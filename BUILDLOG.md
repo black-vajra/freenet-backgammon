@@ -183,3 +183,77 @@ and publishing through the installed Freenet development tool.
 
 Day 2: verify the current Freenet application workflow and the exact commands
 supported by the installed versions of Freenet and fdev.
+
+---
+
+## 2026-08-02 — Ledger Contract Prototype — Milestones 2 and 3
+
+### Completed
+
+- Built a composable Freenet contract prototype for an append-only action ledger.
+- Added deterministic CBOR serialization and validation.
+- Added protocol-version, payload-size, and total-ledger-size limits.
+- Preserved Milestones 2 and 3 as separate repository snapshots.
+- Created the repository's authoritative `SHA256SUMS` file.
+
+### Milestone 2
+
+Milestone 2 established the initial convergent ledger behavior.
+
+Tests verified:
+
+- Duplicate actions are idempotent.
+- Reusing an action ID with different content is rejected.
+- Opposite update orders converge to the same state.
+
+Result: 3 tests passed and the Freenet WASM contract built successfully.
+
+### Milestone 3
+
+Milestone 3 retained the original behavior and added defensive coverage for:
+
+- Malformed CBOR rejection.
+- Unsupported protocol-version rejection.
+- Oversized action-payload rejection.
+- Oversized ledger rejection.
+- Noncanonical state rejection.
+- Full-state merge convergence.
+- Stable CBOR round trips.
+
+Result: 10 tests passed and the Freenet WASM contract built successfully.
+
+### Reproducibility
+
+The contract was rebuilt from the repository copy using an external Cargo target
+directory. The rebuilt WASM exactly matched the stored Milestone 3 artifact:
+
+`095a4208daa63459977efb7eeec0905925f65beda9b6da3e07d6706372ee36fb`
+
+Milestone snapshots are recorded in the root `SHA256SUMS` file.
+
+### What Works
+
+The prototype provides deterministic, convergent handling of ordered action
+records and rejects several classes of malformed, conflicting, noncanonical,
+or oversized state.
+
+### What Remains Uncertain
+
+- Unsupported Freenet `UpdateData` variants have not been exercised through the
+  exported contract ABI.
+- The WASM has not yet been executed through the live Freenet contract runtime.
+- Authentication, game-specific action validation, and fair dice are not yet
+  implemented.
+- Freenet delivery latency and conflict behavior between two independent clients
+  remain untested.
+
+### Freenet Limitations Discovered
+
+No runtime limitation has yet been established. Successful native tests and WASM
+compilation do not prove correct behavior when executed by a Freenet node.
+
+### Next Session
+
+Build a runtime-facing harness for the exported contract interface. Verify state
+validation, update handling, unsupported update variants, malformed serialized
+input, and contract execution before any publication.

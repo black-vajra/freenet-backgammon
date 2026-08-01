@@ -1,0 +1,7 @@
+# Rust build output
+target/
+
+# Temporary and editor files
+*.swp
+*.swo
+*~
