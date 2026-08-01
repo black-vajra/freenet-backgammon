@@ -142,3 +142,44 @@ Add one entry after every development session containing:
 - **What remains uncertain**
 - **Freenet limitations discovered**
 - **Next session**
+
+## 2026-08-02 — Day 1 Completion: Toolchain Installed
+
+### Completed
+
+- Installed Rust through `rustup`.
+- Installed the WebAssembly compilation target.
+- Installed `cargo-make`.
+- Installed Ripgrep.
+- Verified the complete development environment.
+- Confirmed the local repository is synchronized with GitHub.
+
+### Verified Toolchain
+
+- Rust: 1.97.1
+- Cargo: 1.97.1
+- Rust toolchain: stable-x86_64-unknown-linux-gnu
+- Installed Rust targets:
+  - wasm32-unknown-unknown
+  - x86_64-unknown-linux-gnu
+- cargo-make: 0.37.24
+- Ripgrep: 14.1.0
+- Freenet: 0.2.116
+- fdev: 0.3.278
+
+### Repository State
+
+- Branch: main
+- Remote: origin/main
+- Working tree was clean before this log update.
+
+### What Works
+
+The machine now has the required foundation for compiling Rust contracts to
+WebAssembly, running workspace tests, building Freenet application components,
+and publishing through the installed Freenet development tool.
+
+### Next Session
+
+Day 2: verify the current Freenet application workflow and the exact commands
+supported by the installed versions of Freenet and fdev.
