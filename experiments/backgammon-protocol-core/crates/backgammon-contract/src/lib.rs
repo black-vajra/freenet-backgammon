@@ -102,6 +102,50 @@ pub struct LedgerState {
 
 struct Contract;
 
+#[derive(Clone, Debug, PartialEq)]
+enum DecodedUpdate {
+    Delta(LedgerStateDelta),
+    State(LedgerState),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ApplyUpdatesError {
+    InvalidUpdate,
+    InvalidState,
+}
+
+fn apply_decoded_updates(
+    parameters: &LedgerParameters,
+    mut current: LedgerState,
+    updates: impl IntoIterator<Item = DecodedUpdate>,
+) -> Result<LedgerState, ApplyUpdatesError> {
+    for update in updates {
+        match update {
+            DecodedUpdate::Delta(delta) => {
+                let parent = current.clone();
+
+                current
+                    .apply_delta(&parent, parameters, &Some(delta))
+                    .map_err(|_| ApplyUpdatesError::InvalidUpdate)?;
+            }
+
+            DecodedUpdate::State(incoming) => {
+                let parent = current.clone();
+
+                current
+                    .merge(&parent, parameters, &incoming)
+                    .map_err(|_| ApplyUpdatesError::InvalidUpdate)?;
+            }
+        }
+    }
+
+    current
+        .verify(&current, parameters)
+        .map_err(|_| ApplyUpdatesError::InvalidState)?;
+
+    Ok(current)
+}
+
 fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, ContractError> {
     from_reader(bytes).map_err(|e| ContractError::Deser(e.to_string()))
 }
@@ -136,29 +180,29 @@ impl ContractInterface for Contract {
         data: Vec<UpdateData<'static>>,
     ) -> Result<UpdateModification<'static>, ContractError> {
         let parameters: LedgerParameters = decode(parameters.as_ref())?;
-        let mut current: LedgerState = decode(state.as_ref())?;
+        let current: LedgerState = decode(state.as_ref())?;
+        let mut updates = Vec::with_capacity(data.len());
+
         for update in data {
             match update {
                 UpdateData::Delta(bytes) => {
-                    let delta: LedgerStateDelta = decode(bytes.as_ref())?;
-                    let parent = current.clone();
-                    current
-                        .apply_delta(&parent, &parameters, &Some(delta))
-                        .map_err(|_| ContractError::InvalidUpdate)?;
+                    updates.push(DecodedUpdate::Delta(decode(bytes.as_ref())?));
                 }
+
                 UpdateData::State(bytes) => {
-                    let incoming: LedgerState = decode(bytes.as_ref())?;
-                    let parent = current.clone();
-                    current
-                        .merge(&parent, &parameters, &incoming)
-                        .map_err(|_| ContractError::InvalidUpdate)?;
+                    updates.push(DecodedUpdate::State(decode(bytes.as_ref())?));
                 }
+
                 _ => return Err(ContractError::InvalidUpdate),
             }
         }
-        current
-            .verify(&current, &parameters)
-            .map_err(|_| ContractError::InvalidState)?;
+
+        let current =
+            apply_decoded_updates(&parameters, current, updates).map_err(|error| match error {
+                ApplyUpdatesError::InvalidUpdate => ContractError::InvalidUpdate,
+                ApplyUpdatesError::InvalidState => ContractError::InvalidState,
+            })?;
+
         Ok(UpdateModification::valid(encode(&current)?.into()))
     }
 
@@ -364,8 +408,142 @@ mod tests {
         (vec![create, roll, play], completed_state, completed_hash)
     }
 
+    fn action_delta(actions: Vec<Action>) -> DecodedUpdate {
+        DecodedUpdate::Delta(LedgerStateDelta {
+            actions: Some(actions),
+        })
+    }
+
     fn encoded<T: Serialize>(value: &T) -> Vec<u8> {
         encode(value).unwrap()
+    }
+
+    #[test]
+    fn real_actions_apply_as_separate_verified_updates() {
+        let p = params();
+        let (actions, expected_state, expected_hash) = complete_opening_turn_actions();
+
+        let after_create = apply_decoded_updates(
+            &p,
+            LedgerState::default(),
+            [action_delta(vec![actions[0].clone()])],
+        )
+        .unwrap();
+
+        let after_roll =
+            apply_decoded_updates(&p, after_create, [action_delta(vec![actions[1].clone()])])
+                .unwrap();
+
+        let completed =
+            apply_decoded_updates(&p, after_roll, [action_delta(vec![actions[2].clone()])])
+                .unwrap();
+
+        let mut records: Vec<_> = completed
+            .actions
+            .0
+            .iter()
+            .map(Action::to_game_action_record)
+            .collect::<Result<_, _>>()
+            .unwrap();
+
+        records.sort_by_key(|record| record.sequence);
+
+        let replayed = replay_game(&records).unwrap();
+
+        assert_eq!(replayed.state, expected_state);
+        assert_eq!(replayed.latest_state_hash, expected_hash);
+    }
+
+    #[test]
+    fn combined_delta_matches_separate_verified_updates() {
+        let p = params();
+        let (actions, _, _) = complete_opening_turn_actions();
+
+        let combined =
+            apply_decoded_updates(&p, LedgerState::default(), [action_delta(actions.clone())])
+                .unwrap();
+
+        let mut separate = LedgerState::default();
+
+        for action in actions {
+            separate = apply_decoded_updates(&p, separate, [action_delta(vec![action])]).unwrap();
+        }
+
+        assert_eq!(combined, separate);
+    }
+
+    #[test]
+    fn different_valid_delivery_groupings_converge() {
+        let p = params();
+        let (actions, _, _) = complete_opening_turn_actions();
+
+        let first_grouping = apply_decoded_updates(
+            &p,
+            LedgerState::default(),
+            [
+                action_delta(vec![actions[0].clone()]),
+                action_delta(vec![actions[1].clone(), actions[2].clone()]),
+            ],
+        )
+        .unwrap();
+
+        let second_grouping = apply_decoded_updates(
+            &p,
+            LedgerState::default(),
+            [
+                action_delta(vec![actions[0].clone(), actions[1].clone()]),
+                action_delta(vec![actions[2].clone()]),
+            ],
+        )
+        .unwrap();
+
+        let single_grouping =
+            apply_decoded_updates(&p, LedgerState::default(), [action_delta(actions)]).unwrap();
+
+        assert_eq!(first_grouping, second_grouping);
+        assert_eq!(second_grouping, single_grouping);
+    }
+
+    #[test]
+    fn incomplete_history_can_merge_but_not_be_accepted() {
+        let p = params();
+        let (actions, _, _) = complete_opening_turn_actions();
+        let mut partial = LedgerState::default();
+
+        partial
+            .apply_delta(
+                &partial.clone(),
+                &p,
+                &Some(LedgerStateDelta {
+                    actions: Some(vec![actions[1].clone()]),
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(partial.actions.0.len(), 1);
+        assert!(partial.verify(&partial, &p).is_err());
+
+        assert_eq!(
+            apply_decoded_updates(
+                &p,
+                LedgerState::default(),
+                [action_delta(vec![actions[1].clone()])],
+            ),
+            Err(ApplyUpdatesError::InvalidState)
+        );
+    }
+
+    #[test]
+    fn forged_action_is_rejected_through_update_path() {
+        let p = params();
+        let (mut actions, _, _) = complete_opening_turn_actions();
+
+        actions[2].resulting_state_hash = [99; 32];
+
+        assert_eq!(
+            apply_decoded_updates(&p, LedgerState::default(), [action_delta(actions)],),
+            Err(ApplyUpdatesError::InvalidState)
+        );
     }
 
     #[test]
