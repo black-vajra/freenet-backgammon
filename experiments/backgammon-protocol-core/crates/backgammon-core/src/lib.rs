@@ -115,6 +115,12 @@ pub struct CheckerMove {
     pub die: u8,
 }
 
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoveTarget {
+    Point(u8),
+    BearOff,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct GameState {
     pub points: [Point; POINT_COUNT],
@@ -148,6 +154,8 @@ pub enum MoveError {
     SourceOwnedByOpponent,
     DestinationBlocked,
     BearingOffNotImplemented,
+    NotAllCheckersInHome,
+    OversizeBearOffBlocked,
     CheckerCountOverflow,
     CheckerCountUnderflow,
     InvalidResultingState(StateError),
@@ -270,6 +278,66 @@ impl GameState {
         }
     }
 
+    pub const fn point_is_in_home_board(player: Player, point: usize) -> bool {
+        match player {
+            Player::White => point >= 18 && point < POINT_COUNT,
+            Player::Black => point < 6,
+        }
+    }
+
+    pub fn all_checkers_in_home(&self, player: Player) -> bool {
+        self.player_area(player).bar == 0
+            && self.points.iter().enumerate().all(|(index, point)| {
+                point.owner != Some(player) || Self::point_is_in_home_board(player, index)
+            })
+    }
+
+    pub const fn bear_off_distance(player: Player, source: usize) -> usize {
+        match player {
+            Player::White => POINT_COUNT - source,
+            Player::Black => source + 1,
+        }
+    }
+
+    fn has_farther_checker(&self, player: Player, source: usize) -> bool {
+        match player {
+            Player::White => self.points[..source]
+                .iter()
+                .any(|point| point.owner == Some(player)),
+            Player::Black => self.points[source + 1..]
+                .iter()
+                .any(|point| point.owner == Some(player)),
+        }
+    }
+
+    pub fn move_target(
+        &self,
+        player: Player,
+        source: usize,
+        die: u8,
+    ) -> Result<MoveTarget, MoveError> {
+        match Self::point_destination(player, source, die) {
+            Ok(destination) => Ok(MoveTarget::Point(
+                u8::try_from(destination).map_err(|_| MoveError::PointOutOfRange)?,
+            )),
+            Err(MoveError::BearingOffNotImplemented) => {
+                if !self.all_checkers_in_home(player) {
+                    return Err(MoveError::NotAllCheckersInHome);
+                }
+
+                let distance = Self::bear_off_distance(player, source);
+                let die = usize::from(die);
+
+                if die > distance && self.has_farther_checker(player, source) {
+                    return Err(MoveError::OversizeBearOffBlocked);
+                }
+
+                Ok(MoveTarget::BearOff)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     pub fn destination_is_blocked(&self, player: Player, destination: usize) -> bool {
         let point = self.points[destination];
 
@@ -306,13 +374,19 @@ impl GameState {
 
         let bar_count = self.player_area(checker_move.player).bar;
 
-        let destination = match checker_move.source {
+        let target = match checker_move.source {
             MoveSource::Bar => {
                 if bar_count == 0 {
                     return Err(MoveError::NoCheckerOnBar);
                 }
 
-                Self::entry_destination(checker_move.player, checker_move.die)?
+                MoveTarget::Point(
+                    u8::try_from(Self::entry_destination(
+                        checker_move.player,
+                        checker_move.die,
+                    )?)
+                    .map_err(|_| MoveError::PointOutOfRange)?,
+                )
             }
             MoveSource::Point(source) => {
                 if bar_count > 0 {
@@ -335,16 +409,24 @@ impl GameState {
                     Some(_) => {}
                 }
 
-                Self::point_destination(checker_move.player, source, checker_move.die)?
+                self.move_target(checker_move.player, source, checker_move.die)?
             }
         };
 
-        if self.destination_is_blocked(checker_move.player, destination) {
-            return Err(MoveError::DestinationBlocked);
+        if let MoveTarget::Point(destination) = target {
+            if self.destination_is_blocked(checker_move.player, usize::from(destination)) {
+                return Err(MoveError::DestinationBlocked);
+            }
         }
 
         self.remove_checker(checker_move.player, checker_move.source)?;
-        self.place_checker(checker_move.player, destination)?;
+
+        match target {
+            MoveTarget::Point(destination) => {
+                self.place_checker(checker_move.player, usize::from(destination))?;
+            }
+            MoveTarget::BearOff => self.bear_off_checker(checker_move.player)?,
+        }
 
         Ok(())
     }
@@ -387,6 +469,42 @@ impl GameState {
         }
 
         Ok(())
+    }
+
+    fn bear_off_checker(&mut self, player: Player) -> Result<(), MoveError> {
+        let area = self.player_area_mut(player);
+        area.borne_off = area
+            .borne_off
+            .checked_add(1)
+            .ok_or(MoveError::CheckerCountOverflow)?;
+
+        if area.borne_off == CHECKERS_PER_PLAYER {
+            self.status = GameStatus::Completed {
+                winner: player,
+                points: self.completion_points(player),
+            };
+        }
+
+        Ok(())
+    }
+
+    fn completion_points(&self, winner: Player) -> u8 {
+        let loser = winner.opponent();
+        let loser_area = self.player_area(loser);
+
+        if loser_area.borne_off > 0 {
+            return 1;
+        }
+
+        let loser_in_winners_home = self.points.iter().enumerate().any(|(index, point)| {
+            point.owner == Some(loser) && Self::point_is_in_home_board(winner, index)
+        });
+
+        if loser_area.bar > 0 || loser_in_winners_home {
+            3
+        } else {
+            2
+        }
     }
 
     fn place_checker(&mut self, player: Player, destination: usize) -> Result<(), MoveError> {
@@ -755,6 +873,209 @@ mod tests {
         );
 
         assert_eq!(state, before);
+    }
+
+    fn white_bear_off_state(source: usize) -> GameState {
+        let mut state = GameState {
+            points: [Point::EMPTY; POINT_COUNT],
+            white: PlayerArea {
+                bar: 0,
+                borne_off: 14,
+            },
+            black: PlayerArea {
+                bar: 0,
+                borne_off: 1,
+            },
+            active_player: Player::White,
+            turn_phase: TurnPhase::Moving,
+            dice: Some(Dice {
+                first: 1,
+                second: 6,
+            }),
+            status: GameStatus::InProgress,
+        };
+
+        state.points[source] = Point::occupied(Player::White, 1);
+        state.points[6] = Point::occupied(Player::Black, 14);
+        state
+    }
+
+    #[test]
+    fn exact_die_bears_checker_off() {
+        let mut state = white_bear_off_state(23);
+
+        assert_eq!(
+            state.apply_checker_move(CheckerMove {
+                player: Player::White,
+                source: MoveSource::Point(23),
+                die: 1,
+            }),
+            Ok(())
+        );
+
+        assert_eq!(state.white.borne_off, 15);
+        assert_eq!(
+            state.status,
+            GameStatus::Completed {
+                winner: Player::White,
+                points: 1,
+            }
+        );
+        assert_eq!(state.verify(), Ok(()));
+    }
+
+    #[test]
+    fn cannot_bear_off_until_all_checkers_are_home() {
+        let mut state = moving_state();
+
+        assert_eq!(
+            state.apply_checker_move(CheckerMove {
+                player: Player::White,
+                source: MoveSource::Point(18),
+                die: 6,
+            }),
+            Err(MoveError::NotAllCheckersInHome)
+        );
+    }
+
+    #[test]
+    fn oversized_die_can_bear_off_farthest_checker() {
+        let mut state = white_bear_off_state(23);
+
+        assert_eq!(
+            state.apply_checker_move(CheckerMove {
+                player: Player::White,
+                source: MoveSource::Point(23),
+                die: 6,
+            }),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn oversized_die_cannot_skip_farther_checker() {
+        let mut state = white_bear_off_state(23);
+        state.white.borne_off = 13;
+        state.points[22] = Point::occupied(Player::White, 1);
+        let before = state.clone();
+
+        assert_eq!(
+            state.apply_checker_move(CheckerMove {
+                player: Player::White,
+                source: MoveSource::Point(23),
+                die: 6,
+            }),
+            Err(MoveError::OversizeBearOffBlocked)
+        );
+
+        assert_eq!(state, before);
+    }
+
+    #[test]
+    fn black_bears_off_toward_point_zero() {
+        let mut state = GameState {
+            points: [Point::EMPTY; POINT_COUNT],
+            white: PlayerArea {
+                bar: 0,
+                borne_off: 1,
+            },
+            black: PlayerArea {
+                bar: 0,
+                borne_off: 14,
+            },
+            active_player: Player::Black,
+            turn_phase: TurnPhase::Moving,
+            dice: Some(Dice {
+                first: 1,
+                second: 2,
+            }),
+            status: GameStatus::InProgress,
+        };
+
+        state.points[0] = Point::occupied(Player::Black, 1);
+        state.points[17] = Point::occupied(Player::White, 14);
+
+        assert_eq!(
+            state.apply_checker_move(CheckerMove {
+                player: Player::Black,
+                source: MoveSource::Point(0),
+                die: 1,
+            }),
+            Ok(())
+        );
+
+        assert_eq!(state.black.borne_off, 15);
+    }
+
+    #[test]
+    fn completion_scores_gammon() {
+        let mut state = white_bear_off_state(23);
+        state.black.borne_off = 0;
+        state.points[6] = Point::occupied(Player::Black, 15);
+
+        state
+            .apply_checker_move(CheckerMove {
+                player: Player::White,
+                source: MoveSource::Point(23),
+                die: 1,
+            })
+            .unwrap();
+
+        assert_eq!(
+            state.status,
+            GameStatus::Completed {
+                winner: Player::White,
+                points: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn completion_scores_backgammon_for_checker_on_bar() {
+        let mut state = white_bear_off_state(23);
+        state.black.borne_off = 0;
+        state.black.bar = 1;
+        state.points[6] = Point::occupied(Player::Black, 14);
+
+        state
+            .apply_checker_move(CheckerMove {
+                player: Player::White,
+                source: MoveSource::Point(23),
+                die: 1,
+            })
+            .unwrap();
+
+        assert_eq!(
+            state.status,
+            GameStatus::Completed {
+                winner: Player::White,
+                points: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn completion_scores_backgammon_in_winners_home() {
+        let mut state = white_bear_off_state(23);
+        state.black.borne_off = 0;
+        state.points[6] = Point::occupied(Player::Black, 14);
+        state.points[18] = Point::occupied(Player::Black, 1);
+
+        state
+            .apply_checker_move(CheckerMove {
+                player: Player::White,
+                source: MoveSource::Point(23),
+                die: 1,
+            })
+            .unwrap();
+
+        assert_eq!(
+            state.status,
+            GameStatus::Completed {
+                winner: Player::White,
+                points: 3,
+            }
+        );
     }
 
     #[test]
