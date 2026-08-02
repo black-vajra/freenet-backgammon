@@ -1,4 +1,4 @@
-use backgammon_protocol::{verify_action_sequences, Action, LedgerParameters, PROTOCOL_VERSION};
+use backgammon_protocol::{verify_action_history, Action, LedgerParameters};
 use ciborium::{de::from_reader, ser::into_writer};
 use freenet_scaffold_macro::composable;
 use freenet_stdlib::prelude::*;
@@ -45,7 +45,7 @@ impl ComposableState for Actions {
     ) -> Result<(), String> {
         parameters.verify()?;
         self.verify_inner()?;
-        verify_action_sequences(&self.0)
+        verify_action_history(&self.0)
     }
 
     fn summarize(
@@ -195,6 +195,7 @@ impl ContractInterface for Contract {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use backgammon_protocol::{StateHash, GENESIS_STATE_HASH, PROTOCOL_VERSION};
 
     fn params() -> LedgerParameters {
         LedgerParameters {
@@ -202,10 +203,23 @@ mod tests {
         }
     }
 
+    fn state_hash(id: u8) -> StateHash {
+        [id; 32]
+    }
+
     fn action(id: u8, sequence: u32) -> Action {
+        let previous_state_hash = if sequence == 0 {
+            GENESIS_STATE_HASH
+        } else {
+            state_hash(sequence as u8)
+        };
+
         Action {
+            game_id: [7; 32],
             id: [id; 32],
             sequence,
+            previous_state_hash,
+            resulting_state_hash: state_hash((sequence + 1) as u8),
             payload: vec![id],
         }
     }
@@ -356,8 +370,11 @@ mod tests {
             let mut id = [0_u8; 32];
             id[28..].copy_from_slice(&(n as u32).to_be_bytes());
             state.actions.0.push(Action {
+                game_id: [7; 32],
                 id,
                 sequence: n as u32,
+                previous_state_hash: GENESIS_STATE_HASH,
+                resulting_state_hash: [0; 32],
                 payload: Vec::new(),
             });
         }
