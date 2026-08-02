@@ -1,9 +1,11 @@
 #![forbid(unsafe_code)]
 
+mod fair_dice;
 mod game_action;
 mod replay;
 mod state_hash;
 
+pub use fair_dice::*;
 pub use game_action::*;
 pub use replay::*;
 pub use state_hash::*;
