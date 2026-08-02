@@ -9,6 +9,27 @@ const ROLL_DOMAIN: &[u8] = b"freenet-backgammon-dice-roll-v1\0";
 pub type DiceSecret = [u8; 32];
 pub type DiceCommitment = [u8; 32];
 
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct DiceRoundState {
+    pub white_commitment: Option<DiceCommitment>,
+    pub black_commitment: Option<DiceCommitment>,
+    pub white_reveal: Option<DiceSecret>,
+    pub black_reveal: Option<DiceSecret>,
+}
+
+impl DiceRoundState {
+    pub fn is_empty(&self) -> bool {
+        self.white_commitment.is_none()
+            && self.black_commitment.is_none()
+            && self.white_reveal.is_none()
+            && self.black_reveal.is_none()
+    }
+
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct DiceCommit {
     pub turn: u32,

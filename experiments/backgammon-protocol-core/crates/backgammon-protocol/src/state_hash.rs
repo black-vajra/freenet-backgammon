@@ -1,9 +1,9 @@
 use backgammon_core::GameState;
 use serde::{Deserialize, Serialize};
 
-use crate::{GameConfiguration, GameId, ReplayStatus, StateHash, PROTOCOL_VERSION};
+use crate::{DiceRoundState, GameConfiguration, GameId, ReplayStatus, StateHash, PROTOCOL_VERSION};
 
-const STATE_HASH_DOMAIN: &[u8] = b"freenet-backgammon-replay-state-v1\0";
+const STATE_HASH_DOMAIN: &[u8] = b"freenet-backgammon-replay-state-v2\0";
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct CanonicalReplayState {
@@ -12,6 +12,7 @@ pub struct CanonicalReplayState {
     pub configuration: GameConfiguration,
     pub state: GameState,
     pub next_turn: u32,
+    pub dice_round: DiceRoundState,
     pub status: ReplayStatus,
 }
 
@@ -26,6 +27,7 @@ impl CanonicalReplayState {
         configuration: GameConfiguration,
         state: GameState,
         next_turn: u32,
+        dice_round: DiceRoundState,
         status: ReplayStatus,
     ) -> Self {
         Self {
@@ -34,6 +36,7 @@ impl CanonicalReplayState {
             configuration,
             state,
             next_turn,
+            dice_round,
             status,
         }
     }
@@ -86,6 +89,7 @@ mod tests {
             },
             GameState::standard_start(),
             0,
+            DiceRoundState::default(),
             ReplayStatus::InProgress,
         )
     }
@@ -100,8 +104,8 @@ mod tests {
     }
 
     #[test]
-    fn canonical_encoding_matches_v1_golden_fixture() {
-        let expected = include_bytes!("../tests/fixtures/canonical-replay-state-v1.cbor");
+    fn canonical_encoding_matches_v2_golden_fixture() {
+        let expected = include_bytes!("../tests/fixtures/canonical-replay-state-v2.cbor");
 
         let encoded = snapshot().encode_canonical().unwrap();
 
@@ -109,8 +113,8 @@ mod tests {
     }
 
     #[test]
-    fn canonical_hash_matches_v1_golden_fixture() {
-        let expected = include_bytes!("../tests/fixtures/canonical-replay-state-v1.blake3");
+    fn canonical_hash_matches_v2_golden_fixture() {
+        let expected = include_bytes!("../tests/fixtures/canonical-replay-state-v2.blake3");
 
         assert_eq!(expected.len(), 32);
         assert_eq!(snapshot().hash().unwrap().as_slice(), expected);

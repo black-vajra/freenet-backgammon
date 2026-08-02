@@ -239,10 +239,11 @@ impl ContractInterface for Contract {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use backgammon_core::{Dice, GameState, Player, TurnPhase, TurnSequence};
+    use backgammon_core::{GameState, Player, TurnPhase, TurnSequence};
     use backgammon_protocol::{
-        replay_game, CanonicalReplayState, GameActionPayload, GameActionRecord, GameConfiguration,
-        PlayerDescriptor, ReplayStatus, StateHash, GENESIS_STATE_HASH, PROTOCOL_VERSION,
+        derive_dice, replay_game, CanonicalReplayState, DiceCommit, GameActionPayload,
+        GameActionRecord, GameConfiguration, PlayerDescriptor, ReplayStatus, StateHash,
+        GENESIS_STATE_HASH, PROTOCOL_VERSION,
     };
 
     fn params() -> LedgerParameters {
@@ -275,6 +276,7 @@ mod tests {
             configuration(),
             GameState::standard_start(),
             0,
+            backgammon_protocol::DiceRoundState::default(),
             ReplayStatus::InProgress,
         )
         .hash()
@@ -287,6 +289,7 @@ mod tests {
             configuration(),
             GameState::standard_start(),
             0,
+            backgammon_protocol::DiceRoundState::default(),
             ReplayStatus::Resigned {
                 resigned: Player::White,
                 winner: Player::Black,
@@ -345,57 +348,121 @@ mod tests {
     }
 
     fn complete_opening_turn_actions() -> (Vec<Action>, GameState, StateHash) {
-        let dice = Dice {
-            first: 1,
-            second: 2,
-        };
+        let game_id = [7; 32];
+        let white_secret = [11; 32];
+        let black_secret = [22; 32];
 
-        let mut rolled_state = GameState::standard_start();
+        let white_commit = DiceCommit::new(&game_id, 0, Player::White, &white_secret);
+
+        let black_commit = DiceCommit::new(&game_id, 0, Player::Black, &black_secret);
+
+        let dice = derive_dice(&game_id, 0, &white_secret, &black_secret).unwrap();
+
+        let initial_state = GameState::standard_start();
+
+        let mut rolled_state = initial_state.clone();
         rolled_state.dice = Some(dice);
         rolled_state.turn_phase = TurnPhase::Moving;
 
         let sequence = rolled_state.legal_turn_sequences().unwrap()[0].clone();
 
+        let state_hash =
+            |state: &GameState, next_turn: u32, dice_round: backgammon_protocol::DiceRoundState| {
+                CanonicalReplayState::new(
+                    game_id,
+                    configuration(),
+                    state.clone(),
+                    next_turn,
+                    dice_round,
+                    ReplayStatus::InProgress,
+                )
+                .hash()
+                .unwrap()
+            };
+
         let create = action(1, 0);
 
-        let roll_hash = CanonicalReplayState::new(
-            [7; 32],
-            configuration(),
-            rolled_state.clone(),
-            0,
-            ReplayStatus::InProgress,
-        )
-        .hash()
-        .unwrap();
+        let mut white_committed = backgammon_protocol::DiceRoundState::default();
 
-        let roll = typed_action(
+        white_committed.white_commitment = Some(white_commit.commitment);
+
+        let white_commit_hash = state_hash(&initial_state, 0, white_committed.clone());
+
+        let white_commit_action = typed_action(
             2,
             1,
             create_hash(),
-            roll_hash,
-            GameActionPayload::RecordRoll {
+            white_commit_hash,
+            GameActionPayload::CommitDice {
                 turn: 0,
                 player: Player::White,
-                dice,
+                commitment: white_commit.commitment,
+            },
+        );
+
+        let mut both_committed = white_committed;
+        both_committed.black_commitment = Some(black_commit.commitment);
+
+        let black_commit_hash = state_hash(&initial_state, 0, both_committed.clone());
+
+        let black_commit_action = typed_action(
+            3,
+            2,
+            white_commit_hash,
+            black_commit_hash,
+            GameActionPayload::CommitDice {
+                turn: 0,
+                player: Player::Black,
+                commitment: black_commit.commitment,
+            },
+        );
+
+        let mut white_revealed = both_committed;
+        white_revealed.white_reveal = Some(white_secret);
+
+        let white_reveal_hash = state_hash(&initial_state, 0, white_revealed.clone());
+
+        let white_reveal_action = typed_action(
+            4,
+            3,
+            black_commit_hash,
+            white_reveal_hash,
+            GameActionPayload::RevealDice {
+                turn: 0,
+                player: Player::White,
+                secret: white_secret,
+            },
+        );
+
+        let mut both_revealed = white_revealed;
+        both_revealed.black_reveal = Some(black_secret);
+
+        let roll_hash = state_hash(&rolled_state, 0, both_revealed);
+
+        let black_reveal_action = typed_action(
+            5,
+            4,
+            white_reveal_hash,
+            roll_hash,
+            GameActionPayload::RevealDice {
+                turn: 0,
+                player: Player::Black,
+                secret: black_secret,
             },
         );
 
         let mut completed_state = rolled_state;
         completed_state.apply_turn_sequence(&sequence).unwrap();
 
-        let completed_hash = CanonicalReplayState::new(
-            [7; 32],
-            configuration(),
-            completed_state.clone(),
+        let completed_hash = state_hash(
+            &completed_state,
             1,
-            ReplayStatus::InProgress,
-        )
-        .hash()
-        .unwrap();
+            backgammon_protocol::DiceRoundState::default(),
+        );
 
         let play = typed_action(
-            3,
-            2,
+            6,
+            5,
             roll_hash,
             completed_hash,
             GameActionPayload::PlayTurn {
@@ -405,7 +472,18 @@ mod tests {
             },
         );
 
-        (vec![create, roll, play], completed_state, completed_hash)
+        (
+            vec![
+                create,
+                white_commit_action,
+                black_commit_action,
+                white_reveal_action,
+                black_reveal_action,
+                play,
+            ],
+            completed_state,
+            completed_hash,
+        )
     }
 
     fn action_delta(actions: Vec<Action>) -> DecodedUpdate {
@@ -423,22 +501,15 @@ mod tests {
         let p = params();
         let (actions, expected_state, expected_hash) = complete_opening_turn_actions();
 
-        let after_create = apply_decoded_updates(
-            &p,
-            LedgerState::default(),
-            [action_delta(vec![actions[0].clone()])],
-        )
-        .unwrap();
+        let mut state = LedgerState::default();
 
-        let after_roll =
-            apply_decoded_updates(&p, after_create, [action_delta(vec![actions[1].clone()])])
-                .unwrap();
+        for action in actions {
+            state = apply_decoded_updates(&p, state, [action_delta(vec![action])]).unwrap();
+        }
 
-        let completed =
-            apply_decoded_updates(&p, after_roll, [action_delta(vec![actions[2].clone()])])
-                .unwrap();
+        assert_eq!(state.verify(&state, &p), Ok(()));
 
-        let mut records: Vec<_> = completed
+        let mut records: Vec<_> = state
             .actions
             .0
             .iter()
@@ -452,6 +523,8 @@ mod tests {
 
         assert_eq!(replayed.state, expected_state);
         assert_eq!(replayed.latest_state_hash, expected_hash);
+        assert_eq!(replayed.next_sequence, 6);
+        assert_eq!(replayed.next_turn, 1);
     }
 
     #[test]
@@ -475,33 +548,59 @@ mod tests {
     #[test]
     fn different_valid_delivery_groupings_converge() {
         let p = params();
-        let (actions, _, _) = complete_opening_turn_actions();
+        let (actions, expected_state, expected_hash) = complete_opening_turn_actions();
 
-        let first_grouping = apply_decoded_updates(
+        assert_eq!(actions.len(), 6);
+
+        let grouping_a = apply_decoded_updates(
             &p,
             LedgerState::default(),
             [
                 action_delta(vec![actions[0].clone()]),
                 action_delta(vec![actions[1].clone(), actions[2].clone()]),
+                action_delta(vec![
+                    actions[3].clone(),
+                    actions[4].clone(),
+                    actions[5].clone(),
+                ]),
             ],
         )
         .unwrap();
 
-        let second_grouping = apply_decoded_updates(
+        let grouping_b = apply_decoded_updates(
             &p,
             LedgerState::default(),
             [
                 action_delta(vec![actions[0].clone(), actions[1].clone()]),
-                action_delta(vec![actions[2].clone()]),
+                action_delta(vec![actions[2].clone(), actions[3].clone()]),
+                action_delta(vec![actions[4].clone(), actions[5].clone()]),
             ],
         )
         .unwrap();
 
-        let single_grouping =
+        let combined =
             apply_decoded_updates(&p, LedgerState::default(), [action_delta(actions)]).unwrap();
 
-        assert_eq!(first_grouping, second_grouping);
-        assert_eq!(second_grouping, single_grouping);
+        assert_eq!(grouping_a, combined);
+        assert_eq!(grouping_b, combined);
+        assert_eq!(combined.verify(&combined, &p), Ok(()));
+
+        let mut records: Vec<_> = combined
+            .actions
+            .0
+            .iter()
+            .map(Action::to_game_action_record)
+            .collect::<Result<_, _>>()
+            .unwrap();
+
+        records.sort_by_key(|record| record.sequence);
+
+        let replayed = replay_game(&records).unwrap();
+
+        assert_eq!(replayed.state, expected_state);
+        assert_eq!(replayed.latest_state_hash, expected_hash);
+        assert_eq!(replayed.next_sequence, 6);
+        assert_eq!(replayed.next_turn, 1);
     }
 
     #[test]
@@ -583,7 +682,7 @@ mod tests {
 
         assert_eq!(replayed.state, expected_state);
         assert_eq!(replayed.latest_state_hash, expected_hash);
-        assert_eq!(replayed.next_sequence, 3);
+        assert_eq!(replayed.next_sequence, 6);
         assert_eq!(replayed.next_turn, 1);
     }
 
@@ -605,15 +704,14 @@ mod tests {
         let summary = client.summarize(&client, &p);
         let delta = full
             .delta(&full, &p, &summary)
-            .expect("client is missing two actions");
+            .expect("client is missing five actions");
 
         let missing = delta
             .actions
             .expect("actions component must contain a delta");
 
-        assert_eq!(missing.len(), 2);
-        assert_eq!(missing[0], actions[1]);
-        assert_eq!(missing[1], actions[2]);
+        assert_eq!(missing.len(), actions.len() - 1);
+        assert_eq!(missing, actions[1..].to_vec());
     }
 
     #[test]
@@ -848,7 +946,7 @@ mod tests {
 
         assert_eq!(replayed.state, expected_state);
         assert_eq!(replayed.latest_state_hash, expected_hash);
-        assert_eq!(replayed.next_sequence, 3);
+        assert_eq!(replayed.next_sequence, 6);
         assert_eq!(replayed.next_turn, 1);
         assert_eq!(replayed.state.active_player, Player::Black);
         assert_eq!(replayed.state.turn_phase, TurnPhase::AwaitingRoll);

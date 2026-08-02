@@ -4,8 +4,9 @@ use backgammon_core::{GameState, GameStatus, Player, TurnError, TurnPhase};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CanonicalReplayState, GameActionError, GameActionPayload, GameActionRecord, GameConfiguration,
-    GameId, StateHash, StateHashError, GENESIS_STATE_HASH,
+    verify_and_derive_dice, CanonicalReplayState, DiceCommit, DiceReveal, DiceRoundState,
+    FairDiceError, GameActionError, GameActionPayload, GameActionRecord, GameConfiguration, GameId,
+    StateHash, StateHashError, GENESIS_STATE_HASH,
 };
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -23,6 +24,7 @@ pub struct ReplayedGame {
     pub state: GameState,
     pub next_sequence: u64,
     pub next_turn: u32,
+    pub dice_round: DiceRoundState,
     pub status: ReplayStatus,
     pub latest_state_hash: StateHash,
 }
@@ -62,6 +64,17 @@ pub enum ReplayError {
         sequence: u64,
     },
     RollAlreadyPending,
+    DiceCommitmentAlreadyPresent {
+        player: Player,
+    },
+    DiceRevealBeforeBothCommitments,
+    DiceRevealAlreadyPresent {
+        player: Player,
+    },
+    FairDice {
+        sequence: u64,
+        error: FairDiceError,
+    },
     RollExpected,
     WrongTurnNumber {
         expected: u32,
@@ -86,6 +99,7 @@ impl ReplayedGame {
             self.configuration.clone(),
             self.state.clone(),
             self.next_turn,
+            self.dice_round.clone(),
             self.status.clone(),
         )
     }
@@ -114,7 +128,11 @@ impl ReplayedGame {
         match &record.payload {
             GameActionPayload::CreateGame(_) => Err(ReplayError::DuplicateGameCreation),
 
-            GameActionPayload::RecordRoll { turn, player, dice } => {
+            GameActionPayload::CommitDice {
+                turn,
+                player,
+                commitment,
+            } => {
                 if *turn != self.next_turn {
                     return Err(ReplayError::WrongTurnNumber {
                         expected: self.next_turn,
@@ -122,10 +140,33 @@ impl ReplayedGame {
                     });
                 }
 
-                if *player != self.state.active_player {
-                    return Err(ReplayError::WrongPlayer {
-                        expected: self.state.active_player,
-                        found: *player,
+                if self.state.turn_phase != TurnPhase::AwaitingRoll || self.state.dice.is_some() {
+                    return Err(ReplayError::RollAlreadyPending);
+                }
+
+                let slot = match player {
+                    Player::White => &mut self.dice_round.white_commitment,
+                    Player::Black => &mut self.dice_round.black_commitment,
+                };
+
+                if slot.is_some() {
+                    return Err(ReplayError::DiceCommitmentAlreadyPresent { player: *player });
+                }
+
+                *slot = Some(*commitment);
+
+                Ok(())
+            }
+
+            GameActionPayload::RevealDice {
+                turn,
+                player,
+                secret,
+            } => {
+                if *turn != self.next_turn {
+                    return Err(ReplayError::WrongTurnNumber {
+                        expected: self.next_turn,
+                        found: *turn,
                     });
                 }
 
@@ -133,8 +174,101 @@ impl ReplayedGame {
                     return Err(ReplayError::RollAlreadyPending);
                 }
 
-                self.state.dice = Some(*dice);
-                self.state.turn_phase = TurnPhase::Moving;
+                let (white_commitment, black_commitment) = match (
+                    self.dice_round.white_commitment,
+                    self.dice_round.black_commitment,
+                ) {
+                    (Some(white), Some(black)) => (white, black),
+                    _ => {
+                        return Err(ReplayError::DiceRevealBeforeBothCommitments);
+                    }
+                };
+
+                let already_revealed = match player {
+                    Player::White => self.dice_round.white_reveal.is_some(),
+                    Player::Black => self.dice_round.black_reveal.is_some(),
+                };
+
+                if already_revealed {
+                    return Err(ReplayError::DiceRevealAlreadyPresent { player: *player });
+                }
+
+                let player_commitment = match player {
+                    Player::White => white_commitment,
+                    Player::Black => black_commitment,
+                };
+
+                let commitment = DiceCommit {
+                    turn: *turn,
+                    player: *player,
+                    commitment: player_commitment,
+                };
+
+                let reveal = DiceReveal {
+                    turn: *turn,
+                    player: *player,
+                    secret: *secret,
+                };
+
+                commitment
+                    .verify_reveal(&self.game_id, &reveal)
+                    .map_err(|error| ReplayError::FairDice {
+                        sequence: record.sequence,
+                        error,
+                    })?;
+
+                match player {
+                    Player::White => {
+                        self.dice_round.white_reveal = Some(*secret);
+                    }
+                    Player::Black => {
+                        self.dice_round.black_reveal = Some(*secret);
+                    }
+                }
+
+                if let (Some(white_secret), Some(black_secret)) =
+                    (self.dice_round.white_reveal, self.dice_round.black_reveal)
+                {
+                    let white_commit = DiceCommit {
+                        turn: *turn,
+                        player: Player::White,
+                        commitment: white_commitment,
+                    };
+
+                    let black_commit = DiceCommit {
+                        turn: *turn,
+                        player: Player::Black,
+                        commitment: black_commitment,
+                    };
+
+                    let white_reveal = DiceReveal {
+                        turn: *turn,
+                        player: Player::White,
+                        secret: white_secret,
+                    };
+
+                    let black_reveal = DiceReveal {
+                        turn: *turn,
+                        player: Player::Black,
+                        secret: black_secret,
+                    };
+
+                    let dice = verify_and_derive_dice(
+                        &self.game_id,
+                        *turn,
+                        &white_commit,
+                        &black_commit,
+                        &white_reveal,
+                        &black_reveal,
+                    )
+                    .map_err(|error| ReplayError::FairDice {
+                        sequence: record.sequence,
+                        error,
+                    })?;
+
+                    self.state.dice = Some(dice);
+                    self.state.turn_phase = TurnPhase::Moving;
+                }
 
                 Ok(())
             }
@@ -168,6 +302,8 @@ impl ReplayedGame {
                         error,
                     }
                 })?;
+
+                self.dice_round.clear();
 
                 self.next_turn = self
                     .next_turn
@@ -226,6 +362,7 @@ pub fn replay_game(records: &[GameActionRecord]) -> Result<ReplayedGame, ReplayE
         state: GameState::standard_start(),
         next_sequence: 1,
         next_turn: 0,
+        dice_round: DiceRoundState::default(),
         status: ReplayStatus::InProgress,
         latest_state_hash: first.resulting_state_hash,
     };
@@ -351,6 +488,7 @@ mod tests {
             state: GameState::standard_start(),
             next_sequence: 1,
             next_turn: 0,
+            dice_round: DiceRoundState::default(),
             status: ReplayStatus::InProgress,
             latest_state_hash: GENESIS_STATE_HASH,
         };
@@ -389,6 +527,221 @@ mod tests {
         state.legal_turn_sequences().unwrap()[0].clone()
     }
 
+    fn append_fair_roll(records: &mut Vec<GameActionRecord>, turn: u32) -> Dice {
+        let game_id = records[0].game_id;
+        let white_secret = [11; 32];
+        let black_secret = [22; 32];
+
+        let white_commit = DiceCommit::new(&game_id, turn, Player::White, &white_secret);
+
+        let black_commit = DiceCommit::new(&game_id, turn, Player::Black, &black_secret);
+
+        append_valid(
+            records,
+            GameActionPayload::CommitDice {
+                turn,
+                player: Player::White,
+                commitment: white_commit.commitment,
+            },
+        );
+
+        append_valid(
+            records,
+            GameActionPayload::CommitDice {
+                turn,
+                player: Player::Black,
+                commitment: black_commit.commitment,
+            },
+        );
+
+        append_valid(
+            records,
+            GameActionPayload::RevealDice {
+                turn,
+                player: Player::White,
+                secret: white_secret,
+            },
+        );
+
+        append_valid(
+            records,
+            GameActionPayload::RevealDice {
+                turn,
+                player: Player::Black,
+                secret: black_secret,
+            },
+        );
+
+        crate::derive_dice(&game_id, turn, &white_secret, &black_secret).unwrap()
+    }
+
+    #[test]
+    fn fair_dice_actions_derive_roll_deterministically() {
+        let mut actions = vec![create_record()];
+        let expected = append_fair_roll(&mut actions, 0);
+
+        let replay = replay_game(&actions).unwrap();
+
+        assert_eq!(replay.next_sequence, 5);
+        assert_eq!(replay.next_turn, 0);
+        assert_eq!(replay.state.dice, Some(expected));
+        assert_eq!(replay.state.turn_phase, TurnPhase::Moving);
+        assert!(!replay.dice_round.is_empty());
+    }
+
+    #[test]
+    fn reveal_before_both_commitments_is_rejected() {
+        let mut actions = vec![create_record()];
+        let game_id = actions[0].game_id;
+        let secret = [11; 32];
+
+        let commitment = DiceCommit::new(&game_id, 0, Player::White, &secret);
+
+        append_valid(
+            &mut actions,
+            GameActionPayload::CommitDice {
+                turn: 0,
+                player: Player::White,
+                commitment: commitment.commitment,
+            },
+        );
+
+        let current = replay_game(&actions).unwrap();
+
+        actions.push(bare_record(
+            current.next_sequence,
+            9,
+            current.latest_state_hash,
+            [0; 32],
+            GameActionPayload::RevealDice {
+                turn: 0,
+                player: Player::White,
+                secret,
+            },
+        ));
+
+        assert_eq!(
+            replay_game(&actions),
+            Err(ReplayError::DiceRevealBeforeBothCommitments)
+        );
+    }
+
+    #[test]
+    fn mismatched_dice_reveal_is_rejected() {
+        let mut actions = vec![create_record()];
+        let game_id = actions[0].game_id;
+
+        let white_commit = DiceCommit::new(&game_id, 0, Player::White, &[11; 32]);
+
+        let black_commit = DiceCommit::new(&game_id, 0, Player::Black, &[22; 32]);
+
+        append_valid(
+            &mut actions,
+            GameActionPayload::CommitDice {
+                turn: 0,
+                player: Player::White,
+                commitment: white_commit.commitment,
+            },
+        );
+
+        append_valid(
+            &mut actions,
+            GameActionPayload::CommitDice {
+                turn: 0,
+                player: Player::Black,
+                commitment: black_commit.commitment,
+            },
+        );
+
+        let current = replay_game(&actions).unwrap();
+
+        actions.push(bare_record(
+            current.next_sequence,
+            9,
+            current.latest_state_hash,
+            [0; 32],
+            GameActionPayload::RevealDice {
+                turn: 0,
+                player: Player::White,
+                secret: [99; 32],
+            },
+        ));
+
+        assert!(matches!(
+            replay_game(&actions),
+            Err(ReplayError::FairDice {
+                sequence: 3,
+                error: FairDiceError::CommitmentMismatch(Player::White),
+            })
+        ));
+    }
+
+    #[test]
+    fn duplicate_dice_commitment_is_rejected() {
+        let mut actions = vec![create_record()];
+        let game_id = actions[0].game_id;
+        let secret = [11; 32];
+
+        let commitment = DiceCommit::new(&game_id, 0, Player::White, &secret);
+
+        append_valid(
+            &mut actions,
+            GameActionPayload::CommitDice {
+                turn: 0,
+                player: Player::White,
+                commitment: commitment.commitment,
+            },
+        );
+
+        let current = replay_game(&actions).unwrap();
+
+        actions.push(bare_record(
+            current.next_sequence,
+            9,
+            current.latest_state_hash,
+            [0; 32],
+            GameActionPayload::CommitDice {
+                turn: 0,
+                player: Player::White,
+                commitment: commitment.commitment,
+            },
+        ));
+
+        assert_eq!(
+            replay_game(&actions),
+            Err(ReplayError::DiceCommitmentAlreadyPresent {
+                player: Player::White,
+            })
+        );
+    }
+
+    #[test]
+    fn completed_turn_clears_fair_dice_round() {
+        let mut actions = vec![create_record()];
+        append_fair_roll(&mut actions, 0);
+
+        let current = replay_game(&actions).unwrap();
+
+        let sequence = current.state.legal_turn_sequences().unwrap()[0].clone();
+
+        append_valid(
+            &mut actions,
+            GameActionPayload::PlayTurn {
+                turn: 0,
+                player: Player::White,
+                sequence,
+            },
+        );
+
+        let replay = replay_game(&actions).unwrap();
+
+        assert_eq!(replay.next_sequence, 6);
+        assert_eq!(replay.next_turn, 1);
+        assert!(replay.dice_round.is_empty());
+        assert_eq!(replay.state.dice, None);
+        assert_eq!(replay.state.turn_phase, TurnPhase::AwaitingRoll);
+    }
+
     #[test]
     fn create_game_replays_from_genesis() {
         let create = create_record();
@@ -403,23 +756,10 @@ mod tests {
     }
 
     #[test]
-    fn roll_and_complete_turn_replay_deterministically() {
-        let dice = Dice {
-            first: 1,
-            second: 2,
-        };
-        let sequence = legal_opening_sequence(dice);
-
+    fn fair_dice_and_complete_turn_replay_deterministically() {
         let mut actions = vec![create_record()];
-
-        append_valid(
-            &mut actions,
-            GameActionPayload::RecordRoll {
-                turn: 0,
-                player: Player::White,
-                dice,
-            },
-        );
+        let dice = append_fair_roll(&mut actions, 0);
+        let sequence = legal_opening_sequence(dice);
 
         append_valid(
             &mut actions,
@@ -434,11 +774,12 @@ mod tests {
         let second = replay_game(&actions).unwrap();
 
         assert_eq!(first, second);
-        assert_eq!(first.next_sequence, 3);
+        assert_eq!(first.next_sequence, 6);
         assert_eq!(first.next_turn, 1);
         assert_eq!(first.state.active_player, Player::Black);
         assert_eq!(first.state.turn_phase, TurnPhase::AwaitingRoll);
         assert_eq!(first.state.dice, None);
+        assert!(first.dice_round.is_empty());
     }
 
     #[test]
@@ -483,23 +824,20 @@ mod tests {
 
     #[test]
     fn first_action_must_create_game() {
-        let action = bare_record(
+        let first = bare_record(
             0,
             1,
             GENESIS_STATE_HASH,
             [10; 32],
-            GameActionPayload::RecordRoll {
+            GameActionPayload::CommitDice {
                 turn: 0,
                 player: Player::White,
-                dice: Dice {
-                    first: 1,
-                    second: 2,
-                },
+                commitment: [7; 32],
             },
         );
 
         assert_eq!(
-            replay_game(&[action]),
+            replay_game(&[first]),
             Err(ReplayError::FirstActionMustCreateGame)
         );
     }
@@ -570,22 +908,23 @@ mod tests {
     }
 
     #[test]
-    fn wrong_turn_number_is_rejected() {
+    fn wrong_dice_commitment_turn_is_rejected() {
         let mut actions = vec![create_record()];
+        let game_id = actions[0].game_id;
         let previous = actions[0].resulting_state_hash;
+        let secret = [11; 32];
+
+        let commitment = DiceCommit::new(&game_id, 1, Player::White, &secret);
 
         actions.push(bare_record(
             1,
             2,
             previous,
             [11; 32],
-            GameActionPayload::RecordRoll {
+            GameActionPayload::CommitDice {
                 turn: 1,
                 player: Player::White,
-                dice: Dice {
-                    first: 1,
-                    second: 2,
-                },
+                commitment: commitment.commitment,
             },
         ));
 
@@ -599,22 +938,21 @@ mod tests {
     }
 
     #[test]
-    fn wrong_player_roll_is_rejected() {
+    fn wrong_player_turn_is_rejected() {
         let mut actions = vec![create_record()];
-        let previous = actions[0].resulting_state_hash;
+        append_fair_roll(&mut actions, 0);
+
+        let current = replay_game(&actions).unwrap();
 
         actions.push(bare_record(
-            1,
-            2,
-            previous,
-            [11; 32],
-            GameActionPayload::RecordRoll {
+            current.next_sequence,
+            9,
+            current.latest_state_hash,
+            [12; 32],
+            GameActionPayload::PlayTurn {
                 turn: 0,
                 player: Player::Black,
-                dice: Dice {
-                    first: 1,
-                    second: 2,
-                },
+                sequence: TurnSequence { moves: Vec::new() },
             },
         ));
 
@@ -648,33 +986,24 @@ mod tests {
     }
 
     #[test]
-    fn second_roll_before_turn_is_rejected() {
-        let dice = Dice {
-            first: 1,
-            second: 2,
-        };
+    fn fair_dice_action_after_roll_is_rejected() {
         let mut actions = vec![create_record()];
-
-        append_valid(
-            &mut actions,
-            GameActionPayload::RecordRoll {
-                turn: 0,
-                player: Player::White,
-                dice,
-            },
-        );
+        append_fair_roll(&mut actions, 0);
 
         let current = replay_game(&actions).unwrap();
+        let secret = [33; 32];
+
+        let commitment = DiceCommit::new(&current.game_id, 0, Player::White, &secret);
 
         actions.push(bare_record(
             current.next_sequence,
-            3,
+            9,
             current.latest_state_hash,
             [12; 32],
-            GameActionPayload::RecordRoll {
+            GameActionPayload::CommitDice {
                 turn: 0,
                 player: Player::White,
-                dice,
+                commitment: commitment.commitment,
             },
         ));
 

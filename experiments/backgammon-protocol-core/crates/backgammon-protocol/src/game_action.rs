@@ -1,7 +1,7 @@
-use backgammon_core::{CheckerMove, Dice, Player, StateError, TurnSequence};
+use backgammon_core::{CheckerMove, Player, TurnSequence};
 use serde::{Deserialize, Serialize};
 
-use crate::{ActionId, GameId, StateHash, PROTOCOL_VERSION};
+use crate::{ActionId, DiceCommitment, DiceSecret, GameId, StateHash, PROTOCOL_VERSION};
 
 pub const MAX_DISPLAY_NAME_BYTES: usize = 48;
 pub const MAX_MATCH_LENGTH: u16 = 25;
@@ -25,10 +25,16 @@ pub struct GameConfiguration {
 pub enum GameActionPayload {
     CreateGame(GameConfiguration),
 
-    RecordRoll {
+    CommitDice {
         turn: u32,
         player: Player,
-        dice: Dice,
+        commitment: DiceCommitment,
+    },
+
+    RevealDice {
+        turn: u32,
+        player: Player,
+        secret: DiceSecret,
     },
 
     PlayTurn {
@@ -64,7 +70,6 @@ pub enum GameActionError {
     DisplayNameTooLong(Player),
     DuplicatePlayerIdentity,
     InvalidMatchLength,
-    InvalidDice(StateError),
     MoveOwnedByWrongPlayer {
         expected: Player,
         checker_move: CheckerMove,
@@ -107,7 +112,7 @@ impl GameActionPayload {
         match self {
             Self::CreateGame(configuration) => configuration.verify(),
 
-            Self::RecordRoll { dice, .. } => dice.verify().map_err(GameActionError::InvalidDice),
+            Self::CommitDice { .. } | Self::RevealDice { .. } => Ok(()),
 
             Self::PlayTurn {
                 player, sequence, ..
@@ -247,20 +252,48 @@ mod tests {
     }
 
     #[test]
-    fn invalid_recorded_dice_are_rejected() {
-        let payload = GameActionPayload::RecordRoll {
+    fn dice_commitment_action_is_accepted() {
+        let payload = GameActionPayload::CommitDice {
             turn: 0,
             player: Player::White,
-            dice: Dice {
-                first: 0,
-                second: 6,
-            },
+            commitment: [7; 32],
         };
 
-        assert_eq!(
-            payload.verify(),
-            Err(GameActionError::InvalidDice(StateError::InvalidDieValue))
-        );
+        assert_eq!(record(payload).verify(), Ok(()));
+    }
+
+    #[test]
+    fn dice_reveal_action_is_accepted() {
+        let payload = GameActionPayload::RevealDice {
+            turn: 0,
+            player: Player::Black,
+            secret: [9; 32],
+        };
+
+        assert_eq!(record(payload).verify(), Ok(()));
+    }
+
+    #[test]
+    fn fair_dice_actions_round_trip_canonically() {
+        for payload in [
+            GameActionPayload::CommitDice {
+                turn: 4,
+                player: Player::White,
+                commitment: [11; 32],
+            },
+            GameActionPayload::RevealDice {
+                turn: 4,
+                player: Player::Black,
+                secret: [22; 32],
+            },
+        ] {
+            let mut encoded = Vec::new();
+            ciborium::ser::into_writer(&payload, &mut encoded).unwrap();
+
+            let decoded: GameActionPayload = ciborium::de::from_reader(encoded.as_slice()).unwrap();
+
+            assert_eq!(decoded, payload);
+        }
     }
 
     #[test]

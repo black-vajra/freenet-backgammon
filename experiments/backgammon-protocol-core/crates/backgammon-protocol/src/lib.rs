@@ -13,7 +13,7 @@ pub use state_hash::*;
 use ciborium::{de::from_reader, ser::into_writer};
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const GENESIS_STATE_HASH: StateHash = [0_u8; 32];
 
 pub type GameId = [u8; 32];
@@ -248,6 +248,7 @@ mod tests {
             configuration(),
             backgammon_core::GameState::standard_start(),
             0,
+            DiceRoundState::default(),
             ReplayStatus::InProgress,
         );
 
