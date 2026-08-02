@@ -1,4 +1,4 @@
-use backgammon_protocol::{verify_action_history, Action, LedgerParameters};
+use backgammon_protocol::{verify_typed_action_history, Action, LedgerParameters};
 use ciborium::{de::from_reader, ser::into_writer};
 use freenet_scaffold_macro::composable;
 use freenet_stdlib::prelude::*;
@@ -45,7 +45,7 @@ impl ComposableState for Actions {
     ) -> Result<(), String> {
         parameters.verify()?;
         self.verify_inner()?;
-        verify_action_history(&self.0)
+        verify_typed_action_history(&self.0)
     }
 
     fn summarize(
@@ -195,7 +195,11 @@ impl ContractInterface for Contract {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use backgammon_protocol::{StateHash, GENESIS_STATE_HASH, PROTOCOL_VERSION};
+    use backgammon_core::{GameState, Player, TurnSequence};
+    use backgammon_protocol::{
+        CanonicalReplayState, GameActionPayload, GameActionRecord, GameConfiguration,
+        PlayerDescriptor, ReplayStatus, StateHash, GENESIS_STATE_HASH, PROTOCOL_VERSION,
+    };
 
     fn params() -> LedgerParameters {
         LedgerParameters {
@@ -207,20 +211,92 @@ mod tests {
         [id; 32]
     }
 
-    fn action(id: u8, sequence: u32) -> Action {
-        let previous_state_hash = if sequence == 0 {
-            GENESIS_STATE_HASH
-        } else {
-            state_hash(sequence as u8)
-        };
+    fn configuration() -> GameConfiguration {
+        GameConfiguration {
+            white: PlayerDescriptor {
+                id: [1; 32],
+                display_name: "White".to_owned(),
+            },
+            black: PlayerDescriptor {
+                id: [2; 32],
+                display_name: "Black".to_owned(),
+            },
+            match_length: 1,
+        }
+    }
 
-        Action {
+    fn create_hash() -> StateHash {
+        CanonicalReplayState::new(
+            [7; 32],
+            configuration(),
+            GameState::standard_start(),
+            0,
+            ReplayStatus::InProgress,
+        )
+        .hash()
+        .unwrap()
+    }
+
+    fn resignation_hash() -> StateHash {
+        CanonicalReplayState::new(
+            [7; 32],
+            configuration(),
+            GameState::standard_start(),
+            0,
+            ReplayStatus::Resigned {
+                resigned: Player::White,
+                winner: Player::Black,
+            },
+        )
+        .hash()
+        .unwrap()
+    }
+
+    fn typed_action(
+        id: u8,
+        sequence: u32,
+        previous_state_hash: StateHash,
+        resulting_state_hash: StateHash,
+        payload: GameActionPayload,
+    ) -> Action {
+        Action::from_game_action_record(&GameActionRecord {
+            protocol_version: PROTOCOL_VERSION,
             game_id: [7; 32],
-            id: [id; 32],
-            sequence,
+            action_id: [id; 32],
+            sequence: u64::from(sequence),
             previous_state_hash,
-            resulting_state_hash: state_hash((sequence + 1) as u8),
-            payload: vec![id],
+            resulting_state_hash,
+            payload,
+        })
+        .unwrap()
+    }
+
+    fn action(id: u8, sequence: u32) -> Action {
+        match sequence {
+            0 => typed_action(
+                id,
+                0,
+                GENESIS_STATE_HASH,
+                create_hash(),
+                GameActionPayload::CreateGame(configuration()),
+            ),
+            1 => typed_action(
+                id,
+                1,
+                create_hash(),
+                resignation_hash(),
+                GameActionPayload::Resign {
+                    player: Player::White,
+                },
+            ),
+            _ => Action {
+                game_id: [7; 32],
+                id: [id; 32],
+                sequence,
+                previous_state_hash: state_hash(sequence as u8),
+                resulting_state_hash: state_hash((sequence + 1) as u8),
+                payload: vec![id],
+            },
         }
     }
 
@@ -417,6 +493,74 @@ mod tests {
 
         assert_eq!(left_then_right, right_then_left);
         assert_eq!(left_then_right.actions.0.len(), 2);
+    }
+
+    #[test]
+    fn malformed_typed_payload_is_rejected_by_contract_state() {
+        let mut malformed = action(1, 0);
+        malformed.payload = vec![0x9f, 0x01];
+
+        let state = LedgerState {
+            actions: Actions(vec![malformed]),
+        };
+
+        assert!(state.verify(&state, &params()).is_err());
+    }
+
+    #[test]
+    fn forged_canonical_state_hash_is_rejected_by_contract_state() {
+        let mut forged = action(1, 0);
+        forged.resulting_state_hash = [99; 32];
+
+        let state = LedgerState {
+            actions: Actions(vec![forged]),
+        };
+
+        assert!(state
+            .verify(&state, &params())
+            .unwrap_err()
+            .contains("ResultingStateHashMismatch"));
+    }
+
+    #[test]
+    fn turn_without_roll_is_rejected_by_contract_state() {
+        let create = action(1, 0);
+
+        let illegal_turn = typed_action(
+            2,
+            1,
+            create_hash(),
+            [88; 32],
+            GameActionPayload::PlayTurn {
+                turn: 0,
+                player: Player::White,
+                sequence: TurnSequence::default(),
+            },
+        );
+
+        let mut actions = vec![create, illegal_turn];
+        actions.sort_by(|left, right| left.id.cmp(&right.id));
+
+        let state = LedgerState {
+            actions: Actions(actions),
+        };
+
+        assert!(state
+            .verify(&state, &params())
+            .unwrap_err()
+            .contains("RollExpected"));
+    }
+
+    #[test]
+    fn valid_typed_create_and_resignation_are_accepted() {
+        let mut actions = vec![action(1, 0), action(2, 1)];
+        actions.sort_by(|left, right| left.id.cmp(&right.id));
+
+        let state = LedgerState {
+            actions: Actions(actions),
+        };
+
+        assert_eq!(state.verify(&state, &params()), Ok(()));
     }
 
     #[test]
