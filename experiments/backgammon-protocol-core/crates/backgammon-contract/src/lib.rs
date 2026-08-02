@@ -1,4 +1,4 @@
-use backgammon_protocol::{Action, LedgerParameters, PROTOCOL_VERSION};
+use backgammon_protocol::{verify_action_sequences, Action, LedgerParameters, PROTOCOL_VERSION};
 use ciborium::{de::from_reader, ser::into_writer};
 use freenet_scaffold_macro::composable;
 use freenet_stdlib::prelude::*;
@@ -44,7 +44,8 @@ impl ComposableState for Actions {
         parameters: &Self::Parameters,
     ) -> Result<(), String> {
         parameters.verify()?;
-        self.verify_inner()
+        self.verify_inner()?;
+        verify_action_sequences(&self.0)
     }
 
     fn summarize(
@@ -289,6 +290,51 @@ mod tests {
             state.verify(&state, &unsupported),
             Err("unsupported protocol version".into())
         );
+    }
+
+    #[test]
+    fn final_state_rejects_sequence_starting_after_zero() {
+        let state = LedgerState {
+            actions: Actions(vec![action(1, 1)]),
+        };
+
+        assert_eq!(
+            state.verify(&state, &params()),
+            Err("action sequence gap".into())
+        );
+    }
+
+    #[test]
+    fn final_state_rejects_duplicate_sequences() {
+        let state = LedgerState {
+            actions: Actions(vec![action(1, 0), action(2, 0)]),
+        };
+
+        assert_eq!(
+            state.verify(&state, &params()),
+            Err("duplicate action sequence".into())
+        );
+    }
+
+    #[test]
+    fn final_state_rejects_sequence_gaps() {
+        let state = LedgerState {
+            actions: Actions(vec![action(1, 0), action(3, 2)]),
+        };
+
+        assert_eq!(
+            state.verify(&state, &params()),
+            Err("action sequence gap".into())
+        );
+    }
+
+    #[test]
+    fn final_state_accepts_contiguous_sequences_in_id_order() {
+        let state = LedgerState {
+            actions: Actions(vec![action(1, 1), action(2, 0)]),
+        };
+
+        assert_eq!(state.verify(&state, &params()), Ok(()));
     }
 
     #[test]
