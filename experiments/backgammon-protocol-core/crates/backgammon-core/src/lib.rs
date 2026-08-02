@@ -1501,6 +1501,200 @@ mod tests {
     }
 
     #[test]
+    fn only_one_move_order_uses_both_dice() {
+        let state = turn_state(
+            &[(0, 1)],
+            0,
+            14,
+            &[(2, 2), (23, 13)],
+            0,
+            0,
+            Dice {
+                first: 1,
+                second: 2,
+            },
+        );
+
+        let sequences = state.legal_turn_sequences().unwrap();
+
+        assert_eq!(
+            sequences,
+            vec![TurnSequence {
+                moves: vec![
+                    CheckerMove {
+                        player: Player::White,
+                        source: MoveSource::Point(0),
+                        die: 1,
+                    },
+                    CheckerMove {
+                        player: Player::White,
+                        source: MoveSource::Point(1),
+                        die: 2,
+                    },
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn hitting_with_first_die_opens_second_move() {
+        let state = turn_state(
+            &[(0, 1)],
+            0,
+            14,
+            &[(1, 1), (2, 2), (23, 12)],
+            0,
+            0,
+            Dice {
+                first: 1,
+                second: 2,
+            },
+        );
+
+        let sequences = state.legal_turn_sequences().unwrap();
+
+        assert_eq!(
+            sequences,
+            vec![TurnSequence {
+                moves: vec![
+                    CheckerMove {
+                        player: Player::White,
+                        source: MoveSource::Point(0),
+                        die: 1,
+                    },
+                    CheckerMove {
+                        player: Player::White,
+                        source: MoveSource::Point(1),
+                        die: 2,
+                    },
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn bar_entry_with_one_die_enables_other_die() {
+        let state = turn_state(
+            &[],
+            1,
+            14,
+            &[(1, 2), (23, 13)],
+            0,
+            0,
+            Dice {
+                first: 1,
+                second: 2,
+            },
+        );
+
+        let sequences = state.legal_turn_sequences().unwrap();
+
+        assert_eq!(
+            sequences,
+            vec![TurnSequence {
+                moves: vec![
+                    CheckerMove {
+                        player: Player::White,
+                        source: MoveSource::Bar,
+                        die: 1,
+                    },
+                    CheckerMove {
+                        player: Player::White,
+                        source: MoveSource::Point(0),
+                        die: 2,
+                    },
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn doubles_use_three_moves_when_fourth_is_blocked() {
+        let state = turn_state(
+            &[(0, 1)],
+            0,
+            14,
+            &[(4, 2), (23, 13)],
+            0,
+            0,
+            Dice {
+                first: 1,
+                second: 1,
+            },
+        );
+
+        let sequences = state.legal_turn_sequences().unwrap();
+
+        assert_eq!(
+            sequences,
+            vec![TurnSequence {
+                moves: vec![
+                    CheckerMove {
+                        player: Player::White,
+                        source: MoveSource::Point(0),
+                        die: 1,
+                    },
+                    CheckerMove {
+                        player: Player::White,
+                        source: MoveSource::Point(1),
+                        die: 1,
+                    },
+                    CheckerMove {
+                        player: Player::White,
+                        source: MoveSource::Point(2),
+                        die: 1,
+                    },
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn game_completion_stops_remaining_dice_and_uses_higher_die() {
+        let state = turn_state(
+            &[(23, 1)],
+            0,
+            14,
+            &[(6, 15)],
+            0,
+            0,
+            Dice {
+                first: 1,
+                second: 2,
+            },
+        );
+
+        assert_eq!(
+            state.legal_turn_sequences(),
+            Ok(vec![TurnSequence {
+                moves: vec![CheckerMove {
+                    player: Player::White,
+                    source: MoveSource::Point(23),
+                    die: 2,
+                }],
+            }])
+        );
+    }
+
+    #[test]
+    fn generated_turn_sequences_are_sorted_and_unique() {
+        let mut state = GameState::standard_start();
+        state.turn_phase = TurnPhase::Moving;
+        state.dice = Some(Dice {
+            first: 1,
+            second: 2,
+        });
+
+        let sequences = state.legal_turn_sequences().unwrap();
+
+        assert!(!sequences.is_empty());
+
+        for pair in sequences.windows(2) {
+            assert!(pair[0] < pair[1]);
+        }
+    }
+
+    #[test]
     fn inactive_player_cannot_move() {
         let mut state = moving_state();
 
