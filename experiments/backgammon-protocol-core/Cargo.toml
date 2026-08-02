@@ -1,21 +1,22 @@
-[package]
-name = "ledger-prototype"
+[workspace]
+resolver = "2"
+members = [
+    "crates/backgammon-core",
+    "crates/backgammon-protocol",
+    "crates/backgammon-contract",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 
-[lib]
-crate-type = ["cdylib", "rlib"]
-
-[dependencies]
+[workspace.dependencies]
 ciborium = "0.2.2"
 freenet-scaffold = "0.2.2"
 freenet-scaffold-macro = "0.2.2"
 freenet-stdlib = { version = "0.8.5", features = ["contract"] }
 serde = { version = "1.0", features = ["derive"] }
-
-[features]
-default = ["freenet-main-contract"]
-freenet-main-contract = []
 
 [profile.release]
 opt-level = "z"

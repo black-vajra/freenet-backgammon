@@ -1,0 +1,13 @@
+[package]
+name = "backgammon-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+backgammon-core = { path = "../backgammon-core" }
+ciborium.workspace = true
+serde.workspace = true

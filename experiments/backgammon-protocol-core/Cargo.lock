@@ -39,6 +39,35 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
+name = "backgammon-contract"
+version = "0.1.0"
+dependencies = [
+ "backgammon-core",
+ "backgammon-protocol",
+ "ciborium",
+ "freenet-scaffold",
+ "freenet-scaffold-macro",
+ "freenet-stdlib",
+ "serde",
+]
+
+[[package]]
+name = "backgammon-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "backgammon-protocol"
+version = "0.1.0"
+dependencies = [
+ "backgammon-core",
+ "ciborium",
+ "serde",
+]
+
+[[package]]
 name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -530,17 +559,6 @@ name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
-
-[[package]]
-name = "ledger-prototype"
-version = "0.1.0"
-dependencies = [
- "ciborium",
- "freenet-scaffold",
- "freenet-scaffold-macro",
- "freenet-stdlib",
- "serde",
-]
 
 [[package]]
 name = "libc"
