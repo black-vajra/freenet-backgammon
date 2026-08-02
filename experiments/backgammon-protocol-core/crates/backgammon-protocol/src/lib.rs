@@ -1,22 +1,27 @@
 #![forbid(unsafe_code)]
 
-use backgammon_core::CoreProtocolMarker;
 use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: u16 = 1;
 
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct ProtocolMarker {
-    pub core: CoreProtocolMarker,
+#[derive(Serialize, Deserialize, Clone, Default, PartialEq, Eq, Debug)]
+pub struct LedgerParameters {
     pub protocol_version: u16,
 }
 
-impl Default for ProtocolMarker {
-    fn default() -> Self {
+impl LedgerParameters {
+    pub const fn current() -> Self {
         Self {
-            core: CoreProtocolMarker::default(),
             protocol_version: PROTOCOL_VERSION,
         }
+    }
+
+    pub fn verify(&self) -> Result<(), String> {
+        if self.protocol_version != PROTOCOL_VERSION {
+            return Err("unsupported protocol version".into());
+        }
+
+        Ok(())
     }
 }
 
@@ -25,10 +30,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_protocol_marker_is_consistent() {
-        let marker = ProtocolMarker::default();
+    fn current_parameters_use_supported_version() {
+        let parameters = LedgerParameters::current();
 
-        assert_eq!(marker.core.version, PROTOCOL_VERSION);
-        assert_eq!(marker.protocol_version, PROTOCOL_VERSION);
+        assert_eq!(parameters.protocol_version, PROTOCOL_VERSION);
+        assert_eq!(parameters.verify(), Ok(()));
+    }
+
+    #[test]
+    fn unsupported_version_is_rejected() {
+        let parameters = LedgerParameters {
+            protocol_version: PROTOCOL_VERSION + 1,
+        };
+
+        assert_eq!(
+            parameters.verify(),
+            Err("unsupported protocol version".into())
+        );
     }
 }

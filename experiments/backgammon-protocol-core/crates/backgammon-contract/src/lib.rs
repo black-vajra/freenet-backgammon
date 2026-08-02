@@ -1,16 +1,11 @@
+use backgammon_protocol::{LedgerParameters, PROTOCOL_VERSION};
 use ciborium::{de::from_reader, ser::into_writer};
 use freenet_scaffold_macro::composable;
 use freenet_stdlib::prelude::*;
 use serde::{Deserialize, Serialize};
 
-const PROTOCOL_VERSION: u16 = 1;
 const MAX_ACTIONS: usize = 256;
 const MAX_PAYLOAD_BYTES: usize = 1024;
-
-#[derive(Serialize, Deserialize, Clone, Default, PartialEq, Eq, Debug)]
-pub struct LedgerParameters {
-    pub protocol_version: u16,
-}
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct Action {
@@ -55,9 +50,7 @@ impl ComposableState for Actions {
         _parent: &Self::ParentState,
         parameters: &Self::Parameters,
     ) -> Result<(), String> {
-        if parameters.protocol_version != PROTOCOL_VERSION {
-            return Err("unsupported protocol version".into());
-        }
+        parameters.verify()?;
         self.verify_inner()
     }
 
@@ -184,7 +177,9 @@ impl ContractInterface for Contract {
         }
         let parameters: LedgerParameters = decode(parameters.as_ref())?;
         let state: LedgerState = decode(state.as_ref())?;
-        Ok(StateSummary::from(encode(&state.summarize(&state, &parameters))?))
+        Ok(StateSummary::from(encode(
+            &state.summarize(&state, &parameters),
+        )?))
     }
 
     fn get_state_delta(
@@ -195,7 +190,11 @@ impl ContractInterface for Contract {
         let parameters: LedgerParameters = decode(parameters.as_ref())?;
         let state: LedgerState = decode(state.as_ref())?;
         let summary: LedgerStateSummary = decode(summary.as_ref())?;
-        Ok(StateDelta::from(encode(&state.delta(&state, &parameters, &summary))?))
+        Ok(StateDelta::from(encode(&state.delta(
+            &state,
+            &parameters,
+            &summary,
+        ))?))
     }
 }
 
@@ -204,11 +203,17 @@ mod tests {
     use super::*;
 
     fn params() -> LedgerParameters {
-        LedgerParameters { protocol_version: PROTOCOL_VERSION }
+        LedgerParameters {
+            protocol_version: PROTOCOL_VERSION,
+        }
     }
 
     fn action(id: u8, sequence: u32) -> Action {
-        Action { id: [id; 32], sequence, payload: vec![id] }
+        Action {
+            id: [id; 32],
+            sequence,
+            payload: vec![id],
+        }
     }
 
     fn encoded<T: Serialize>(value: &T) -> Vec<u8> {
@@ -219,8 +224,12 @@ mod tests {
     fn opposite_update_orders_converge() {
         let p = params();
         let empty = LedgerState::default();
-        let da = LedgerStateDelta { actions: Some(vec![action(1, 0)]) };
-        let db = LedgerStateDelta { actions: Some(vec![action(2, 1)]) };
+        let da = LedgerStateDelta {
+            actions: Some(vec![action(1, 0)]),
+        };
+        let db = LedgerStateDelta {
+            actions: Some(vec![action(2, 1)]),
+        };
         let mut ab = empty.clone();
         ab.apply_delta(&ab.clone(), &p, &Some(da.clone())).unwrap();
         ab.apply_delta(&ab.clone(), &p, &Some(db.clone())).unwrap();
@@ -233,9 +242,13 @@ mod tests {
     #[test]
     fn duplicate_is_idempotent() {
         let p = params();
-        let d = LedgerStateDelta { actions: Some(vec![action(1, 0)]) };
+        let d = LedgerStateDelta {
+            actions: Some(vec![action(1, 0)]),
+        };
         let mut state = LedgerState::default();
-        state.apply_delta(&state.clone(), &p, &Some(d.clone())).unwrap();
+        state
+            .apply_delta(&state.clone(), &p, &Some(d.clone()))
+            .unwrap();
         let once = state.clone();
         state.apply_delta(&state.clone(), &p, &Some(d)).unwrap();
         assert_eq!(state, once);
@@ -245,18 +258,26 @@ mod tests {
     fn same_id_with_different_content_is_rejected() {
         let p = params();
         let mut state = LedgerState::default();
-        state.apply_delta(
-            &state.clone(),
-            &p,
-            &Some(LedgerStateDelta { actions: Some(vec![action(1, 0)]) }),
-        ).unwrap();
+        state
+            .apply_delta(
+                &state.clone(),
+                &p,
+                &Some(LedgerStateDelta {
+                    actions: Some(vec![action(1, 0)]),
+                }),
+            )
+            .unwrap();
         let mut conflicting = action(1, 99);
         conflicting.payload = vec![9];
-        assert!(state.apply_delta(
-            &state.clone(),
-            &p,
-            &Some(LedgerStateDelta { actions: Some(vec![conflicting]) }),
-        ).is_err());
+        assert!(state
+            .apply_delta(
+                &state.clone(),
+                &p,
+                &Some(LedgerStateDelta {
+                    actions: Some(vec![conflicting])
+                }),
+            )
+            .is_err());
     }
 
     #[test]
