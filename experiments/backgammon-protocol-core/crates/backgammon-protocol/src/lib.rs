@@ -2,9 +2,11 @@
 
 mod game_action;
 mod replay;
+mod state_hash;
 
 pub use game_action::*;
 pub use replay::*;
+pub use state_hash::*;
 
 use serde::{Deserialize, Serialize};
 

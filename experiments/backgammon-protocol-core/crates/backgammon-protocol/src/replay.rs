@@ -1,13 +1,14 @@
 use std::collections::BTreeSet;
 
 use backgammon_core::{GameState, GameStatus, Player, TurnError, TurnPhase};
+use serde::{Deserialize, Serialize};
 
 use crate::{
-    GameActionError, GameActionPayload, GameActionRecord, GameConfiguration, GameId, StateHash,
-    GENESIS_STATE_HASH,
+    CanonicalReplayState, GameActionError, GameActionPayload, GameActionRecord, GameConfiguration,
+    GameId, StateHash, StateHashError, GENESIS_STATE_HASH,
 };
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum ReplayStatus {
     InProgress,
     Completed { winner: Player, points: u8 },
@@ -46,6 +47,15 @@ pub enum ReplayError {
     BrokenStateHashChain {
         sequence: u64,
     },
+    ResultingStateHashMismatch {
+        sequence: u64,
+        expected: StateHash,
+        found: StateHash,
+    },
+    StateHash {
+        sequence: u64,
+        error: StateHashError,
+    },
     FirstActionMustCreateGame,
     DuplicateGameCreation,
     ActionAfterTerminalState {
@@ -70,6 +80,20 @@ pub enum ReplayError {
 }
 
 impl ReplayedGame {
+    pub fn canonical_state(&self) -> CanonicalReplayState {
+        CanonicalReplayState::new(
+            self.game_id,
+            self.configuration.clone(),
+            self.state.clone(),
+            self.next_turn,
+            self.status.clone(),
+        )
+    }
+
+    pub fn canonical_hash(&self) -> Result<StateHash, StateHashError> {
+        self.canonical_state().hash()
+    }
+
     fn refresh_status_from_board(&mut self) {
         if let GameStatus::Completed { winner, points } = self.state.status {
             self.status = ReplayStatus::Completed { winner, points };
@@ -206,6 +230,23 @@ pub fn replay_game(records: &[GameActionRecord]) -> Result<ReplayedGame, ReplayE
         latest_state_hash: first.resulting_state_hash,
     };
 
+    let expected_first_hash = replay
+        .canonical_hash()
+        .map_err(|error| ReplayError::StateHash {
+            sequence: first.sequence,
+            error,
+        })?;
+
+    if first.resulting_state_hash != expected_first_hash {
+        return Err(ReplayError::ResultingStateHashMismatch {
+            sequence: first.sequence,
+            expected: expected_first_hash,
+            found: first.resulting_state_hash,
+        });
+    }
+
+    replay.latest_state_hash = expected_first_hash;
+
     let mut action_ids = BTreeSet::new();
     action_ids.insert(first.action_id);
 
@@ -239,7 +280,23 @@ pub fn replay_game(records: &[GameActionRecord]) -> Result<ReplayedGame, ReplayE
         }
 
         replay.apply_record(record)?;
-        replay.latest_state_hash = record.resulting_state_hash;
+
+        let expected_hash = replay
+            .canonical_hash()
+            .map_err(|error| ReplayError::StateHash {
+                sequence: record.sequence,
+                error,
+            })?;
+
+        if record.resulting_state_hash != expected_hash {
+            return Err(ReplayError::ResultingStateHashMismatch {
+                sequence: record.sequence,
+                expected: expected_hash,
+                found: record.resulting_state_hash,
+            });
+        }
+
+        replay.latest_state_hash = expected_hash;
         replay.next_sequence = replay
             .next_sequence
             .checked_add(1)
@@ -269,7 +326,7 @@ mod tests {
         }
     }
 
-    fn record(
+    fn bare_record(
         sequence: u64,
         action_id: u8,
         previous_state_hash: StateHash,
@@ -288,13 +345,41 @@ mod tests {
     }
 
     fn create_record() -> GameActionRecord {
-        record(
+        let replay = ReplayedGame {
+            game_id: [9; 32],
+            configuration: configuration(),
+            state: GameState::standard_start(),
+            next_sequence: 1,
+            next_turn: 0,
+            status: ReplayStatus::InProgress,
+            latest_state_hash: GENESIS_STATE_HASH,
+        };
+
+        bare_record(
             0,
             1,
             GENESIS_STATE_HASH,
-            [10; 32],
+            replay.canonical_hash().unwrap(),
             GameActionPayload::CreateGame(configuration()),
         )
+    }
+
+    fn append_valid(records: &mut Vec<GameActionRecord>, payload: GameActionPayload) {
+        let current = replay_game(records).unwrap();
+        let sequence = current.next_sequence;
+        let mut next = current.clone();
+
+        let mut record = bare_record(
+            sequence,
+            u8::try_from(sequence + 1).unwrap(),
+            current.latest_state_hash,
+            [0; 32],
+            payload,
+        );
+
+        next.apply_record(&record).unwrap();
+        record.resulting_state_hash = next.canonical_hash().unwrap();
+        records.push(record);
     }
 
     fn legal_opening_sequence(dice: Dice) -> TurnSequence {
@@ -306,14 +391,15 @@ mod tests {
 
     #[test]
     fn create_game_replays_from_genesis() {
-        let replay = replay_game(&[create_record()]).unwrap();
+        let create = create_record();
+        let replay = replay_game(&[create.clone()]).unwrap();
 
         assert_eq!(replay.game_id, [9; 32]);
         assert_eq!(replay.next_sequence, 1);
         assert_eq!(replay.next_turn, 0);
         assert_eq!(replay.status, ReplayStatus::InProgress);
         assert_eq!(replay.state, GameState::standard_start());
-        assert_eq!(replay.latest_state_hash, [10; 32]);
+        assert_eq!(replay.latest_state_hash, create.resulting_state_hash);
     }
 
     #[test]
@@ -324,45 +410,80 @@ mod tests {
         };
         let sequence = legal_opening_sequence(dice);
 
-        let actions = vec![
-            create_record(),
-            record(
-                1,
-                2,
-                [10; 32],
-                [11; 32],
-                GameActionPayload::RecordRoll {
-                    turn: 0,
-                    player: Player::White,
-                    dice,
-                },
-            ),
-            record(
-                2,
-                3,
-                [11; 32],
-                [12; 32],
-                GameActionPayload::PlayTurn {
-                    turn: 0,
-                    player: Player::White,
-                    sequence,
-                },
-            ),
-        ];
+        let mut actions = vec![create_record()];
 
-        let replay = replay_game(&actions).unwrap();
+        append_valid(
+            &mut actions,
+            GameActionPayload::RecordRoll {
+                turn: 0,
+                player: Player::White,
+                dice,
+            },
+        );
 
-        assert_eq!(replay.next_sequence, 3);
-        assert_eq!(replay.next_turn, 1);
-        assert_eq!(replay.state.active_player, Player::Black);
-        assert_eq!(replay.state.turn_phase, TurnPhase::AwaitingRoll);
-        assert_eq!(replay.state.dice, None);
-        assert_eq!(replay.latest_state_hash, [12; 32]);
+        append_valid(
+            &mut actions,
+            GameActionPayload::PlayTurn {
+                turn: 0,
+                player: Player::White,
+                sequence,
+            },
+        );
+
+        let first = replay_game(&actions).unwrap();
+        let second = replay_game(&actions).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(first.next_sequence, 3);
+        assert_eq!(first.next_turn, 1);
+        assert_eq!(first.state.active_player, Player::Black);
+        assert_eq!(first.state.turn_phase, TurnPhase::AwaitingRoll);
+        assert_eq!(first.state.dice, None);
+    }
+
+    #[test]
+    fn forged_create_resulting_hash_is_rejected() {
+        let mut create = create_record();
+        let expected = create.resulting_state_hash;
+        create.resulting_state_hash = [99; 32];
+
+        assert_eq!(
+            replay_game(&[create]),
+            Err(ReplayError::ResultingStateHashMismatch {
+                sequence: 0,
+                expected,
+                found: [99; 32],
+            })
+        );
+    }
+
+    #[test]
+    fn forged_post_action_resulting_hash_is_rejected() {
+        let mut actions = vec![create_record()];
+
+        append_valid(
+            &mut actions,
+            GameActionPayload::Resign {
+                player: Player::White,
+            },
+        );
+
+        let expected = actions[1].resulting_state_hash;
+        actions[1].resulting_state_hash = [88; 32];
+
+        assert_eq!(
+            replay_game(&actions),
+            Err(ReplayError::ResultingStateHashMismatch {
+                sequence: 1,
+                expected,
+                found: [88; 32],
+            })
+        );
     }
 
     #[test]
     fn first_action_must_create_game() {
-        let action = record(
+        let action = bare_record(
             0,
             1,
             GENESIS_STATE_HASH,
@@ -385,21 +506,20 @@ mod tests {
 
     #[test]
     fn sequence_gap_is_rejected() {
-        let actions = vec![
-            create_record(),
-            record(
-                2,
-                2,
-                [10; 32],
-                [11; 32],
-                GameActionPayload::Resign {
-                    player: Player::White,
-                },
-            ),
-        ];
+        let create = create_record();
+
+        let second = bare_record(
+            2,
+            2,
+            create.resulting_state_hash,
+            [11; 32],
+            GameActionPayload::Resign {
+                player: Player::White,
+            },
+        );
 
         assert_eq!(
-            replay_game(&actions),
+            replay_game(&[create, second]),
             Err(ReplayError::SequenceGap {
                 expected: 1,
                 found: 2,
@@ -409,10 +529,12 @@ mod tests {
 
     #[test]
     fn mixed_game_ids_are_rejected() {
-        let mut second = record(
+        let create = create_record();
+
+        let mut second = bare_record(
             1,
             2,
-            [10; 32],
+            create.resulting_state_hash,
             [11; 32],
             GameActionPayload::Resign {
                 player: Player::White,
@@ -421,7 +543,7 @@ mod tests {
         second.game_id = [8; 32];
 
         assert_eq!(
-            replay_game(&[create_record(), second]),
+            replay_game(&[create, second]),
             Err(ReplayError::MixedGameIds)
         );
     }
@@ -430,7 +552,7 @@ mod tests {
     fn broken_hash_chain_is_rejected() {
         let actions = vec![
             create_record(),
-            record(
+            bare_record(
                 1,
                 2,
                 [99; 32],
@@ -449,23 +571,23 @@ mod tests {
 
     #[test]
     fn wrong_turn_number_is_rejected() {
-        let actions = vec![
-            create_record(),
-            record(
-                1,
-                2,
-                [10; 32],
-                [11; 32],
-                GameActionPayload::RecordRoll {
-                    turn: 1,
-                    player: Player::White,
-                    dice: Dice {
-                        first: 1,
-                        second: 2,
-                    },
+        let mut actions = vec![create_record()];
+        let previous = actions[0].resulting_state_hash;
+
+        actions.push(bare_record(
+            1,
+            2,
+            previous,
+            [11; 32],
+            GameActionPayload::RecordRoll {
+                turn: 1,
+                player: Player::White,
+                dice: Dice {
+                    first: 1,
+                    second: 2,
                 },
-            ),
-        ];
+            },
+        ));
 
         assert_eq!(
             replay_game(&actions),
@@ -478,23 +600,23 @@ mod tests {
 
     #[test]
     fn wrong_player_roll_is_rejected() {
-        let actions = vec![
-            create_record(),
-            record(
-                1,
-                2,
-                [10; 32],
-                [11; 32],
-                GameActionPayload::RecordRoll {
-                    turn: 0,
-                    player: Player::Black,
-                    dice: Dice {
-                        first: 1,
-                        second: 2,
-                    },
+        let mut actions = vec![create_record()];
+        let previous = actions[0].resulting_state_hash;
+
+        actions.push(bare_record(
+            1,
+            2,
+            previous,
+            [11; 32],
+            GameActionPayload::RecordRoll {
+                turn: 0,
+                player: Player::Black,
+                dice: Dice {
+                    first: 1,
+                    second: 2,
                 },
-            ),
-        ];
+            },
+        ));
 
         assert_eq!(
             replay_game(&actions),
@@ -507,20 +629,20 @@ mod tests {
 
     #[test]
     fn turn_without_roll_is_rejected() {
-        let actions = vec![
-            create_record(),
-            record(
-                1,
-                2,
-                [10; 32],
-                [11; 32],
-                GameActionPayload::PlayTurn {
-                    turn: 0,
-                    player: Player::White,
-                    sequence: TurnSequence::default(),
-                },
-            ),
-        ];
+        let mut actions = vec![create_record()];
+        let previous = actions[0].resulting_state_hash;
+
+        actions.push(bare_record(
+            1,
+            2,
+            previous,
+            [11; 32],
+            GameActionPayload::PlayTurn {
+                turn: 0,
+                player: Player::White,
+                sequence: TurnSequence::default(),
+            },
+        ));
 
         assert_eq!(replay_game(&actions), Err(ReplayError::RollExpected));
     }
@@ -531,59 +653,56 @@ mod tests {
             first: 1,
             second: 2,
         };
+        let mut actions = vec![create_record()];
 
-        let actions = vec![
-            create_record(),
-            record(
-                1,
-                2,
-                [10; 32],
-                [11; 32],
-                GameActionPayload::RecordRoll {
-                    turn: 0,
-                    player: Player::White,
-                    dice,
-                },
-            ),
-            record(
-                2,
-                3,
-                [11; 32],
-                [12; 32],
-                GameActionPayload::RecordRoll {
-                    turn: 0,
-                    player: Player::White,
-                    dice,
-                },
-            ),
-        ];
+        append_valid(
+            &mut actions,
+            GameActionPayload::RecordRoll {
+                turn: 0,
+                player: Player::White,
+                dice,
+            },
+        );
+
+        let current = replay_game(&actions).unwrap();
+
+        actions.push(bare_record(
+            current.next_sequence,
+            3,
+            current.latest_state_hash,
+            [12; 32],
+            GameActionPayload::RecordRoll {
+                turn: 0,
+                player: Player::White,
+                dice,
+            },
+        ));
 
         assert_eq!(replay_game(&actions), Err(ReplayError::RollAlreadyPending));
     }
 
     #[test]
     fn action_after_resignation_is_rejected() {
-        let actions = vec![
-            create_record(),
-            record(
-                1,
-                2,
-                [10; 32],
-                [11; 32],
-                GameActionPayload::Resign {
-                    player: Player::White,
-                },
-            ),
-            record(
-                2,
-                3,
-                [11; 32],
-                [12; 32],
-                GameActionPayload::Abandon {
-                    player: Player::Black,
-                },
-            ),
-        ];
+        let mut actions = vec![create_record()];
+
+        append_valid(
+            &mut actions,
+            GameActionPayload::Resign {
+                player: Player::White,
+            },
+        );
+
+        let current = replay_game(&actions).unwrap();
+
+        actions.push(bare_record(
+            current.next_sequence,
+            3,
+            current.latest_state_hash,
+            [12; 32],
+            GameActionPayload::Abandon {
+                player: Player::Black,
+            },
+        ));
 
         assert_eq!(
             replay_game(&actions),
@@ -593,19 +712,21 @@ mod tests {
 
     #[test]
     fn duplicate_action_id_is_rejected() {
-        let actions = vec![
-            create_record(),
-            record(
-                1,
-                1,
-                [10; 32],
-                [11; 32],
-                GameActionPayload::Resign {
-                    player: Player::White,
-                },
-            ),
-        ];
+        let create = create_record();
 
-        assert_eq!(replay_game(&actions), Err(ReplayError::DuplicateActionId));
+        let second = bare_record(
+            1,
+            1,
+            create.resulting_state_hash,
+            [11; 32],
+            GameActionPayload::Resign {
+                player: Player::White,
+            },
+        );
+
+        assert_eq!(
+            replay_game(&[create, second]),
+            Err(ReplayError::DuplicateActionId)
+        );
     }
 }

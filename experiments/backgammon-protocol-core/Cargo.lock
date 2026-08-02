@@ -63,6 +63,7 @@ name = "backgammon-protocol"
 version = "0.1.0"
 dependencies = [
  "backgammon-core",
+ "blake3",
  "ciborium",
  "serde",
 ]

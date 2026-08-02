@@ -9,5 +9,6 @@ crate-type = ["rlib"]
 
 [dependencies]
 backgammon-core = { path = "../backgammon-core" }
+blake3 = "1.8.5"
 ciborium.workspace = true
 serde.workspace = true
