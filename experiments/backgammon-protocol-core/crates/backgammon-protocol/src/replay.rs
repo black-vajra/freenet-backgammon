@@ -1,0 +1,611 @@
+use std::collections::BTreeSet;
+
+use backgammon_core::{GameState, GameStatus, Player, TurnError, TurnPhase};
+
+use crate::{
+    GameActionError, GameActionPayload, GameActionRecord, GameConfiguration, GameId, StateHash,
+    GENESIS_STATE_HASH,
+};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReplayStatus {
+    InProgress,
+    Completed { winner: Player, points: u8 },
+    Resigned { resigned: Player, winner: Player },
+    Abandoned { player: Player },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplayedGame {
+    pub game_id: GameId,
+    pub configuration: GameConfiguration,
+    pub state: GameState,
+    pub next_sequence: u64,
+    pub next_turn: u32,
+    pub status: ReplayStatus,
+    pub latest_state_hash: StateHash,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReplayError {
+    EmptyHistory,
+    InvalidAction {
+        sequence: u64,
+        error: GameActionError,
+    },
+    SequenceMustStartAtZero {
+        found: u64,
+    },
+    SequenceGap {
+        expected: u64,
+        found: u64,
+    },
+    DuplicateActionId,
+    MixedGameIds,
+    GenesisHashMismatch,
+    BrokenStateHashChain {
+        sequence: u64,
+    },
+    FirstActionMustCreateGame,
+    DuplicateGameCreation,
+    ActionAfterTerminalState {
+        sequence: u64,
+    },
+    RollAlreadyPending,
+    RollExpected,
+    WrongTurnNumber {
+        expected: u32,
+        found: u32,
+    },
+    WrongPlayer {
+        expected: Player,
+        found: Player,
+    },
+    InvalidTurn {
+        sequence: u64,
+        error: TurnError,
+    },
+    TurnNumberOverflow,
+    SequenceNumberOverflow,
+}
+
+impl ReplayedGame {
+    fn refresh_status_from_board(&mut self) {
+        if let GameStatus::Completed { winner, points } = self.state.status {
+            self.status = ReplayStatus::Completed { winner, points };
+        }
+    }
+
+    fn ensure_in_progress(&self, sequence: u64) -> Result<(), ReplayError> {
+        if self.status != ReplayStatus::InProgress {
+            return Err(ReplayError::ActionAfterTerminalState { sequence });
+        }
+
+        Ok(())
+    }
+
+    fn apply_record(&mut self, record: &GameActionRecord) -> Result<(), ReplayError> {
+        self.ensure_in_progress(record.sequence)?;
+
+        match &record.payload {
+            GameActionPayload::CreateGame(_) => Err(ReplayError::DuplicateGameCreation),
+
+            GameActionPayload::RecordRoll { turn, player, dice } => {
+                if *turn != self.next_turn {
+                    return Err(ReplayError::WrongTurnNumber {
+                        expected: self.next_turn,
+                        found: *turn,
+                    });
+                }
+
+                if *player != self.state.active_player {
+                    return Err(ReplayError::WrongPlayer {
+                        expected: self.state.active_player,
+                        found: *player,
+                    });
+                }
+
+                if self.state.turn_phase != TurnPhase::AwaitingRoll || self.state.dice.is_some() {
+                    return Err(ReplayError::RollAlreadyPending);
+                }
+
+                self.state.dice = Some(*dice);
+                self.state.turn_phase = TurnPhase::Moving;
+
+                Ok(())
+            }
+
+            GameActionPayload::PlayTurn {
+                turn,
+                player,
+                sequence,
+            } => {
+                if *turn != self.next_turn {
+                    return Err(ReplayError::WrongTurnNumber {
+                        expected: self.next_turn,
+                        found: *turn,
+                    });
+                }
+
+                if *player != self.state.active_player {
+                    return Err(ReplayError::WrongPlayer {
+                        expected: self.state.active_player,
+                        found: *player,
+                    });
+                }
+
+                if self.state.turn_phase != TurnPhase::Moving || self.state.dice.is_none() {
+                    return Err(ReplayError::RollExpected);
+                }
+
+                self.state.apply_turn_sequence(sequence).map_err(|error| {
+                    ReplayError::InvalidTurn {
+                        sequence: record.sequence,
+                        error,
+                    }
+                })?;
+
+                self.next_turn = self
+                    .next_turn
+                    .checked_add(1)
+                    .ok_or(ReplayError::TurnNumberOverflow)?;
+
+                self.refresh_status_from_board();
+
+                Ok(())
+            }
+
+            GameActionPayload::Resign { player } => {
+                self.status = ReplayStatus::Resigned {
+                    resigned: *player,
+                    winner: player.opponent(),
+                };
+
+                Ok(())
+            }
+
+            GameActionPayload::Abandon { player } => {
+                self.status = ReplayStatus::Abandoned { player: *player };
+
+                Ok(())
+            }
+        }
+    }
+}
+
+pub fn replay_game(records: &[GameActionRecord]) -> Result<ReplayedGame, ReplayError> {
+    let first = records.first().ok_or(ReplayError::EmptyHistory)?;
+
+    if first.sequence != 0 {
+        return Err(ReplayError::SequenceMustStartAtZero {
+            found: first.sequence,
+        });
+    }
+
+    first.verify().map_err(|error| ReplayError::InvalidAction {
+        sequence: first.sequence,
+        error,
+    })?;
+
+    if first.previous_state_hash != GENESIS_STATE_HASH {
+        return Err(ReplayError::GenesisHashMismatch);
+    }
+
+    let configuration = match &first.payload {
+        GameActionPayload::CreateGame(configuration) => configuration.clone(),
+        _ => return Err(ReplayError::FirstActionMustCreateGame),
+    };
+
+    let mut replay = ReplayedGame {
+        game_id: first.game_id,
+        configuration,
+        state: GameState::standard_start(),
+        next_sequence: 1,
+        next_turn: 0,
+        status: ReplayStatus::InProgress,
+        latest_state_hash: first.resulting_state_hash,
+    };
+
+    let mut action_ids = BTreeSet::new();
+    action_ids.insert(first.action_id);
+
+    for record in &records[1..] {
+        record
+            .verify()
+            .map_err(|error| ReplayError::InvalidAction {
+                sequence: record.sequence,
+                error,
+            })?;
+
+        if record.game_id != replay.game_id {
+            return Err(ReplayError::MixedGameIds);
+        }
+
+        if record.sequence != replay.next_sequence {
+            return Err(ReplayError::SequenceGap {
+                expected: replay.next_sequence,
+                found: record.sequence,
+            });
+        }
+
+        if !action_ids.insert(record.action_id) {
+            return Err(ReplayError::DuplicateActionId);
+        }
+
+        if record.previous_state_hash != replay.latest_state_hash {
+            return Err(ReplayError::BrokenStateHashChain {
+                sequence: record.sequence,
+            });
+        }
+
+        replay.apply_record(record)?;
+        replay.latest_state_hash = record.resulting_state_hash;
+        replay.next_sequence = replay
+            .next_sequence
+            .checked_add(1)
+            .ok_or(ReplayError::SequenceNumberOverflow)?;
+    }
+
+    Ok(replay)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ActionId, PlayerDescriptor, PROTOCOL_VERSION};
+    use backgammon_core::{Dice, TurnSequence};
+
+    fn configuration() -> GameConfiguration {
+        GameConfiguration {
+            white: PlayerDescriptor {
+                id: [1; 32],
+                display_name: "White".to_owned(),
+            },
+            black: PlayerDescriptor {
+                id: [2; 32],
+                display_name: "Black".to_owned(),
+            },
+            match_length: 1,
+        }
+    }
+
+    fn record(
+        sequence: u64,
+        action_id: u8,
+        previous_state_hash: StateHash,
+        resulting_state_hash: StateHash,
+        payload: GameActionPayload,
+    ) -> GameActionRecord {
+        GameActionRecord {
+            protocol_version: PROTOCOL_VERSION,
+            game_id: [9; 32],
+            action_id: [action_id; 32] as ActionId,
+            sequence,
+            previous_state_hash,
+            resulting_state_hash,
+            payload,
+        }
+    }
+
+    fn create_record() -> GameActionRecord {
+        record(
+            0,
+            1,
+            GENESIS_STATE_HASH,
+            [10; 32],
+            GameActionPayload::CreateGame(configuration()),
+        )
+    }
+
+    fn legal_opening_sequence(dice: Dice) -> TurnSequence {
+        let mut state = GameState::standard_start();
+        state.dice = Some(dice);
+        state.turn_phase = TurnPhase::Moving;
+        state.legal_turn_sequences().unwrap()[0].clone()
+    }
+
+    #[test]
+    fn create_game_replays_from_genesis() {
+        let replay = replay_game(&[create_record()]).unwrap();
+
+        assert_eq!(replay.game_id, [9; 32]);
+        assert_eq!(replay.next_sequence, 1);
+        assert_eq!(replay.next_turn, 0);
+        assert_eq!(replay.status, ReplayStatus::InProgress);
+        assert_eq!(replay.state, GameState::standard_start());
+        assert_eq!(replay.latest_state_hash, [10; 32]);
+    }
+
+    #[test]
+    fn roll_and_complete_turn_replay_deterministically() {
+        let dice = Dice {
+            first: 1,
+            second: 2,
+        };
+        let sequence = legal_opening_sequence(dice);
+
+        let actions = vec![
+            create_record(),
+            record(
+                1,
+                2,
+                [10; 32],
+                [11; 32],
+                GameActionPayload::RecordRoll {
+                    turn: 0,
+                    player: Player::White,
+                    dice,
+                },
+            ),
+            record(
+                2,
+                3,
+                [11; 32],
+                [12; 32],
+                GameActionPayload::PlayTurn {
+                    turn: 0,
+                    player: Player::White,
+                    sequence,
+                },
+            ),
+        ];
+
+        let replay = replay_game(&actions).unwrap();
+
+        assert_eq!(replay.next_sequence, 3);
+        assert_eq!(replay.next_turn, 1);
+        assert_eq!(replay.state.active_player, Player::Black);
+        assert_eq!(replay.state.turn_phase, TurnPhase::AwaitingRoll);
+        assert_eq!(replay.state.dice, None);
+        assert_eq!(replay.latest_state_hash, [12; 32]);
+    }
+
+    #[test]
+    fn first_action_must_create_game() {
+        let action = record(
+            0,
+            1,
+            GENESIS_STATE_HASH,
+            [10; 32],
+            GameActionPayload::RecordRoll {
+                turn: 0,
+                player: Player::White,
+                dice: Dice {
+                    first: 1,
+                    second: 2,
+                },
+            },
+        );
+
+        assert_eq!(
+            replay_game(&[action]),
+            Err(ReplayError::FirstActionMustCreateGame)
+        );
+    }
+
+    #[test]
+    fn sequence_gap_is_rejected() {
+        let actions = vec![
+            create_record(),
+            record(
+                2,
+                2,
+                [10; 32],
+                [11; 32],
+                GameActionPayload::Resign {
+                    player: Player::White,
+                },
+            ),
+        ];
+
+        assert_eq!(
+            replay_game(&actions),
+            Err(ReplayError::SequenceGap {
+                expected: 1,
+                found: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn mixed_game_ids_are_rejected() {
+        let mut second = record(
+            1,
+            2,
+            [10; 32],
+            [11; 32],
+            GameActionPayload::Resign {
+                player: Player::White,
+            },
+        );
+        second.game_id = [8; 32];
+
+        assert_eq!(
+            replay_game(&[create_record(), second]),
+            Err(ReplayError::MixedGameIds)
+        );
+    }
+
+    #[test]
+    fn broken_hash_chain_is_rejected() {
+        let actions = vec![
+            create_record(),
+            record(
+                1,
+                2,
+                [99; 32],
+                [11; 32],
+                GameActionPayload::Resign {
+                    player: Player::White,
+                },
+            ),
+        ];
+
+        assert_eq!(
+            replay_game(&actions),
+            Err(ReplayError::BrokenStateHashChain { sequence: 1 })
+        );
+    }
+
+    #[test]
+    fn wrong_turn_number_is_rejected() {
+        let actions = vec![
+            create_record(),
+            record(
+                1,
+                2,
+                [10; 32],
+                [11; 32],
+                GameActionPayload::RecordRoll {
+                    turn: 1,
+                    player: Player::White,
+                    dice: Dice {
+                        first: 1,
+                        second: 2,
+                    },
+                },
+            ),
+        ];
+
+        assert_eq!(
+            replay_game(&actions),
+            Err(ReplayError::WrongTurnNumber {
+                expected: 0,
+                found: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn wrong_player_roll_is_rejected() {
+        let actions = vec![
+            create_record(),
+            record(
+                1,
+                2,
+                [10; 32],
+                [11; 32],
+                GameActionPayload::RecordRoll {
+                    turn: 0,
+                    player: Player::Black,
+                    dice: Dice {
+                        first: 1,
+                        second: 2,
+                    },
+                },
+            ),
+        ];
+
+        assert_eq!(
+            replay_game(&actions),
+            Err(ReplayError::WrongPlayer {
+                expected: Player::White,
+                found: Player::Black,
+            })
+        );
+    }
+
+    #[test]
+    fn turn_without_roll_is_rejected() {
+        let actions = vec![
+            create_record(),
+            record(
+                1,
+                2,
+                [10; 32],
+                [11; 32],
+                GameActionPayload::PlayTurn {
+                    turn: 0,
+                    player: Player::White,
+                    sequence: TurnSequence::default(),
+                },
+            ),
+        ];
+
+        assert_eq!(replay_game(&actions), Err(ReplayError::RollExpected));
+    }
+
+    #[test]
+    fn second_roll_before_turn_is_rejected() {
+        let dice = Dice {
+            first: 1,
+            second: 2,
+        };
+
+        let actions = vec![
+            create_record(),
+            record(
+                1,
+                2,
+                [10; 32],
+                [11; 32],
+                GameActionPayload::RecordRoll {
+                    turn: 0,
+                    player: Player::White,
+                    dice,
+                },
+            ),
+            record(
+                2,
+                3,
+                [11; 32],
+                [12; 32],
+                GameActionPayload::RecordRoll {
+                    turn: 0,
+                    player: Player::White,
+                    dice,
+                },
+            ),
+        ];
+
+        assert_eq!(replay_game(&actions), Err(ReplayError::RollAlreadyPending));
+    }
+
+    #[test]
+    fn action_after_resignation_is_rejected() {
+        let actions = vec![
+            create_record(),
+            record(
+                1,
+                2,
+                [10; 32],
+                [11; 32],
+                GameActionPayload::Resign {
+                    player: Player::White,
+                },
+            ),
+            record(
+                2,
+                3,
+                [11; 32],
+                [12; 32],
+                GameActionPayload::Abandon {
+                    player: Player::Black,
+                },
+            ),
+        ];
+
+        assert_eq!(
+            replay_game(&actions),
+            Err(ReplayError::ActionAfterTerminalState { sequence: 2 })
+        );
+    }
+
+    #[test]
+    fn duplicate_action_id_is_rejected() {
+        let actions = vec![
+            create_record(),
+            record(
+                1,
+                1,
+                [10; 32],
+                [11; 32],
+                GameActionPayload::Resign {
+                    player: Player::White,
+                },
+            ),
+        ];
+
+        assert_eq!(replay_game(&actions), Err(ReplayError::DuplicateActionId));
+    }
+}

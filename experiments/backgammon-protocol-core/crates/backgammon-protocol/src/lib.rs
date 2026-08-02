@@ -1,7 +1,10 @@
 #![forbid(unsafe_code)]
 
 mod game_action;
+mod replay;
+
 pub use game_action::*;
+pub use replay::*;
 
 use serde::{Deserialize, Serialize};
 
