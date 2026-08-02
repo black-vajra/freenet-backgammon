@@ -1,0 +1,9 @@
+   Compiling freenet v0.2.116 (/home/pepper/Projects/freenet-backgammon/runtime-milestone-0.2.116/freenet-core/crates/core)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 37.00s
+     Running unittests src/lib.rs (/var/tmp/freenet-core-02116-target/debug/deps/freenet-de5e382655f302c4)
+
+running 1 test
+test wasm_runtime::tests::ledger_prototype::ledger_package_runs_through_production_wasm_runtime ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4562 filtered out; finished in 0.09s
+
