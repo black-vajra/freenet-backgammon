@@ -8,6 +8,7 @@ pub use game_action::*;
 pub use replay::*;
 pub use state_hash::*;
 
+use ciborium::{de::from_reader, ser::into_writer};
 use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: u16 = 1;
@@ -30,6 +31,98 @@ pub struct Action {
     pub previous_state_hash: StateHash,
     pub resulting_state_hash: StateHash,
     pub payload: Vec<u8>,
+}
+
+pub fn encode_game_action_payload(payload: &GameActionPayload) -> Result<Vec<u8>, String> {
+    payload
+        .verify()
+        .map_err(|error| format!("invalid typed game-action payload: {error:?}"))?;
+
+    let mut encoded = Vec::new();
+
+    into_writer(payload, &mut encoded)
+        .map_err(|error| format!("failed to encode typed game-action payload: {error}"))?;
+
+    Ok(encoded)
+}
+
+pub fn decode_game_action_payload(bytes: &[u8]) -> Result<GameActionPayload, String> {
+    let payload: GameActionPayload = from_reader(bytes)
+        .map_err(|error| format!("failed to decode typed game-action payload: {error}"))?;
+
+    payload
+        .verify()
+        .map_err(|error| format!("invalid typed game-action payload: {error:?}"))?;
+
+    /*
+     * Reject alternate CBOR representations. The exact encoded payload
+     * bytes form part of the authenticated and replicated action record.
+     */
+    let canonical = encode_game_action_payload(&payload)?;
+
+    if canonical != bytes {
+        return Err("typed game-action payload is not canonical".into());
+    }
+
+    Ok(payload)
+}
+
+impl Action {
+    pub fn from_game_action_record(record: &GameActionRecord) -> Result<Self, String> {
+        record
+            .verify()
+            .map_err(|error| format!("invalid typed game-action record: {error:?}"))?;
+
+        let sequence = u32::try_from(record.sequence)
+            .map_err(|_| "typed action sequence exceeds ledger range")?;
+
+        Ok(Self {
+            game_id: record.game_id,
+            id: record.action_id,
+            sequence,
+            previous_state_hash: record.previous_state_hash,
+            resulting_state_hash: record.resulting_state_hash,
+            payload: encode_game_action_payload(&record.payload)?,
+        })
+    }
+
+    pub fn to_game_action_record(&self) -> Result<GameActionRecord, String> {
+        let record = GameActionRecord {
+            protocol_version: PROTOCOL_VERSION,
+            game_id: self.game_id,
+            action_id: self.id,
+            sequence: u64::from(self.sequence),
+            previous_state_hash: self.previous_state_hash,
+            resulting_state_hash: self.resulting_state_hash,
+            payload: decode_game_action_payload(&self.payload)?,
+        };
+
+        record
+            .verify()
+            .map_err(|error| format!("invalid typed game-action record: {error:?}"))?;
+
+        Ok(record)
+    }
+}
+
+pub fn verify_typed_action_history(actions: &[Action]) -> Result<(), String> {
+    verify_action_history(actions)?;
+
+    if actions.is_empty() {
+        return Ok(());
+    }
+
+    let mut ordered: Vec<&Action> = actions.iter().collect();
+    ordered.sort_unstable_by_key(|action| action.sequence);
+
+    let records: Result<Vec<_>, _> = ordered
+        .into_iter()
+        .map(Action::to_game_action_record)
+        .collect();
+
+    replay_game(&records?)
+        .map(|_| ())
+        .map_err(|error| format!("typed game replay failed: {error:?}"))
 }
 
 impl LedgerParameters {
@@ -130,6 +223,77 @@ mod tests {
             resulting_state_hash,
             payload: vec![id],
         }
+    }
+
+    fn player(id: u8, name: &str) -> PlayerDescriptor {
+        PlayerDescriptor {
+            id: [id; 32],
+            display_name: name.to_owned(),
+        }
+    }
+
+    fn configuration() -> GameConfiguration {
+        GameConfiguration {
+            white: player(1, "White"),
+            black: player(2, "Black"),
+            match_length: 1,
+        }
+    }
+
+    fn typed_create_record() -> GameActionRecord {
+        let snapshot = CanonicalReplayState::new(
+            [7; 32],
+            configuration(),
+            backgammon_core::GameState::standard_start(),
+            0,
+            ReplayStatus::InProgress,
+        );
+
+        GameActionRecord {
+            protocol_version: PROTOCOL_VERSION,
+            game_id: [7; 32],
+            action_id: [1; 32],
+            sequence: 0,
+            previous_state_hash: GENESIS_STATE_HASH,
+            resulting_state_hash: snapshot.hash().unwrap(),
+            payload: GameActionPayload::CreateGame(configuration()),
+        }
+    }
+
+    #[test]
+    fn typed_action_round_trip_is_stable() {
+        let record = typed_create_record();
+        let action = Action::from_game_action_record(&record).unwrap();
+        let decoded = action.to_game_action_record().unwrap();
+
+        assert_eq!(decoded, record);
+        assert_eq!(
+            encode_game_action_payload(&decoded.payload).unwrap(),
+            action.payload
+        );
+    }
+
+    #[test]
+    fn malformed_typed_payload_is_rejected() {
+        assert!(decode_game_action_payload(&[0x9f, 0x01]).is_err());
+    }
+
+    #[test]
+    fn typed_create_history_replays_successfully() {
+        let action = Action::from_game_action_record(&typed_create_record()).unwrap();
+
+        assert_eq!(verify_typed_action_history(&[action]), Ok(()));
+    }
+
+    #[test]
+    fn forged_typed_resulting_hash_is_rejected() {
+        let mut action = Action::from_game_action_record(&typed_create_record()).unwrap();
+
+        action.resulting_state_hash = [99; 32];
+
+        assert!(verify_typed_action_history(&[action])
+            .unwrap_err()
+            .contains("ResultingStateHashMismatch"));
     }
 
     #[test]
