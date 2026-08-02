@@ -100,6 +100,23 @@ mod tests {
     }
 
     #[test]
+    fn canonical_encoding_matches_v1_golden_fixture() {
+        let expected = include_bytes!("../tests/fixtures/canonical-replay-state-v1.cbor");
+
+        let encoded = snapshot().encode_canonical().unwrap();
+
+        assert_eq!(encoded.as_slice(), expected);
+    }
+
+    #[test]
+    fn canonical_hash_matches_v1_golden_fixture() {
+        let expected = include_bytes!("../tests/fixtures/canonical-replay-state-v1.blake3");
+
+        assert_eq!(expected.len(), 32);
+        assert_eq!(snapshot().hash().unwrap().as_slice(), expected);
+    }
+
+    #[test]
     fn meaningful_state_change_changes_hash() {
         let first = snapshot();
         let mut second = snapshot();
