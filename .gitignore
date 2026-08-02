@@ -5,3 +5,7 @@ target/
 *.swp
 *.swo
 *~
+
+# Backgammon protocol workspace build outputs
+experiments/backgammon-protocol-core/target/
+experiments/backgammon-protocol-core/crates/backgammon-contract/build/

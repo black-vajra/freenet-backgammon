@@ -117,3 +117,24 @@ The preserved ledger prototype already demonstrates:
 The prototype orders records by action ID and does not yet enforce its sequence
 field. The game protocol must add ordered-history validation without assuming
 ordered network delivery.
+
+## Contract build
+
+The contract is built from:
+
+    crates/backgammon-contract
+
+With the currently installed `fdev 0.3.279`, an explicit Cargo target directory
+is required:
+
+    CARGO_TARGET_DIR=/path/to/workspace/target fdev build
+
+Use:
+
+    ./scripts/build-contract.sh
+
+The script builds the contract and verifies that the generated Freenet package
+contains a 40-byte header followed by the exact raw WASM module.
+
+The shared `backgammon-core` and `backgammon-protocol` crates compile as path
+dependencies of the Freenet contract.
