@@ -1,5 +1,8 @@
 #![forbid(unsafe_code)]
 
+mod game_action;
+pub use game_action::*;
+
 use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: u16 = 1;
