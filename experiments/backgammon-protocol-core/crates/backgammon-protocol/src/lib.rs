@@ -9,6 +9,13 @@ pub struct LedgerParameters {
     pub protocol_version: u16,
 }
 
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct Action {
+    pub id: [u8; 32],
+    pub sequence: u32,
+    pub payload: Vec<u8>,
+}
+
 impl LedgerParameters {
     pub const fn current() -> Self {
         Self {

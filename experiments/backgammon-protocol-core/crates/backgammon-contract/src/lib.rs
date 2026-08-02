@@ -1,4 +1,4 @@
-use backgammon_protocol::{LedgerParameters, PROTOCOL_VERSION};
+use backgammon_protocol::{Action, LedgerParameters, PROTOCOL_VERSION};
 use ciborium::{de::from_reader, ser::into_writer};
 use freenet_scaffold_macro::composable;
 use freenet_stdlib::prelude::*;
@@ -6,13 +6,6 @@ use serde::{Deserialize, Serialize};
 
 const MAX_ACTIONS: usize = 256;
 const MAX_PAYLOAD_BYTES: usize = 1024;
-
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
-pub struct Action {
-    pub id: [u8; 32],
-    pub sequence: u32,
-    pub payload: Vec<u8>,
-}
 
 #[derive(Serialize, Deserialize, Clone, Default, PartialEq, Eq, Debug)]
 pub struct Actions(pub Vec<Action>);
