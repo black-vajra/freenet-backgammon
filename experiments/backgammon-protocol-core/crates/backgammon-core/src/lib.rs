@@ -87,6 +87,14 @@ pub struct Dice {
 }
 
 impl Dice {
+    pub fn values(self) -> Vec<u8> {
+        if self.first == self.second {
+            vec![self.first; 4]
+        } else {
+            vec![self.first, self.second]
+        }
+    }
+
     pub fn verify(self) -> Result<(), StateError> {
         if !(1..=6).contains(&self.first) || !(1..=6).contains(&self.second) {
             return Err(StateError::InvalidDieValue);
@@ -102,13 +110,13 @@ pub enum GameStatus {
     Completed { winner: Player, points: u8 },
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum MoveSource {
     Bar,
     Point(u8),
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct CheckerMove {
     pub player: Player,
     pub source: MoveSource,
@@ -119,6 +127,21 @@ pub struct CheckerMove {
 pub enum MoveTarget {
     Point(u8),
     BearOff,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TurnSequence {
+    pub moves: Vec<CheckerMove>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TurnError {
+    GameAlreadyCompleted,
+    NotMovingPhase,
+    MissingDice,
+    InvalidState(StateError),
+    IllegalTurnSequence,
+    Move(MoveError),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -342,6 +365,166 @@ impl GameState {
         let point = self.points[destination];
 
         point.owner == Some(player.opponent()) && point.count >= 2
+    }
+
+    pub fn legal_checker_moves_for_die(&self, player: Player, die: u8) -> Vec<CheckerMove> {
+        let sources: Vec<MoveSource> = if self.player_area(player).bar > 0 {
+            vec![MoveSource::Bar]
+        } else {
+            self.points
+                .iter()
+                .enumerate()
+                .filter(|(_, point)| point.owner == Some(player))
+                .filter_map(|(index, _)| u8::try_from(index).ok().map(MoveSource::Point))
+                .collect()
+        };
+
+        let mut legal = Vec::new();
+
+        for source in sources {
+            let checker_move = CheckerMove {
+                player,
+                source,
+                die,
+            };
+
+            let mut candidate = self.clone();
+
+            if candidate.apply_checker_move(checker_move).is_ok() {
+                legal.push(checker_move);
+            }
+        }
+
+        legal.sort_unstable();
+        legal.dedup();
+        legal
+    }
+
+    fn collect_turn_sequences(
+        state: &GameState,
+        remaining_dice: &[u8],
+        current: &mut Vec<CheckerMove>,
+        output: &mut Vec<TurnSequence>,
+    ) {
+        if !matches!(state.status, GameStatus::InProgress) {
+            output.push(TurnSequence {
+                moves: current.clone(),
+            });
+            return;
+        }
+
+        let mut advanced = false;
+        let mut seen_die = [false; 7];
+
+        for (index, die) in remaining_dice.iter().copied().enumerate() {
+            let die_index = usize::from(die);
+
+            if seen_die[die_index] {
+                continue;
+            }
+
+            seen_die[die_index] = true;
+
+            for checker_move in state.legal_checker_moves_for_die(state.active_player, die) {
+                let mut next_state = state.clone();
+
+                if next_state.apply_checker_move(checker_move).is_err() {
+                    continue;
+                }
+
+                let mut next_dice = remaining_dice.to_vec();
+                next_dice.remove(index);
+
+                current.push(checker_move);
+                Self::collect_turn_sequences(&next_state, &next_dice, current, output);
+                current.pop();
+
+                advanced = true;
+            }
+        }
+
+        if !advanced {
+            output.push(TurnSequence {
+                moves: current.clone(),
+            });
+        }
+    }
+
+    pub fn legal_turn_sequences(&self) -> Result<Vec<TurnSequence>, TurnError> {
+        self.verify().map_err(TurnError::InvalidState)?;
+
+        if !matches!(self.status, GameStatus::InProgress) {
+            return Err(TurnError::GameAlreadyCompleted);
+        }
+
+        if self.turn_phase != TurnPhase::Moving {
+            return Err(TurnError::NotMovingPhase);
+        }
+
+        let dice = self.dice.ok_or(TurnError::MissingDice)?;
+        let dice_values = dice.values();
+
+        let mut generated = Vec::new();
+        let mut current = Vec::new();
+
+        Self::collect_turn_sequences(self, &dice_values, &mut current, &mut generated);
+
+        let maximum_moves = generated
+            .iter()
+            .map(|sequence| sequence.moves.len())
+            .max()
+            .unwrap_or(0);
+
+        generated.retain(|sequence| sequence.moves.len() == maximum_moves);
+
+        /*
+         * When only one of two distinct dice can be played, backgammon
+         * requires use of the higher die if that die is playable.
+         */
+        if dice.first != dice.second && maximum_moves == 1 {
+            let higher_die = dice.first.max(dice.second);
+
+            if generated.iter().any(|sequence| {
+                sequence.moves.first().map(|checker_move| checker_move.die) == Some(higher_die)
+            }) {
+                generated.retain(|sequence| {
+                    sequence.moves.first().map(|checker_move| checker_move.die) == Some(higher_die)
+                });
+            }
+        }
+
+        generated.sort_unstable();
+        generated.dedup();
+
+        Ok(generated)
+    }
+
+    pub fn apply_turn_sequence(&mut self, sequence: &TurnSequence) -> Result<(), TurnError> {
+        let legal = self.legal_turn_sequences()?;
+
+        if legal.binary_search(sequence).is_err() {
+            return Err(TurnError::IllegalTurnSequence);
+        }
+
+        let mut candidate = self.clone();
+
+        for checker_move in &sequence.moves {
+            candidate
+                .apply_checker_move(*checker_move)
+                .map_err(TurnError::Move)?;
+        }
+
+        candidate.dice = None;
+        candidate.turn_phase = TurnPhase::AwaitingRoll;
+
+        if matches!(candidate.status, GameStatus::InProgress) {
+            candidate.active_player = candidate.active_player.opponent();
+        }
+
+        candidate.verify().map_err(TurnError::InvalidState)?;
+        *self = candidate;
+
+        Ok(())
     }
 
     pub fn apply_checker_move(&mut self, checker_move: CheckerMove) -> Result<(), MoveError> {
@@ -1076,6 +1259,245 @@ mod tests {
                 points: 3,
             }
         );
+    }
+
+    fn turn_state(
+        white_points: &[(usize, u8)],
+        white_bar: u8,
+        white_borne_off: u8,
+        black_points: &[(usize, u8)],
+        black_bar: u8,
+        black_borne_off: u8,
+        dice: Dice,
+    ) -> GameState {
+        let mut state = GameState {
+            points: [Point::EMPTY; POINT_COUNT],
+            white: PlayerArea {
+                bar: white_bar,
+                borne_off: white_borne_off,
+            },
+            black: PlayerArea {
+                bar: black_bar,
+                borne_off: black_borne_off,
+            },
+            active_player: Player::White,
+            turn_phase: TurnPhase::Moving,
+            dice: Some(dice),
+            status: GameStatus::InProgress,
+        };
+
+        for (point, count) in white_points {
+            state.points[*point] = Point::occupied(Player::White, *count);
+        }
+
+        for (point, count) in black_points {
+            state.points[*point] = Point::occupied(Player::Black, *count);
+        }
+
+        assert_eq!(state.verify(), Ok(()));
+        state
+    }
+
+    #[test]
+    fn turn_generation_uses_both_dice_when_possible() {
+        let state = turn_state(
+            &[(0, 2)],
+            0,
+            13,
+            &[(23, 1)],
+            0,
+            14,
+            Dice {
+                first: 1,
+                second: 2,
+            },
+        );
+
+        let sequences = state.legal_turn_sequences().unwrap();
+
+        assert!(!sequences.is_empty());
+        assert!(sequences.iter().all(|sequence| sequence.moves.len() == 2));
+    }
+
+    #[test]
+    fn doubles_generate_four_moves_when_possible() {
+        let state = turn_state(
+            &[(0, 4)],
+            0,
+            11,
+            &[(23, 1)],
+            0,
+            14,
+            Dice {
+                first: 1,
+                second: 1,
+            },
+        );
+
+        let sequences = state.legal_turn_sequences().unwrap();
+
+        assert!(!sequences.is_empty());
+        assert!(sequences.iter().all(|sequence| sequence.moves.len() == 4));
+        assert!(sequences.iter().all(|sequence| {
+            sequence
+                .moves
+                .iter()
+                .all(|checker_move| checker_move.die == 1)
+        }));
+    }
+
+    #[test]
+    fn higher_die_is_required_when_only_one_die_can_be_used() {
+        let state = turn_state(
+            &[(23, 1)],
+            0,
+            14,
+            &[(6, 1)],
+            0,
+            14,
+            Dice {
+                first: 1,
+                second: 2,
+            },
+        );
+
+        let sequences = state.legal_turn_sequences().unwrap();
+
+        assert!(!sequences.is_empty());
+        assert!(sequences.iter().all(|sequence| sequence.moves.len() == 1));
+        assert!(sequences.iter().all(|sequence| sequence.moves[0].die == 2));
+    }
+
+    #[test]
+    fn lower_die_is_allowed_when_higher_die_is_unplayable() {
+        let state = turn_state(
+            &[],
+            1,
+            14,
+            &[(1, 2), (2, 2)],
+            0,
+            11,
+            Dice {
+                first: 1,
+                second: 2,
+            },
+        );
+
+        let sequences = state.legal_turn_sequences().unwrap();
+
+        assert_eq!(
+            sequences,
+            vec![TurnSequence {
+                moves: vec![CheckerMove {
+                    player: Player::White,
+                    source: MoveSource::Bar,
+                    die: 1,
+                }],
+            }]
+        );
+    }
+
+    #[test]
+    fn bar_priority_applies_to_each_move_in_sequence() {
+        let state = turn_state(
+            &[],
+            2,
+            13,
+            &[(23, 1)],
+            0,
+            14,
+            Dice {
+                first: 1,
+                second: 2,
+            },
+        );
+
+        let sequences = state.legal_turn_sequences().unwrap();
+
+        assert!(!sequences.is_empty());
+        assert!(sequences.iter().all(|sequence| sequence.moves.len() == 2));
+        assert!(sequences.iter().all(|sequence| {
+            sequence
+                .moves
+                .iter()
+                .all(|checker_move| checker_move.source == MoveSource::Bar)
+        }));
+    }
+
+    #[test]
+    fn blocked_turn_has_one_empty_legal_sequence() {
+        let state = turn_state(
+            &[],
+            1,
+            14,
+            &[(0, 2), (1, 2)],
+            0,
+            11,
+            Dice {
+                first: 1,
+                second: 2,
+            },
+        );
+
+        assert_eq!(
+            state.legal_turn_sequences(),
+            Ok(vec![TurnSequence::default()])
+        );
+    }
+
+    #[test]
+    fn applying_complete_turn_switches_player_and_clears_dice() {
+        let mut state = turn_state(
+            &[(0, 2)],
+            0,
+            13,
+            &[(23, 1)],
+            0,
+            14,
+            Dice {
+                first: 1,
+                second: 2,
+            },
+        );
+
+        let sequence = state.legal_turn_sequences().unwrap()[0].clone();
+
+        assert_eq!(state.apply_turn_sequence(&sequence), Ok(()));
+        assert_eq!(state.active_player, Player::Black);
+        assert_eq!(state.turn_phase, TurnPhase::AwaitingRoll);
+        assert_eq!(state.dice, None);
+        assert_eq!(state.verify(), Ok(()));
+    }
+
+    #[test]
+    fn incomplete_turn_sequence_is_rejected_without_mutation() {
+        let mut state = turn_state(
+            &[(0, 2)],
+            0,
+            13,
+            &[(23, 1)],
+            0,
+            14,
+            Dice {
+                first: 1,
+                second: 2,
+            },
+        );
+        let before = state.clone();
+
+        let incomplete = TurnSequence {
+            moves: vec![CheckerMove {
+                player: Player::White,
+                source: MoveSource::Point(0),
+                die: 1,
+            }],
+        };
+
+        assert_eq!(
+            state.apply_turn_sequence(&incomplete),
+            Err(TurnError::IllegalTurnSequence)
+        );
+        assert_eq!(state, before);
     }
 
     #[test]
