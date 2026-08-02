@@ -195,9 +195,9 @@ impl ContractInterface for Contract {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use backgammon_core::{GameState, Player, TurnSequence};
+    use backgammon_core::{Dice, GameState, Player, TurnPhase, TurnSequence};
     use backgammon_protocol::{
-        CanonicalReplayState, GameActionPayload, GameActionRecord, GameConfiguration,
+        replay_game, CanonicalReplayState, GameActionPayload, GameActionRecord, GameConfiguration,
         PlayerDescriptor, ReplayStatus, StateHash, GENESIS_STATE_HASH, PROTOCOL_VERSION,
     };
 
@@ -298,6 +298,70 @@ mod tests {
                 payload: vec![id],
             },
         }
+    }
+
+    fn complete_opening_turn_actions() -> (Vec<Action>, GameState, StateHash) {
+        let dice = Dice {
+            first: 1,
+            second: 2,
+        };
+
+        let mut rolled_state = GameState::standard_start();
+        rolled_state.dice = Some(dice);
+        rolled_state.turn_phase = TurnPhase::Moving;
+
+        let sequence = rolled_state.legal_turn_sequences().unwrap()[0].clone();
+
+        let create = action(1, 0);
+
+        let roll_hash = CanonicalReplayState::new(
+            [7; 32],
+            configuration(),
+            rolled_state.clone(),
+            0,
+            ReplayStatus::InProgress,
+        )
+        .hash()
+        .unwrap();
+
+        let roll = typed_action(
+            2,
+            1,
+            create_hash(),
+            roll_hash,
+            GameActionPayload::RecordRoll {
+                turn: 0,
+                player: Player::White,
+                dice,
+            },
+        );
+
+        let mut completed_state = rolled_state;
+        completed_state.apply_turn_sequence(&sequence).unwrap();
+
+        let completed_hash = CanonicalReplayState::new(
+            [7; 32],
+            configuration(),
+            completed_state.clone(),
+            1,
+            ReplayStatus::InProgress,
+        )
+        .hash()
+        .unwrap();
+
+        let play = typed_action(
+            3,
+            2,
+            roll_hash,
+            completed_hash,
+            GameActionPayload::PlayTurn {
+                turn: 0,
+                player: Player::White,
+                sequence,
+            },
+        );
+
+        (vec![create, roll, play], completed_state, completed_hash)
     }
 
     fn encoded<T: Serialize>(value: &T) -> Vec<u8> {
@@ -493,6 +557,38 @@ mod tests {
 
         assert_eq!(left_then_right, right_then_left);
         assert_eq!(left_then_right.actions.0.len(), 2);
+    }
+
+    #[test]
+    fn complete_legal_turn_is_accepted_and_reconstructed() {
+        let (mut actions, expected_state, expected_hash) = complete_opening_turn_actions();
+
+        actions.sort_by(|left, right| left.id.cmp(&right.id));
+
+        let state = LedgerState {
+            actions: Actions(actions.clone()),
+        };
+
+        assert_eq!(state.verify(&state, &params()), Ok(()));
+
+        let mut ordered = actions;
+        ordered.sort_by_key(|action| action.sequence);
+
+        let records: Vec<_> = ordered
+            .iter()
+            .map(Action::to_game_action_record)
+            .collect::<Result<_, _>>()
+            .unwrap();
+
+        let replayed = replay_game(&records).unwrap();
+
+        assert_eq!(replayed.state, expected_state);
+        assert_eq!(replayed.latest_state_hash, expected_hash);
+        assert_eq!(replayed.next_sequence, 3);
+        assert_eq!(replayed.next_turn, 1);
+        assert_eq!(replayed.state.active_player, Player::Black);
+        assert_eq!(replayed.state.turn_phase, TurnPhase::AwaitingRoll);
+        assert_eq!(replayed.state.dice, None);
     }
 
     #[test]
