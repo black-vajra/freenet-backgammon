@@ -257,3 +257,198 @@ compilation do not prove correct behavior when executed by a Freenet node.
 Build a runtime-facing harness for the exported contract interface. Verify state
 validation, update handling, unsupported update variants, malformed serialized
 input, and contract execution before any publication.
+---
+
+## 2026-08-02 — Protocol Core 0.1: Complete Rules, Verified State, and Fair Dice
+
+### Completed
+
+- Created a three-crate Rust workspace:
+  - `backgammon-core`
+  - `backgammon-protocol`
+  - `backgammon-contract`
+- Implemented a transport-independent backgammon rules engine.
+- Implemented typed, versioned game-action records.
+- Implemented deterministic replay from an append-only action history.
+- Implemented canonical CBOR state serialization and BLAKE3 state hashing.
+- Preserved versioned golden fixtures for canonical replay-state encoding and hashing.
+- Integrated typed game replay into the Freenet contract.
+- Implemented contract-state validation, ordered action synchronization, and delta exchange.
+- Implemented cryptographic commit-and-reveal dice generation.
+- Removed the transitional trusted-roll action from protocol version 2.
+- Created the annotated `protocol-core-v0.1` checkpoint.
+- Created the `local-client-0.1` branch for graphical-client development.
+
+### Rules Engine
+
+The rules engine now enforces:
+
+- Standard starting positions.
+- Player orientation and turn order.
+- Legal checker movement.
+- Blocked points.
+- Hitting blots.
+- Mandatory entry from the bar.
+- Use of both dice when possible.
+- The higher-die rule when only one die can be played.
+- Doubles and partial doubles when later moves become blocked.
+- Complete-turn generation and validation.
+- Bearing off.
+- Oversize-die bearing-off restrictions.
+- Gammon and backgammon scoring.
+- Game completion.
+- Rejection of incomplete, illegal, or out-of-turn move sequences.
+
+The interface and network layers will consume this engine rather than duplicating
+or independently deciding the game rules.
+
+### Protocol and State Verification
+
+Each game action includes:
+
+- Protocol version.
+- Game identifier.
+- Unique action identifier.
+- Sequential action number.
+- Previous canonical state hash.
+- Resulting canonical state hash.
+- Typed CBOR action payload.
+
+Both complete histories and received deltas are validated by deterministic
+replay. The implementation rejects:
+
+- Missing or duplicate sequence numbers.
+- Mixed game identifiers.
+- Duplicate action identifiers.
+- Reused identifiers with different content.
+- Broken state-hash chains.
+- Forged resulting-state hashes.
+- Unsupported protocol versions.
+- Malformed typed payloads.
+- Illegal game actions.
+- Actions submitted after game completion or resignation.
+- Noncanonical, oversized, or malformed contract state.
+
+### Verifiable Fair Dice
+
+Protocol version 2 replaces privately supplied dice with a commit-and-reveal
+process:
+
+1. White commits secret random material.
+2. Black commits secret random material.
+3. White reveals its secret.
+4. Black reveals its secret.
+5. Both commitments are verified.
+6. The secrets are combined with the game ID, turn number, and fixed player ordering.
+7. Rejection sampling converts the resulting cryptographic digest into two unbiased dice values.
+
+Both clients can independently reproduce and verify the roll.
+
+The protocol rejects:
+
+- Reveals before both commitments exist.
+- Duplicate commitments.
+- Duplicate reveals.
+- Secrets that do not match their commitments.
+- Commitments for the wrong turn.
+- Fair-dice actions submitted after a roll is already pending.
+- Turns played before a verified roll exists.
+
+The previous `RecordRoll` action was removed completely. A player can no longer
+inject privately selected dice through the version-2 action protocol.
+
+### Canonical Fixtures
+
+Protocol-version-1 fixtures were retained for historical compatibility testing.
+
+Protocol-version-2 fixtures were added for replay state containing the pending
+fair-dice round:
+
+- `canonical-replay-state-v2.cbor`
+- `canonical-replay-state-v2.blake3`
+
+The version-2 canonical CBOR fixture is 851 bytes. The state hash is 32 bytes.
+
+### Tested
+
+Final local test results:
+
+- `backgammon-core`: 44 tests passed.
+- `backgammon-protocol`: 59 tests passed.
+- `backgammon-contract`: 27 tests passed.
+- Total: 130 tests passed.
+- Documentation tests: passed.
+- Workspace compilation check: passed.
+- Release WebAssembly contract build: passed.
+- Freenet package verification: passed.
+
+The tests cover rules enforcement, deterministic replay, malformed records,
+forged hashes, synchronization deltas, alternate delivery groupings, fair-dice
+commitments and reveals, rejection sampling, state reconstruction, and
+complete-turn execution.
+
+### Contract Build
+
+Verified contract build:
+
+- Contract code hash: `7GgvRv6g1cFwSVSrbSMUaBNexZoCERkrZR2ojaQwvFLs`
+- Raw WebAssembly size: 327231 bytes.
+- Freenet package size: 327271 bytes.
+- Package wrapper difference: 40 bytes.
+
+The build script independently extracts the packaged WebAssembly payload and
+verifies that it exactly matches the raw release artifact.
+
+### Production Runtime Proof
+
+The earlier generic ledger contract was executed successfully through the
+Freenet Core 0.2.116 production Wasmtime runtime rather than only through native
+Rust tests.
+
+That proof established that the contract packaging and exported runtime path
+work in the production execution environment. The current backgammon-specific
+version-2 contract must still receive its own runtime-harness and two-client
+integration tests.
+
+### What Works
+
+The project now has a complete transport-independent foundation for playing and
+verifying a standard backgammon game.
+
+A game can be represented as an authenticated-style ordered action history,
+reconstructed deterministically, validated against the rules engine,
+synchronized through contract deltas, and advanced using reproducible
+commit-and-reveal dice.
+
+### What Remains Uncertain
+
+- The graphical browser client has not yet been implemented.
+- Local two-player interaction has not yet been tested through a user interface.
+- Player authentication and signing are not yet integrated.
+- The policy for a player who commits but refuses to reveal still needs to be defined.
+- The current backgammon contract has not yet been exercised through two independent Freenet clients.
+- Real Freenet message delay, reordering, disconnection, and reconnection behavior remain untested.
+- Player discovery, availability announcements, challenges, and challenge expiration remain unimplemented.
+- Publication and protocol-upgrade behavior remain untested.
+
+### Freenet Limitations Discovered
+
+Freenet contract updates must be treated as asynchronous and potentially
+grouped, delayed, duplicated, or delivered in different valid partitions.
+
+The contract therefore cannot depend on ordinary request-response timing,
+WebSockets, a central mutable database, or delivery boundaries matching
+game-action boundaries.
+
+Tests now confirm that complete histories converge when the same valid actions
+arrive separately, together, or in different groupings. Actual network latency
+and cross-node behavior still require measurement.
+
+### Next Session
+
+Begin the `local-client-0.1` milestone:
+
+- Create the graphical backgammon board.
+- Display all 24 points, checker stacks, bar, bear-off areas, dice, players, score, turn status, connection status, and move history.
+- Connect checker selection and legal-destination highlighting directly to `backgammon-core`.
+- Support a complete local two-player game before introducing Freenet communication.
