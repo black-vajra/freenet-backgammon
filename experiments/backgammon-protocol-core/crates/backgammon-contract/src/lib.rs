@@ -547,6 +547,92 @@ mod tests {
     }
 
     #[test]
+    fn summary_delta_synchronizes_missing_game_actions() {
+        let p = params();
+        let (mut actions, expected_state, expected_hash) = complete_opening_turn_actions();
+
+        actions.sort_by(|left, right| left.id.cmp(&right.id));
+
+        let full = LedgerState {
+            actions: Actions(actions.clone()),
+        };
+
+        let mut client = LedgerState {
+            actions: Actions(vec![actions[0].clone()]),
+        };
+
+        let client_summary = client.summarize(&client, &p);
+        let delta = full.delta(&full, &p, &client_summary);
+
+        client.apply_delta(&client.clone(), &p, &delta).unwrap();
+
+        assert_eq!(client, full);
+        assert_eq!(client.verify(&client, &p), Ok(()));
+
+        let mut records: Vec<_> = client
+            .actions
+            .0
+            .iter()
+            .map(Action::to_game_action_record)
+            .collect::<Result<_, _>>()
+            .unwrap();
+
+        records.sort_by_key(|record| record.sequence);
+
+        let replayed = replay_game(&records).unwrap();
+
+        assert_eq!(replayed.state, expected_state);
+        assert_eq!(replayed.latest_state_hash, expected_hash);
+        assert_eq!(replayed.next_sequence, 3);
+        assert_eq!(replayed.next_turn, 1);
+    }
+
+    #[test]
+    fn state_delta_contains_only_missing_actions() {
+        let p = params();
+        let (mut actions, _, _) = complete_opening_turn_actions();
+
+        actions.sort_by(|left, right| left.id.cmp(&right.id));
+
+        let full = LedgerState {
+            actions: Actions(actions.clone()),
+        };
+
+        let client = LedgerState {
+            actions: Actions(vec![actions[0].clone()]),
+        };
+
+        let summary = client.summarize(&client, &p);
+        let delta = full
+            .delta(&full, &p, &summary)
+            .expect("client is missing two actions");
+
+        let missing = delta
+            .actions
+            .expect("actions component must contain a delta");
+
+        assert_eq!(missing.len(), 2);
+        assert_eq!(missing[0], actions[1]);
+        assert_eq!(missing[1], actions[2]);
+    }
+
+    #[test]
+    fn current_summary_produces_no_state_delta() {
+        let p = params();
+        let (mut actions, _, _) = complete_opening_turn_actions();
+
+        actions.sort_by(|left, right| left.id.cmp(&right.id));
+
+        let full = LedgerState {
+            actions: Actions(actions),
+        };
+
+        let summary = full.summarize(&full, &p);
+
+        assert_eq!(full.delta(&full, &p, &summary), None);
+    }
+
+    #[test]
     fn opposite_update_orders_converge() {
         let p = params();
         let empty = LedgerState::default();
