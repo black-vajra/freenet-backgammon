@@ -1,4 +1,4 @@
-use backgammon_core::Player;
+use backgammon_core::{MoveSource, MoveTarget, Player};
 use yew::prelude::*;
 
 use crate::components::checker::Checker;
@@ -9,6 +9,11 @@ pub struct PointProps {
     pub point: PointView,
     pub x: f32,
     pub top: bool,
+    pub source_selectable: bool,
+    pub source_selected: bool,
+    pub destination_legal: bool,
+    pub on_source: Callback<MoveSource>,
+    pub on_destination: Callback<MoveTarget>,
 }
 
 #[function_component(Point)]
@@ -39,6 +44,41 @@ pub fn point(props: &PointProps) -> Html {
         45.0
     } else {
         225.0 / checker_count.saturating_sub(1) as f32
+    };
+
+    let point_index =
+        u8::try_from(props.point.index).expect("projected point index must fit in u8");
+
+    let source = MoveSource::Point(point_index);
+    let destination = MoveTarget::Point(point_index);
+
+    let on_source = {
+        let callback = props.on_source.clone();
+
+        Callback::from(move |event: MouseEvent| {
+            event.stop_propagation();
+            callback.emit(source);
+        })
+    };
+
+    let on_destination = {
+        let callback = props.on_destination.clone();
+
+        Callback::from(move |_| {
+            callback.emit(destination);
+        })
+    };
+
+    let destination_click = if props.destination_legal {
+        on_destination
+    } else {
+        Callback::noop()
+    };
+
+    let checker_click = if props.source_selectable {
+        on_source
+    } else {
+        Callback::noop()
     };
 
     let checkers = props.point.owner.map_or_else(
@@ -72,6 +112,9 @@ pub fn point(props: &PointProps) -> Html {
                                         props.point.count,
                                         props.point.index + 1
                                     )}
+                                    selectable={props.source_selectable}
+                                    selected={props.source_selected}
+                                    onclick={checker_click.clone()}
                                 />
                             }
                         })
@@ -82,12 +125,27 @@ pub fn point(props: &PointProps) -> Html {
     );
 
     html! {
-        <g>
+        <g
+            class={classes!(
+                "board-point",
+                props.source_selectable.then_some("source-selectable"),
+                props.source_selected.then_some("source-selected"),
+                props.destination_legal.then_some("destination-legal"),
+            )}
+        >
             <polygon
-                points={triangle_points}
+                class="point-triangle"
+                points={triangle_points.clone()}
                 fill={point_fill}
                 stroke="#3b2114"
                 stroke-width="1.5"
+                onclick={destination_click}
+            />
+
+            <polygon
+                class="destination-highlight"
+                points={triangle_points}
+                pointer-events="none"
             />
 
             <text

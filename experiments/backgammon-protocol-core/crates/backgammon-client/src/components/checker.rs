@@ -7,6 +7,9 @@ pub struct CheckerProps {
     pub x: f32,
     pub y: f32,
     pub label: String,
+    pub selectable: bool,
+    pub selected: bool,
+    pub onclick: Callback<MouseEvent>,
 }
 
 #[function_component(Checker)]
@@ -17,8 +20,24 @@ pub fn checker(props: &CheckerProps) -> Html {
     };
 
     html! {
-        <g role="img" aria-label={props.label.clone()}>
+        <g
+            class={classes!(
+                "checker",
+                props.selectable.then_some("checker-selectable"),
+                props.selected.then_some("checker-selected"),
+            )}
+            role={props.selectable.then_some("button")}
+            aria-label={props.label.clone()}
+            onclick={props.onclick.clone()}
+        >
             <title>{ props.label.clone() }</title>
+
+            <circle
+                class="checker-selection-ring"
+                cx={props.x.to_string()}
+                cy={props.y.to_string()}
+                r="27"
+            />
 
             <circle
                 cx={props.x.to_string()}

@@ -6,7 +6,7 @@ pub mod projection;
 
 #[cfg(target_arch = "wasm32")]
 mod browser {
-    use backgammon_core::{Dice, GameStatus, Player, TurnPhase};
+    use backgammon_core::{Dice, GameStatus, MoveSource, MoveTarget, Player, TurnPhase};
     use yew::prelude::*;
 
     use crate::components::board::Board;
@@ -77,6 +77,20 @@ mod browser {
             TurnPhase::Moving => format!("{active_name} is moving"),
         };
 
+        let legal_sources = if controller.state().turn_phase == TurnPhase::Moving {
+            controller.legal_sources()
+        } else {
+            Vec::new()
+        };
+
+        let selected_source = controller.selected_source();
+
+        let legal_destinations = if selected_source.is_some() {
+            controller.legal_destinations().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
         let on_roll = {
             let controller = controller.clone();
             let interface_error = interface_error.clone();
@@ -96,6 +110,46 @@ mod browser {
                         }
                     },
                     Err(error) => interface_error.set(Some(error)),
+                }
+            })
+        };
+
+        let on_source = {
+            let controller = controller.clone();
+            let interface_error = interface_error.clone();
+
+            Callback::from(move |source: MoveSource| {
+                let mut next = (*controller).clone();
+
+                match next.select_source(source) {
+                    Ok(()) => {
+                        interface_error.set(None);
+                        controller.set(next);
+                    }
+                    Err(error) => {
+                        interface_error
+                            .set(Some(format!("That checker cannot be selected: {error:?}")));
+                    }
+                }
+            })
+        };
+
+        let on_destination = {
+            let controller = controller.clone();
+            let interface_error = interface_error.clone();
+
+            Callback::from(move |destination: MoveTarget| {
+                let mut next = (*controller).clone();
+
+                match next.choose_destination(destination) {
+                    Ok(_) => {
+                        interface_error.set(None);
+                        controller.set(next);
+                    }
+                    Err(error) => {
+                        interface_error
+                            .set(Some(format!("That destination is not legal: {error:?}")));
+                    }
                 }
             })
         };
@@ -137,6 +191,7 @@ mod browser {
                         <section class="panel turn-panel" aria-labelledby="turn-heading">
                             <h2 id="turn-heading">{ "Turn" }</h2>
                             <strong>{ turn_text }</strong>
+
                             <p class="panel-note">
                                 { controller.status_message().to_owned() }
                             </p>
@@ -162,11 +217,18 @@ mod browser {
                     </aside>
 
                     <section class="board-stage" aria-label="Game board">
-                        <Board board={board} />
+                        <Board
+                            board={board}
+                            legal_sources={legal_sources}
+                            selected_source={selected_source}
+                            legal_destinations={legal_destinations}
+                            on_source={on_source}
+                            on_destination={on_destination}
+                        />
                     </section>
 
                     <aside class="right-rail">
-                        <MoveHistory />
+                        <MoveHistory history={controller.history().to_vec()} />
 
                         <section class="panel status-panel" aria-labelledby="status-heading">
                             <h2 id="status-heading">{ "Connection" }</h2>

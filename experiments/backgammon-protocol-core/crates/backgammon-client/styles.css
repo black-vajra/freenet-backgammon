@@ -394,3 +394,61 @@ h2 {
     line-height: 1.4;
 }
 
+/* Interactive checker movement */
+
+.checker-selectable,
+.source-selectable .point-triangle,
+.destination-legal .point-triangle,
+.bar-selectable,
+.bear-off-area.destination-legal {
+    cursor: pointer;
+}
+
+.checker-selection-ring {
+    fill: none;
+    stroke: transparent;
+    stroke-width: 5;
+    pointer-events: none;
+}
+
+.checker-selectable:hover .checker-selection-ring {
+    stroke: #f5d47a;
+}
+
+.checker-selected .checker-selection-ring {
+    stroke: #ffef78;
+    filter: drop-shadow(0 0 8px rgba(255, 239, 120, 0.95));
+}
+
+.destination-highlight {
+    fill: transparent;
+    stroke: transparent;
+    stroke-width: 7;
+}
+
+.destination-legal .destination-highlight {
+    fill: rgba(83, 232, 154, 0.2);
+    stroke: #5ce59a;
+    filter: drop-shadow(0 0 8px rgba(92, 229, 154, 0.9));
+}
+
+.destination-legal:hover .destination-highlight {
+    fill: rgba(83, 232, 154, 0.38);
+}
+
+.bar-selectable rect {
+    stroke: #f5d47a;
+    stroke-width: 7;
+}
+
+.bar-selected rect {
+    stroke: #ffef78;
+    filter: drop-shadow(0 0 9px rgba(255, 239, 120, 0.85));
+}
+
+.bear-off-area.destination-legal .bear-off-tray {
+    stroke: #5ce59a;
+    stroke-width: 7;
+    filter: drop-shadow(0 0 8px rgba(92, 229, 154, 0.9));
+}
+
