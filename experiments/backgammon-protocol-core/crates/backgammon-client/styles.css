@@ -382,3 +382,15 @@ h2 {
         grid-template-columns: 1fr;
     }
 }
+
+.interface-error {
+    margin: 0.75rem 0 0;
+    padding: 0.65rem 0.75rem;
+    border: 1px solid #d28b7a;
+    border-radius: 0.45rem;
+    color: #ffe2dc;
+    background: rgba(115, 35, 27, 0.55);
+    font-size: 0.8rem;
+    line-height: 1.4;
+}
+

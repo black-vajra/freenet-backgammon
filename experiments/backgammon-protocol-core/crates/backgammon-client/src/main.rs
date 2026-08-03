@@ -6,7 +6,7 @@ pub mod projection;
 
 #[cfg(target_arch = "wasm32")]
 mod browser {
-    use backgammon_core::{GameState, Player, TurnPhase};
+    use backgammon_core::{Dice, GameStatus, Player, TurnPhase};
     use yew::prelude::*;
 
     use crate::components::board::Board;
@@ -14,16 +14,90 @@ mod browser {
     use crate::components::dice::DiceDisplay;
     use crate::components::history::MoveHistory;
     use crate::components::player_panel::PlayerPanel;
+    use crate::controller::LocalGameController;
     use crate::projection::BoardView;
+
+    fn secure_local_dice() -> Result<Dice, String> {
+        let window =
+            web_sys::window().ok_or_else(|| "Browser window is unavailable.".to_owned())?;
+
+        let crypto = window
+            .crypto()
+            .map_err(|error| format!("Browser randomness is unavailable: {error:?}"))?;
+
+        let mut dice = [0_u8; 2];
+        let mut accepted = 0_usize;
+
+        while accepted < dice.len() {
+            let mut random_bytes = [0_u8; 8];
+
+            crypto
+                .get_random_values_with_u8_array(&mut random_bytes)
+                .map_err(|error| format!("Could not generate dice: {error:?}"))?;
+
+            for byte in random_bytes {
+                if byte < 252 {
+                    dice[accepted] = byte % 6 + 1;
+                    accepted += 1;
+
+                    if accepted == dice.len() {
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(Dice {
+            first: dice[0],
+            second: dice[1],
+        })
+    }
+
+    fn player_name(player: Player) -> &'static str {
+        match player {
+            Player::White => "White",
+            Player::Black => "Black",
+        }
+    }
 
     #[function_component(App)]
     fn app() -> Html {
-        let state = GameState::standard_start();
-        let board = BoardView::from(&state);
+        let controller = use_state(LocalGameController::new);
+        let interface_error = use_state(|| None::<String>);
+
+        let board = BoardView::from(controller.visible_state());
+
+        let can_roll = matches!(controller.state().status, GameStatus::InProgress)
+            && controller.state().turn_phase == TurnPhase::AwaitingRoll;
+
+        let active_name = player_name(board.active_player);
 
         let turn_text = match board.turn_phase {
-            TurnPhase::AwaitingRoll => "White to roll",
-            TurnPhase::Moving => "White is moving",
+            TurnPhase::AwaitingRoll => format!("{active_name} to roll"),
+            TurnPhase::Moving => format!("{active_name} is moving"),
+        };
+
+        let on_roll = {
+            let controller = controller.clone();
+            let interface_error = interface_error.clone();
+
+            Callback::from(move |_| {
+                let mut next = (*controller).clone();
+
+                match secure_local_dice() {
+                    Ok(dice) => match next.begin_turn(dice) {
+                        Ok(()) => {
+                            interface_error.set(None);
+                            controller.set(next);
+                        }
+                        Err(error) => {
+                            interface_error
+                                .set(Some(format!("The roll could not be applied: {error:?}")));
+                        }
+                    },
+                    Err(error) => interface_error.set(Some(error)),
+                }
+            })
         };
 
         html! {
@@ -63,11 +137,28 @@ mod browser {
                         <section class="panel turn-panel" aria-labelledby="turn-heading">
                             <h2 id="turn-heading">{ "Turn" }</h2>
                             <strong>{ turn_text }</strong>
-                            <p class="panel-note">{ "Game 1 · Single game" }</p>
+                            <p class="panel-note">
+                                { controller.status_message().to_owned() }
+                            </p>
+
+                            {
+                                interface_error.as_ref().map_or_else(
+                                    || html! {},
+                                    |error| html! {
+                                        <p class="interface-error" role="alert">
+                                            { error }
+                                        </p>
+                                    },
+                                )
+                            }
                         </section>
 
                         <DiceDisplay dice={board.dice} />
-                        <GameControls />
+
+                        <GameControls
+                            can_roll={can_roll}
+                            on_roll={on_roll}
+                        />
                     </aside>
 
                     <section class="board-stage" aria-label="Game board">
@@ -93,7 +184,15 @@ mod browser {
 
                                 <div>
                                     <dt>{ "State" }</dt>
-                                    <dd>{ "Ready" }</dd>
+                                    <dd>
+                                        {
+                                            if can_roll {
+                                                "Ready to roll"
+                                            } else {
+                                                "Turn in progress"
+                                            }
+                                        }
+                                    </dd>
                                 </div>
                             </dl>
                         </section>
