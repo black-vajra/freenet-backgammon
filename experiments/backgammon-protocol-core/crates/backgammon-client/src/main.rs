@@ -1,6 +1,7 @@
 #[cfg(target_arch = "wasm32")]
 mod components;
 
+pub mod controller;
 pub mod projection;
 
 #[cfg(target_arch = "wasm32")]
