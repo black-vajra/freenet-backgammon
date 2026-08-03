@@ -4,6 +4,7 @@ members = [
     "crates/backgammon-core",
     "crates/backgammon-protocol",
     "crates/backgammon-contract",
+    "crates/backgammon-client",
 ]
 
 [workspace.package]

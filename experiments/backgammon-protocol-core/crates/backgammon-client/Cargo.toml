@@ -1,0 +1,12 @@
+[package]
+name = "backgammon-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+backgammon-core = { path = "../backgammon-core" }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+yew = { version = "0.23.0", features = ["csr"] }
