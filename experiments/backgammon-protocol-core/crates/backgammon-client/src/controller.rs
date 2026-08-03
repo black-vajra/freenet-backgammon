@@ -10,9 +10,16 @@ pub struct LocalTurnRecord {
     pub moves: Vec<CheckerMove>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalGameOutcome {
+    Completed { winner: Player, points: u8 },
+    Resigned { resigned: Player, winner: Player },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ControllerError {
     GameAlreadyCompleted,
+    SessionInactive,
     NotAwaitingRoll,
     InvalidDice(StateError),
     InvalidState(StateError),
@@ -33,6 +40,8 @@ pub struct LocalGameController {
     selected_moves: Vec<CheckerMove>,
     selected_source: Option<MoveSource>,
     history: Vec<LocalTurnRecord>,
+    outcome: Option<LocalGameOutcome>,
+    left_table: bool,
     status_message: String,
 }
 
@@ -54,6 +63,8 @@ impl LocalGameController {
             selected_moves: Vec::new(),
             selected_source: None,
             history: Vec::new(),
+            outcome: None,
+            left_table: false,
             status_message: "White to roll.".to_owned(),
         }
     }
@@ -78,6 +89,18 @@ impl LocalGameController {
         self.selected_source
     }
 
+    pub fn outcome(&self) -> Option<LocalGameOutcome> {
+        self.outcome
+    }
+
+    pub fn has_left_table(&self) -> bool {
+        self.left_table
+    }
+
+    pub fn is_active(&self) -> bool {
+        !self.left_table && self.outcome.is_none()
+    }
+
     pub fn status_message(&self) -> &str {
         &self.status_message
     }
@@ -86,7 +109,40 @@ impl LocalGameController {
         *self = Self::new();
     }
 
+    pub fn resign(&mut self) -> Result<(), ControllerError> {
+        if self.left_table {
+            return Err(ControllerError::SessionInactive);
+        }
+
+        if self.outcome.is_some() || !matches!(self.state.status, GameStatus::InProgress) {
+            return Err(ControllerError::GameAlreadyCompleted);
+        }
+
+        let resigned = self.state.active_player;
+        let winner = resigned.opponent();
+
+        self.outcome = Some(LocalGameOutcome::Resigned { resigned, winner });
+        self.cancel_pending_turn();
+        self.status_message = format!(
+            "{} resigned. {} wins.",
+            player_name(resigned),
+            player_name(winner)
+        );
+
+        Ok(())
+    }
+
+    pub fn leave_table(&mut self) {
+        self.left_table = true;
+        self.cancel_pending_turn();
+        self.status_message = "You left the local table.".to_owned();
+    }
+
     pub fn begin_turn(&mut self, dice: Dice) -> Result<(), ControllerError> {
+        if !self.is_active() {
+            return Err(ControllerError::SessionInactive);
+        }
+
         if !matches!(self.state.status, GameStatus::InProgress) {
             return Err(ControllerError::GameAlreadyCompleted);
         }
@@ -134,6 +190,10 @@ impl LocalGameController {
     }
 
     pub fn legal_sources(&self) -> Vec<MoveSource> {
+        if !self.is_active() {
+            return Vec::new();
+        }
+
         let mut sources = Vec::new();
 
         for checker_move in self.next_legal_moves() {
@@ -147,6 +207,10 @@ impl LocalGameController {
     }
 
     pub fn select_source(&mut self, source: MoveSource) -> Result<(), ControllerError> {
+        if !self.is_active() {
+            return Err(ControllerError::SessionInactive);
+        }
+
         if !self.legal_sources().contains(&source) {
             self.selected_source = None;
             self.status_message = "That checker cannot be moved legally.".to_owned();
@@ -160,6 +224,10 @@ impl LocalGameController {
     }
 
     pub fn legal_destinations(&self) -> Result<Vec<MoveTarget>, ControllerError> {
+        if !self.is_active() {
+            return Err(ControllerError::SessionInactive);
+        }
+
         let source = self
             .selected_source
             .ok_or(ControllerError::NoSourceSelected)?;
@@ -171,6 +239,10 @@ impl LocalGameController {
         &self,
         source: MoveSource,
     ) -> Result<Vec<MoveTarget>, ControllerError> {
+        if !self.is_active() {
+            return Err(ControllerError::SessionInactive);
+        }
+
         let mut destinations = Vec::new();
 
         for checker_move in self
@@ -194,6 +266,10 @@ impl LocalGameController {
     }
 
     pub fn choose_destination(&mut self, destination: MoveTarget) -> Result<bool, ControllerError> {
+        if !self.is_active() {
+            return Err(ControllerError::SessionInactive);
+        }
+
         let source = self
             .selected_source
             .ok_or(ControllerError::NoSourceSelected)?;
@@ -306,9 +382,35 @@ impl LocalGameController {
         self.legal_sequences.clear();
         self.selected_moves.clear();
         self.selected_source = None;
-        self.status_message = format!("{} to roll.", player_name(self.state.active_player));
+
+        self.sync_outcome_from_state();
+
+        if self.outcome.is_none() {
+            self.status_message = format!("{} to roll.", player_name(self.state.active_player));
+        }
 
         Ok(())
+    }
+
+    fn sync_outcome_from_state(&mut self) {
+        if let GameStatus::Completed { winner, points } = self.state.status {
+            self.outcome = Some(LocalGameOutcome::Completed { winner, points });
+            self.status_message = format!(
+                "{} wins a {} for {} point{}.",
+                player_name(winner),
+                result_name(points),
+                points,
+                if points == 1 { "" } else { "s" }
+            );
+        }
+    }
+
+    fn cancel_pending_turn(&mut self) {
+        self.preview_state = self.state.clone();
+        self.turn_start_state = None;
+        self.legal_sequences.clear();
+        self.selected_moves.clear();
+        self.selected_source = None;
     }
 }
 
@@ -334,6 +436,15 @@ fn player_name(player: Player) -> &'static str {
     }
 }
 
+fn result_name(points: u8) -> &'static str {
+    match points {
+        1 => "single game",
+        2 => "gammon",
+        3 => "backgammon",
+        _ => "game",
+    }
+}
+
 fn source_name(source: MoveSource) -> String {
     match source {
         MoveSource::Bar => "bar checker".to_owned(),
@@ -346,7 +457,7 @@ mod tests {
     use super::*;
 
     fn play_first_available_turn(controller: &mut LocalGameController) {
-        while controller.state().turn_phase == TurnPhase::Moving {
+        while controller.state().turn_phase == TurnPhase::Moving && controller.outcome().is_none() {
             let source = controller.legal_sources()[0];
             controller.select_source(source).unwrap();
 
@@ -363,6 +474,9 @@ mod tests {
         assert_eq!(controller.visible_state(), controller.state());
         assert!(controller.history().is_empty());
         assert!(controller.legal_sources().is_empty());
+        assert_eq!(controller.outcome(), None);
+        assert!(!controller.has_left_table());
+        assert!(controller.is_active());
         assert_eq!(controller.status_message(), "White to roll.");
     }
 
@@ -485,7 +599,65 @@ mod tests {
     }
 
     #[test]
-    fn new_game_clears_progress_and_history() {
+    fn resignation_records_winner_and_stops_play() {
+        let mut controller = LocalGameController::new();
+
+        controller.resign().unwrap();
+
+        assert_eq!(
+            controller.outcome(),
+            Some(LocalGameOutcome::Resigned {
+                resigned: Player::White,
+                winner: Player::Black,
+            })
+        );
+        assert!(!controller.is_active());
+        assert_eq!(
+            controller.begin_turn(Dice {
+                first: 1,
+                second: 2,
+            }),
+            Err(ControllerError::SessionInactive)
+        );
+    }
+
+    #[test]
+    fn leave_table_stops_local_session() {
+        let mut controller = LocalGameController::new();
+
+        controller.leave_table();
+
+        assert!(controller.has_left_table());
+        assert!(!controller.is_active());
+        assert!(controller.legal_sources().is_empty());
+    }
+
+    #[test]
+    fn completed_state_produces_scored_outcome() {
+        let mut controller = LocalGameController::new();
+
+        controller.state.status = GameStatus::Completed {
+            winner: Player::Black,
+            points: 3,
+        };
+
+        controller.sync_outcome_from_state();
+
+        assert_eq!(
+            controller.outcome(),
+            Some(LocalGameOutcome::Completed {
+                winner: Player::Black,
+                points: 3,
+            })
+        );
+        assert_eq!(
+            controller.status_message(),
+            "Black wins a backgammon for 3 points."
+        );
+    }
+
+    #[test]
+    fn new_game_clears_progress_history_and_terminal_state() {
         let mut controller = LocalGameController::new();
 
         controller
@@ -498,10 +670,15 @@ mod tests {
         play_first_available_turn(&mut controller);
         assert_eq!(controller.history().len(), 1);
 
+        controller.resign().unwrap();
+        controller.leave_table();
         controller.new_game();
 
         assert_eq!(controller.state(), &GameState::standard_start());
         assert!(controller.history().is_empty());
+        assert_eq!(controller.outcome(), None);
+        assert!(!controller.has_left_table());
+        assert!(controller.is_active());
         assert_eq!(controller.status_message(), "White to roll.");
     }
 }
