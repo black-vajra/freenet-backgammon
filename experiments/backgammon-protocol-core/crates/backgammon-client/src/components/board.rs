@@ -13,18 +13,10 @@ fn point_position(index: usize) -> (f32, bool) {
     const RIGHT: [f32; 6] = [740.0, 810.0, 880.0, 950.0, 1020.0, 1090.0];
 
     match index {
-        // Points 1-6: bottom-right, numbered from the outer edge toward the bar.
         0..=5 => (RIGHT[5 - index], false),
-
-        // Points 7-12: bottom-left, numbered from the bar toward the outer edge.
         6..=11 => (LEFT[11 - index], false),
-
-        // Points 13-18: top-left, numbered from the outer edge toward the bar.
         12..=17 => (LEFT[index - 12], true),
-
-        // Points 19-24: top-right, numbered from the bar toward the outer edge.
         18..=23 => (RIGHT[index - 18], true),
-
         _ => unreachable!("backgammon point index must be between 0 and 23"),
     }
 }
@@ -35,9 +27,8 @@ pub fn board(props: &BoardProps) -> Html {
         <svg
             class="backgammon-board"
             viewBox="0 0 1200 800"
-            width="100%"
             role="img"
-            aria-label="Backgammon board showing the standard starting position"
+            aria-label="Backgammon board"
         >
             <title>{ "Backgammon board" }</title>
 
@@ -72,6 +63,96 @@ pub fn board(props: &BoardProps) -> Html {
                 stroke="#211008"
                 stroke-width="4"
             />
+
+            <text
+                x="600"
+                y="360"
+                text-anchor="middle"
+                class="board-label"
+            >
+                { "BLACK BAR" }
+            </text>
+
+            <text
+                x="600"
+                y="392"
+                text-anchor="middle"
+                class="board-count"
+            >
+                { props.board.black_bar }
+            </text>
+
+            <text
+                x="600"
+                y="435"
+                text-anchor="middle"
+                class="board-label"
+            >
+                { "WHITE BAR" }
+            </text>
+
+            <text
+                x="600"
+                y="467"
+                text-anchor="middle"
+                class="board-count"
+            >
+                { props.board.white_bar }
+            </text>
+
+            <rect
+                x="1132"
+                y="70"
+                width="34"
+                height="300"
+                rx="10"
+                class="bear-off-tray"
+            />
+
+            <text
+                x="1149"
+                y="105"
+                text-anchor="middle"
+                class="tray-label"
+            >
+                { "B" }
+            </text>
+
+            <text
+                x="1149"
+                y="220"
+                text-anchor="middle"
+                class="tray-count"
+            >
+                { props.board.black_borne_off }
+            </text>
+
+            <rect
+                x="1132"
+                y="430"
+                width="34"
+                height="300"
+                rx="10"
+                class="bear-off-tray"
+            />
+
+            <text
+                x="1149"
+                y="465"
+                text-anchor="middle"
+                class="tray-label"
+            >
+                { "W" }
+            </text>
+
+            <text
+                x="1149"
+                y="580"
+                text-anchor="middle"
+                class="tray-count"
+            >
+                { props.board.white_borne_off }
+            </text>
 
             {
                 for props.board.points.iter().map(|point| {
