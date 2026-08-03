@@ -1,3 +1,5 @@
+mod projection;
+
 #[cfg(target_arch = "wasm32")]
 mod browser {
     use backgammon_core::GameState;
