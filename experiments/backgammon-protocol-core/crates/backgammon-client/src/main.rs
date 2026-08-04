@@ -69,10 +69,44 @@ mod browser {
         }
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum PendingConfirmation {
+        Resign,
+        Leave,
+        NewGame,
+    }
+
+    impl PendingConfirmation {
+        fn title(self) -> &'static str {
+            match self {
+                Self::Resign => "Resign this game?",
+                Self::Leave => "Leave the table?",
+                Self::NewGame => "Start a new game?",
+            }
+        }
+
+        fn message(self) -> &'static str {
+            match self {
+                Self::Resign => "The active player will resign and the opponent will win.",
+                Self::Leave => "The current local session will end.",
+                Self::NewGame => "The current board, dice, and move history will be discarded.",
+            }
+        }
+
+        fn confirm_label(self) -> &'static str {
+            match self {
+                Self::Resign => "Resign game",
+                Self::Leave => "Leave table",
+                Self::NewGame => "Start new game",
+            }
+        }
+    }
+
     #[function_component(App)]
     fn app() -> Html {
         let controller = use_state(LocalGameController::new);
         let interface_error = use_state(|| None::<String>);
+        let pending_confirmation = use_state(|| None::<PendingConfirmation>);
 
         let board = BoardView::from(controller.visible_state());
         let outcome = controller.outcome();
@@ -206,50 +240,135 @@ mod browser {
         };
 
         let on_resign = {
-            let controller = controller.clone();
-            let interface_error = interface_error.clone();
+            let pending_confirmation = pending_confirmation.clone();
 
             Callback::from(move |_| {
-                let mut next = (*controller).clone();
-
-                match next.resign() {
-                    Ok(()) => {
-                        interface_error.set(None);
-                        controller.set(next);
-                    }
-                    Err(error) => {
-                        interface_error
-                            .set(Some(format!("The game could not be resigned: {error:?}")));
-                    }
-                }
+                pending_confirmation.set(Some(PendingConfirmation::Resign));
             })
         };
 
         let on_new_game = {
             let controller = controller.clone();
             let interface_error = interface_error.clone();
+            let pending_confirmation = pending_confirmation.clone();
 
             Callback::from(move |_| {
-                let mut next = (*controller).clone();
-                next.new_game();
+                if controller.is_active() {
+                    pending_confirmation.set(Some(PendingConfirmation::NewGame));
+                } else {
+                    let mut next = (*controller).clone();
+                    next.new_game();
 
-                interface_error.set(None);
-                controller.set(next);
+                    interface_error.set(None);
+                    pending_confirmation.set(None);
+                    controller.set(next);
+                }
             })
         };
 
         let on_leave = {
-            let controller = controller.clone();
-            let interface_error = interface_error.clone();
+            let pending_confirmation = pending_confirmation.clone();
 
             Callback::from(move |_| {
-                let mut next = (*controller).clone();
-                next.leave_table();
-
-                interface_error.set(None);
-                controller.set(next);
+                pending_confirmation.set(Some(PendingConfirmation::Leave));
             })
         };
+
+        let on_cancel_confirmation = {
+            let pending_confirmation = pending_confirmation.clone();
+
+            Callback::from(move |_| {
+                pending_confirmation.set(None);
+            })
+        };
+
+        let on_confirm_action = {
+            let controller = controller.clone();
+            let interface_error = interface_error.clone();
+            let pending_confirmation = pending_confirmation.clone();
+
+            Callback::from(move |_| {
+                let Some(action) = *pending_confirmation else {
+                    return;
+                };
+
+                let mut next = (*controller).clone();
+
+                let result = match action {
+                    PendingConfirmation::Resign => next.resign(),
+                    PendingConfirmation::Leave => {
+                        next.leave_table();
+                        Ok(())
+                    }
+                    PendingConfirmation::NewGame => {
+                        next.new_game();
+                        Ok(())
+                    }
+                };
+
+                match result {
+                    Ok(()) => {
+                        interface_error.set(None);
+                        pending_confirmation.set(None);
+                        controller.set(next);
+                    }
+                    Err(error) => {
+                        interface_error.set(Some(format!(
+                            "The requested action could not be completed: {error:?}"
+                        )));
+                        pending_confirmation.set(None);
+                    }
+                }
+            })
+        };
+
+        let confirmation_overlay = pending_confirmation.as_ref().map_or_else(
+            || html! {},
+            |action| {
+                html! {
+                    <div
+                        class="game-overlay confirmation-overlay"
+                        role="dialog"
+                        aria-modal="true"
+                        aria-labelledby="confirmation-title"
+                        aria-describedby="confirmation-message"
+                    >
+                        <div class="result-card confirmation-card">
+                            <p class="result-kicker">{ "CONFIRM ACTION" }</p>
+
+                            <h2 id="confirmation-title">
+                                { action.title() }
+                            </h2>
+
+                            <p
+                                id="confirmation-message"
+                                class="confirmation-message"
+                            >
+                                { action.message() }
+                            </p>
+
+                            <div class="confirmation-actions">
+                                <button
+                                    type="button"
+                                    class="confirmation-cancel"
+                                    onclick={on_cancel_confirmation.clone()}
+                                >
+                                    { "Cancel" }
+                                </button>
+
+                                <button
+                                    type="button"
+                                    class="confirmation-danger"
+                                    onclick={on_confirm_action.clone()}
+                                >
+                                    { action.confirm_label() }
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                }
+            },
+        );
 
         let terminal_overlay = if left_table {
             html! {
@@ -466,6 +585,7 @@ mod browser {
                 </section>
 
                 { terminal_overlay }
+                { confirmation_overlay }
             </main>
         }
     }

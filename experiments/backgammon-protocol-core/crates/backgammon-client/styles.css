@@ -799,3 +799,53 @@ h2 {
 .pass-control:not(:disabled):hover {
     background: #ffe096;
 }
+
+/* Destructive-action confirmation dialogs */
+
+.confirmation-card {
+    width: min(92vw, 440px);
+    border-color: #c98967;
+}
+
+.confirmation-message {
+    margin: 1rem auto 1.4rem;
+    max-width: 34rem;
+    color: #e5d0b0;
+    line-height: 1.55;
+}
+
+.confirmation-actions {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.75rem;
+}
+
+.confirmation-actions button {
+    min-height: 3rem;
+    cursor: pointer;
+}
+
+.confirmation-cancel {
+    border-color: #96775e;
+    background: #493124;
+}
+
+.confirmation-cancel:hover {
+    background: #5a3d2d;
+}
+
+.confirmation-danger {
+    border-color: #df9675;
+    color: #fff2e9;
+    background: #8e382b;
+}
+
+.confirmation-danger:hover {
+    background: #a54434;
+}
+
+@media (max-width: 30rem) {
+    .confirmation-actions {
+        grid-template-columns: 1fr;
+    }
+}
