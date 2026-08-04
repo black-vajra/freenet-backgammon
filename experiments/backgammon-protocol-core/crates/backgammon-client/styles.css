@@ -681,3 +681,121 @@ h2 {
     }
 }
 
+
+/* Visible bar checkers and bear-off trays */
+
+.bar-divider {
+    stroke: rgba(224, 192, 143, 0.38);
+    stroke-width: 2;
+    stroke-dasharray: 6 7;
+    pointer-events: none;
+}
+
+.bar-player-label {
+    fill: #dcc39a;
+    font-size: 10px;
+    font-weight: 900;
+    letter-spacing: 0.08em;
+}
+
+.bar-empty-count {
+    fill: rgba(255, 240, 211, 0.48);
+    font-size: 20px;
+    font-weight: 800;
+}
+
+.bar-overflow-badge circle {
+    fill: #9c6e38;
+    stroke: #f3d28e;
+    stroke-width: 2;
+}
+
+.bar-overflow-badge text {
+    fill: #fff2d4;
+    font-size: 13px;
+    font-weight: 900;
+}
+
+.bear-off-tray {
+    fill: #321d12;
+    stroke: #211008;
+    stroke-width: 3;
+}
+
+.bear-off-area {
+    outline: none;
+}
+
+.bear-off-area.destination-legal {
+    cursor: pointer;
+}
+
+.bear-off-area.destination-legal .bear-off-tray {
+    fill: #3b2d1d;
+    stroke: #5ce59a;
+    stroke-width: 7;
+    filter: drop-shadow(0 0 8px rgba(92, 229, 154, 0.9));
+}
+
+.bear-off-area.destination-legal:hover .bear-off-tray {
+    fill: #443725;
+}
+
+.tray-label {
+    fill: #e4c999;
+    font-size: 10px;
+    font-weight: 900;
+    letter-spacing: 0.05em;
+}
+
+.borne-off-checker {
+    stroke: #100906;
+    stroke-width: 1.5;
+    pointer-events: none;
+}
+
+.borne-off-checker.white {
+    fill: #f4ead7;
+}
+
+.borne-off-checker.black {
+    fill: #241713;
+    stroke: #c5a36e;
+}
+
+.tray-count-badge circle {
+    fill: #684320;
+    stroke: #dab879;
+    stroke-width: 2;
+}
+
+.tray-count-badge text {
+    fill: #fff0d3;
+    font-size: 13px;
+    font-weight: 900;
+}
+
+/* Prevent browser SVG selection and drag artifacts */
+
+.backgammon-board,
+.backgammon-board * {
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-user-drag: none;
+    -webkit-touch-callout: none;
+}
+
+.backgammon-board {
+    touch-action: manipulation;
+}
+
+.pass-control:not(:disabled) {
+    border-color: rgba(245, 212, 122, 0.9);
+    color: #21130b;
+    background: #f0c96f;
+    cursor: pointer;
+}
+
+.pass-control:not(:disabled):hover {
+    background: #ffe096;
+}

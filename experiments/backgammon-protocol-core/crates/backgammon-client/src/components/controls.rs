@@ -3,9 +3,11 @@ use yew::prelude::*;
 #[derive(Properties, PartialEq)]
 pub struct GameControlsProps {
     pub can_roll: bool,
+    pub can_pass: bool,
     pub can_resign: bool,
     pub can_leave: bool,
     pub on_roll: Callback<MouseEvent>,
+    pub on_pass: Callback<MouseEvent>,
     pub on_resign: Callback<MouseEvent>,
     pub on_new_game: Callback<MouseEvent>,
     pub on_leave: Callback<MouseEvent>,
@@ -25,6 +27,15 @@ pub fn game_controls(props: &GameControlsProps) -> Html {
                     onclick={props.on_roll.clone()}
                 >
                     { "Roll" }
+                </button>
+
+                <button
+                    type="button"
+                    class="pass-control"
+                    disabled={!props.can_pass}
+                    onclick={props.on_pass.clone()}
+                >
+                    { "Pass turn" }
                 </button>
 
                 <button
@@ -58,7 +69,9 @@ pub fn game_controls(props: &GameControlsProps) -> Html {
 
             <p class="panel-note">
                 {
-                    if props.can_roll {
+                    if props.can_pass {
+                        "The roll has no legal move. Pass the turn when ready."
+                    } else if props.can_roll {
                         "Roll to begin the turn."
                     } else if props.can_resign {
                         "Complete the turn, resign, or begin a new game."

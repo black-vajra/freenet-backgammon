@@ -21,6 +21,7 @@ pub enum ControllerError {
     GameAlreadyCompleted,
     SessionInactive,
     NotAwaitingRoll,
+    NoForcedPassPending,
     InvalidDice(StateError),
     InvalidState(StateError),
     TurnGeneration(TurnError),
@@ -105,6 +106,13 @@ impl LocalGameController {
         &self.status_message
     }
 
+    pub fn must_pass(&self) -> bool {
+        self.is_active()
+            && self.state.turn_phase == TurnPhase::Moving
+            && self.legal_sequences.len() == 1
+            && self.legal_sequences[0].moves.is_empty()
+    }
+
     pub fn new_game(&mut self) {
         *self = Self::new();
     }
@@ -176,17 +184,28 @@ impl LocalGameController {
             dice.second
         );
 
-        if self
-            .legal_sequences
-            .iter()
-            .any(|sequence| sequence.moves.is_empty())
-        {
-            self.commit_sequence(TurnSequence::default())?;
-            self.status_message =
-                format!("{} had no legal move. Turn passed.", player_name(player));
+        if self.must_pass() {
+            self.status_message = format!(
+                "{} rolled {} and {} but has no legal move. Select Pass turn.",
+                player_name(player),
+                dice.first,
+                dice.second
+            );
         }
 
         Ok(())
+    }
+
+    pub fn pass_turn(&mut self) -> Result<(), ControllerError> {
+        if !self.is_active() {
+            return Err(ControllerError::SessionInactive);
+        }
+
+        if !self.must_pass() {
+            return Err(ControllerError::NoForcedPassPending);
+        }
+
+        self.commit_sequence(TurnSequence::default())
     }
 
     pub fn legal_sources(&self) -> Vec<MoveSource> {
@@ -596,6 +615,92 @@ mod tests {
         assert_eq!(controller.visible_state(), controller.state());
         assert_eq!(controller.history().len(), 1);
         assert!(controller.selected_moves().is_empty());
+    }
+
+    #[test]
+    fn forced_pass_waits_for_player_confirmation() {
+        use backgammon_core::{PlayerArea, Point};
+
+        let dice = Dice {
+            first: 4,
+            second: 2,
+        };
+
+        let mut points = [Point::EMPTY; 24];
+
+        /*
+         * White enters from the bar toward increasing point indices:
+         *
+         * - die 2 enters on index 1
+         * - die 4 enters on index 3
+         *
+         * Both entry points contain at least two Black checkers, so neither
+         * die can be played.
+         */
+        points[1] = Point::occupied(Player::Black, 2);
+        points[3] = Point::occupied(Player::Black, 2);
+
+        let blocked_state = GameState {
+            points,
+            white: PlayerArea {
+                bar: 1,
+                borne_off: 14,
+            },
+            black: PlayerArea {
+                bar: 0,
+                borne_off: 11,
+            },
+            active_player: Player::White,
+            turn_phase: TurnPhase::AwaitingRoll,
+            dice: None,
+            status: GameStatus::InProgress,
+        };
+
+        blocked_state.verify().unwrap();
+
+        let mut controller = LocalGameController::new();
+        controller.state = blocked_state.clone();
+        controller.preview_state = blocked_state;
+
+        controller.begin_turn(dice).unwrap();
+
+        assert!(controller.must_pass());
+        assert_eq!(controller.state().active_player, Player::White);
+        assert_eq!(controller.state().turn_phase, TurnPhase::Moving);
+        assert_eq!(controller.state().dice, Some(dice));
+        assert_eq!(controller.visible_state(), controller.state());
+        assert!(controller.legal_sources().is_empty());
+        assert!(controller.selected_moves().is_empty());
+        assert!(controller.history().is_empty());
+        assert_eq!(
+            controller.status_message(),
+            "White rolled 4 and 2 but has no legal move. Select Pass turn."
+        );
+
+        controller.pass_turn().unwrap();
+
+        assert!(!controller.must_pass());
+        assert_eq!(controller.state().active_player, Player::Black);
+        assert_eq!(controller.state().turn_phase, TurnPhase::AwaitingRoll);
+        assert_eq!(controller.state().dice, None);
+        assert_eq!(controller.visible_state(), controller.state());
+        assert_eq!(controller.history().len(), 1);
+        assert_eq!(controller.history()[0].player, Player::White);
+        assert_eq!(controller.history()[0].dice, dice);
+        assert!(controller.history()[0].moves.is_empty());
+    }
+
+    #[test]
+    fn pass_turn_is_rejected_when_a_pass_is_not_pending() {
+        let mut controller = LocalGameController::new();
+
+        assert_eq!(
+            controller.pass_turn(),
+            Err(ControllerError::NoForcedPassPending)
+        );
+
+        assert_eq!(controller.state(), &GameState::standard_start());
+        assert!(controller.history().is_empty());
     }
 
     #[test]

@@ -83,6 +83,8 @@ mod browser {
             && matches!(controller.state().status, GameStatus::InProgress)
             && controller.state().turn_phase == TurnPhase::AwaitingRoll;
 
+        let can_pass = session_active && controller.must_pass();
+
         let can_resign =
             session_active && matches!(controller.state().status, GameStatus::InProgress);
 
@@ -92,6 +94,8 @@ mod browser {
             "Table left".to_owned()
         } else if outcome.is_some() {
             "Game complete".to_owned()
+        } else if can_pass {
+            format!("{active_name} must pass")
         } else {
             match board.turn_phase {
                 TurnPhase::AwaitingRoll => format!("{active_name} to roll"),
@@ -137,6 +141,26 @@ mod browser {
                         }
                     },
                     Err(error) => interface_error.set(Some(error)),
+                }
+            })
+        };
+
+        let on_pass = {
+            let controller = controller.clone();
+            let interface_error = interface_error.clone();
+
+            Callback::from(move |_| {
+                let mut next = (*controller).clone();
+
+                match next.pass_turn() {
+                    Ok(()) => {
+                        interface_error.set(None);
+                        controller.set(next);
+                    }
+                    Err(error) => {
+                        interface_error
+                            .set(Some(format!("The turn could not be passed: {error:?}")));
+                    }
                 }
             })
         };
@@ -379,9 +403,11 @@ mod browser {
 
                         <GameControls
                             can_roll={can_roll}
+                            can_pass={can_pass}
                             can_resign={can_resign}
                             can_leave={!left_table}
                             on_roll={on_roll}
+                            on_pass={on_pass}
                             on_resign={on_resign}
                             on_new_game={on_new_game.clone()}
                             on_leave={on_leave}
@@ -424,6 +450,8 @@ mod browser {
                                                 "Table left"
                                             } else if outcome.is_some() {
                                                 "Game complete"
+                                            } else if can_pass {
+                                                "Awaiting pass"
                                             } else if can_roll {
                                                 "Ready to roll"
                                             } else {

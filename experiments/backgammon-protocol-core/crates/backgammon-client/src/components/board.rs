@@ -1,6 +1,7 @@
 use backgammon_core::{MoveSource, MoveTarget, Player};
 use yew::prelude::*;
 
+use crate::components::checker::Checker;
 use crate::components::point::Point;
 use crate::projection::BoardView;
 
@@ -27,25 +28,151 @@ fn point_position(index: usize) -> (f32, bool) {
     }
 }
 
+fn bar_checker_y(player: Player, index: u8) -> f32 {
+    let offset = f32::from(index) * 42.0;
+
+    match player {
+        Player::Black => 112.0 + offset,
+        Player::White => 688.0 - offset,
+    }
+}
+
+fn borne_off_checker_y(player: Player, index: u8) -> f32 {
+    let offset = f32::from(index) * 15.0;
+
+    match player {
+        Player::Black => 137.0 + offset,
+        Player::White => 683.0 - offset,
+    }
+}
+
+fn bar_checkers(
+    player: Player,
+    count: u8,
+    selectable: bool,
+    selected: bool,
+    on_source: &Callback<MoveSource>,
+) -> Html {
+    let visible_count = count.min(5);
+
+    html! {
+        <>
+            {
+                for (0..visible_count).map(|index| {
+                    let onclick = if selectable {
+                        let callback = on_source.clone();
+
+                        Callback::from(move |_| {
+                            callback.emit(MoveSource::Bar);
+                        })
+                    } else {
+                        Callback::noop()
+                    };
+
+                    html! {
+                        <Checker
+                            player={player}
+                            x={600.0}
+                            y={bar_checker_y(player, index)}
+                            label={format!(
+                                "{} checker on the bar",
+                                match player {
+                                    Player::White => "White",
+                                    Player::Black => "Black",
+                                }
+                            )}
+                            selectable={selectable}
+                            selected={selected}
+                            onclick={onclick}
+                        />
+                    }
+                })
+            }
+
+            {
+                if count > visible_count {
+                    let badge_y = match player {
+                        Player::Black => 112.0 + f32::from(visible_count) * 42.0,
+                        Player::White => 688.0 - f32::from(visible_count) * 42.0,
+                    };
+
+                    html! {
+                        <g class="bar-overflow-badge" pointer-events="none">
+                            <circle
+                                cx="600"
+                                cy={badge_y.to_string()}
+                                r="18"
+                            />
+
+                            <text
+                                x="600"
+                                y={(badge_y + 6.0).to_string()}
+                                text-anchor="middle"
+                            >
+                                { format!("+{}", count - visible_count) }
+                            </text>
+                        </g>
+                    }
+                } else {
+                    html! {}
+                }
+            }
+        </>
+    }
+}
+
+fn borne_off_checkers(player: Player, count: u8) -> Html {
+    html! {
+        <>
+            {
+                for (0..count).map(|index| {
+                    let player_class = match player {
+                        Player::White => "white",
+                        Player::Black => "black",
+                    };
+
+                    html! {
+                        <rect
+                            class={classes!("borne-off-checker", player_class)}
+                            x="1123"
+                            y={borne_off_checker_y(player, index).to_string()}
+                            width="34"
+                            height="11"
+                            rx="5.5"
+                        >
+                            <title>
+                                {
+                                    format!(
+                                        "{} borne-off checker {}",
+                                        match player {
+                                            Player::White => "White",
+                                            Player::Black => "Black",
+                                        },
+                                        index + 1
+                                    )
+                                }
+                            </title>
+                        </rect>
+                    }
+                })
+            }
+        </>
+    }
+}
+
 #[function_component(Board)]
 pub fn board(props: &BoardProps) -> Html {
     let bar_is_legal = props.legal_sources.contains(&MoveSource::Bar);
     let bar_is_selected = props.selected_source == Some(MoveSource::Bar);
     let bear_off_is_legal = props.legal_destinations.contains(&MoveTarget::BearOff);
 
-    let on_bar = {
-        let callback = props.on_source.clone();
+    let black_bar_selectable = bar_is_legal && props.board.active_player == Player::Black;
 
-        Callback::from(move |_| {
-            callback.emit(MoveSource::Bar);
-        })
-    };
+    let white_bar_selectable = bar_is_legal && props.board.active_player == Player::White;
 
-    let bar_click = if bar_is_legal {
-        on_bar
-    } else {
-        Callback::noop()
-    };
+    let black_bar_selected = bar_is_selected && props.board.active_player == Player::Black;
+
+    let white_bar_selected = bar_is_selected && props.board.active_player == Player::White;
 
     let on_bear_off = {
         let callback = props.on_destination.clone();
@@ -65,6 +192,9 @@ pub fn board(props: &BoardProps) -> Html {
             viewBox="0 0 1200 800"
             role="img"
             aria-label="Interactive backgammon board"
+            onmousedown={Callback::from(|event: MouseEvent| {
+                event.prevent_default();
+            })}
         >
             <title>{ "Interactive backgammon board" }</title>
 
@@ -90,14 +220,7 @@ pub fn board(props: &BoardProps) -> Html {
                 stroke-width="4"
             />
 
-            <g
-                class={classes!(
-                    "bar-area",
-                    bar_is_legal.then_some("bar-selectable"),
-                    bar_is_selected.then_some("bar-selected"),
-                )}
-                onclick={bar_click}
-            >
+            <g class="bar-area">
                 <rect
                     x="555"
                     y="55"
@@ -108,11 +231,19 @@ pub fn board(props: &BoardProps) -> Html {
                     stroke-width="4"
                 />
 
+                <line
+                    x1="565"
+                    y1="400"
+                    x2="635"
+                    y2="400"
+                    class="bar-divider"
+                />
+
                 <text
                     x="600"
-                    y="360"
+                    y="78"
                     text-anchor="middle"
-                    class="board-label"
+                    class="bar-player-label"
                     pointer-events="none"
                 >
                     { "BLACK BAR" }
@@ -120,40 +251,79 @@ pub fn board(props: &BoardProps) -> Html {
 
                 <text
                     x="600"
-                    y="392"
+                    y="730"
                     text-anchor="middle"
-                    class="board-count"
-                    pointer-events="none"
-                >
-                    { props.board.black_bar }
-                </text>
-
-                <text
-                    x="600"
-                    y="435"
-                    text-anchor="middle"
-                    class="board-label"
+                    class="bar-player-label"
                     pointer-events="none"
                 >
                     { "WHITE BAR" }
                 </text>
 
-                <text
-                    x="600"
-                    y="467"
-                    text-anchor="middle"
-                    class="board-count"
-                    pointer-events="none"
-                >
-                    { props.board.white_bar }
-                </text>
+                {
+                    bar_checkers(
+                        Player::Black,
+                        props.board.black_bar,
+                        black_bar_selectable,
+                        black_bar_selected,
+                        &props.on_source,
+                    )
+                }
+
+                {
+                    bar_checkers(
+                        Player::White,
+                        props.board.white_bar,
+                        white_bar_selectable,
+                        white_bar_selected,
+                        &props.on_source,
+                    )
+                }
+
+                {
+                    if props.board.black_bar == 0 {
+                        html! {
+                            <text
+                                x="600"
+                                y="122"
+                                text-anchor="middle"
+                                class="bar-empty-count"
+                                pointer-events="none"
+                            >
+                                { "0" }
+                            </text>
+                        }
+                    } else {
+                        html! {}
+                    }
+                }
+
+                {
+                    if props.board.white_bar == 0 {
+                        html! {
+                            <text
+                                x="600"
+                                y="686"
+                                text-anchor="middle"
+                                class="bar-empty-count"
+                                pointer-events="none"
+                            >
+                                { "0" }
+                            </text>
+                        }
+                    } else {
+                        html! {}
+                    }
+                }
             </g>
 
             <g
                 class={classes!(
                     "bear-off-area",
+                    "black-off-area",
                     black_bear_off_legal.then_some("destination-legal"),
                 )}
+                role={black_bear_off_legal.then_some("button")}
+                aria-label="Black bear-off tray"
                 onclick={
                     if black_bear_off_legal {
                         on_bear_off.clone()
@@ -163,40 +333,48 @@ pub fn board(props: &BoardProps) -> Html {
                 }
             >
                 <rect
-                    x="1132"
+                    x="1114"
                     y="70"
-                    width="34"
+                    width="52"
                     height="300"
                     rx="10"
                     class="bear-off-tray"
                 />
 
                 <text
-                    x="1149"
-                    y="105"
+                    x="1140"
+                    y="94"
                     text-anchor="middle"
                     class="tray-label"
                     pointer-events="none"
                 >
-                    { "B" }
+                    <tspan x="1140" dy="0">{ "BLACK" }</tspan>
+                    <tspan x="1140" dy="14">{ "OFF" }</tspan>
                 </text>
 
-                <text
-                    x="1149"
-                    y="220"
-                    text-anchor="middle"
-                    class="tray-count"
-                    pointer-events="none"
-                >
-                    { props.board.black_borne_off }
-                </text>
+                {
+                    borne_off_checkers(
+                        Player::Black,
+                        props.board.black_borne_off,
+                    )
+                }
+
+                <g class="tray-count-badge" pointer-events="none">
+                    <circle cx="1140" cy="345" r="16" />
+                    <text x="1140" y="351" text-anchor="middle">
+                        { props.board.black_borne_off }
+                    </text>
+                </g>
             </g>
 
             <g
                 class={classes!(
                     "bear-off-area",
+                    "white-off-area",
                     white_bear_off_legal.then_some("destination-legal"),
                 )}
+                role={white_bear_off_legal.then_some("button")}
+                aria-label="White bear-off tray"
                 onclick={
                     if white_bear_off_legal {
                         on_bear_off
@@ -206,33 +384,38 @@ pub fn board(props: &BoardProps) -> Html {
                 }
             >
                 <rect
-                    x="1132"
+                    x="1114"
                     y="430"
-                    width="34"
+                    width="52"
                     height="300"
                     rx="10"
                     class="bear-off-tray"
                 />
 
                 <text
-                    x="1149"
-                    y="465"
+                    x="1140"
+                    y="708"
                     text-anchor="middle"
                     class="tray-label"
                     pointer-events="none"
                 >
-                    { "W" }
+                    <tspan x="1140" dy="0">{ "WHITE" }</tspan>
+                    <tspan x="1140" dy="14">{ "OFF" }</tspan>
                 </text>
 
-                <text
-                    x="1149"
-                    y="580"
-                    text-anchor="middle"
-                    class="tray-count"
-                    pointer-events="none"
-                >
-                    { props.board.white_borne_off }
-                </text>
+                {
+                    borne_off_checkers(
+                        Player::White,
+                        props.board.white_borne_off,
+                    )
+                }
+
+                <g class="tray-count-badge" pointer-events="none">
+                    <circle cx="1140" cy="455" r="16" />
+                    <text x="1140" y="461" text-anchor="middle">
+                        { props.board.white_borne_off }
+                    </text>
+                </g>
             </g>
 
             {
@@ -265,7 +448,8 @@ pub fn board(props: &BoardProps) -> Html {
 
 #[cfg(test)]
 mod tests {
-    use super::point_position;
+    use super::{bar_checker_y, borne_off_checker_y, point_position};
+    use backgammon_core::Player;
 
     #[test]
     fn all_points_have_distinct_quadrant_positions() {
@@ -300,5 +484,23 @@ mod tests {
         assert_eq!(point_position(17), (460.0, true));
         assert_eq!(point_position(18), (740.0, true));
         assert_eq!(point_position(23), (1090.0, true));
+    }
+
+    #[test]
+    fn bar_checkers_stack_away_from_each_end() {
+        assert_eq!(bar_checker_y(Player::Black, 0), 112.0);
+        assert_eq!(bar_checker_y(Player::Black, 1), 154.0);
+
+        assert_eq!(bar_checker_y(Player::White, 0), 688.0);
+        assert_eq!(bar_checker_y(Player::White, 1), 646.0);
+    }
+
+    #[test]
+    fn borne_off_checkers_stack_inside_their_trays() {
+        assert_eq!(borne_off_checker_y(Player::Black, 0), 137.0);
+        assert_eq!(borne_off_checker_y(Player::Black, 14), 347.0);
+
+        assert_eq!(borne_off_checker_y(Player::White, 0), 683.0);
+        assert_eq!(borne_off_checker_y(Player::White, 14), 473.0);
     }
 }
