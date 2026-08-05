@@ -1,15 +1,22 @@
 use backgammon_core::Player;
 use backgammon_protocol::{DiceCommit, DiceCommitment, DiceSecret, GameId};
 
-const STORAGE_PREFIX: &str = "freenet-backgammon.dice-secret.v1";
+const STORAGE_PREFIX: &str = "freenet-backgammon.dice-secret.v2";
 
-pub fn dice_secret_storage_key(game_id: &GameId, turn: u32, player: Player) -> String {
-    format!(
-        "{STORAGE_PREFIX}.{}.{}.{}",
+pub fn dice_secret_storage_key(
+    contract_id: &str,
+    game_id: &GameId,
+    turn: u32,
+    player: Player,
+) -> Result<String, String> {
+    validate_contract_id(contract_id)?;
+
+    Ok(format!(
+        "{STORAGE_PREFIX}.{contract_id}.{}.{}.{}",
         encode_hex(game_id),
         turn,
         player_label(player),
-    )
+    ))
 }
 
 pub fn verify_dice_secret_commitment(
@@ -32,13 +39,14 @@ pub fn verify_dice_secret_commitment(
 
 #[cfg(target_arch = "wasm32")]
 pub fn store_dice_secret(
+    contract_id: &str,
     game_id: &GameId,
     turn: u32,
     player: Player,
     secret: &DiceSecret,
 ) -> Result<(), String> {
     let storage = browser_storage()?;
-    let key = dice_secret_storage_key(game_id, turn, player);
+    let key = dice_secret_storage_key(contract_id, game_id, turn, player)?;
     let encoded = encode_hex(secret);
 
     storage
@@ -63,12 +71,13 @@ pub fn store_dice_secret(
 
 #[cfg(target_arch = "wasm32")]
 pub fn load_dice_secret(
+    contract_id: &str,
     game_id: &GameId,
     turn: u32,
     player: Player,
 ) -> Result<Option<DiceSecret>, String> {
     let storage = browser_storage()?;
-    let key = dice_secret_storage_key(game_id, turn, player);
+    let key = dice_secret_storage_key(contract_id, game_id, turn, player)?;
 
     let Some(encoded) = storage
         .get_item(&key)
@@ -87,13 +96,41 @@ pub fn load_dice_secret(
 }
 
 #[cfg(target_arch = "wasm32")]
-pub fn remove_dice_secret(game_id: &GameId, turn: u32, player: Player) -> Result<(), String> {
+pub fn remove_dice_secret(
+    contract_id: &str,
+    game_id: &GameId,
+    turn: u32,
+    player: Player,
+) -> Result<(), String> {
     let storage = browser_storage()?;
-    let key = dice_secret_storage_key(game_id, turn, player);
+    let key = dice_secret_storage_key(contract_id, game_id, turn, player)?;
 
     storage
         .remove_item(&key)
         .map_err(|error| format!("Could not remove the dice secret: {error:?}"))
+}
+
+fn validate_contract_id(contract_id: &str) -> Result<(), String> {
+    const MAX_CONTRACT_ID_BYTES: usize = 128;
+
+    if contract_id.is_empty() {
+        return Err("Dice-secret contract ID is empty.".to_owned());
+    }
+
+    if contract_id.len() > MAX_CONTRACT_ID_BYTES {
+        return Err(format!(
+            "Dice-secret contract ID exceeds {MAX_CONTRACT_ID_BYTES} bytes."
+        ));
+    }
+
+    if !contract_id
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return Err("Dice-secret contract ID contains unsupported characters.".to_owned());
+    }
+
+    Ok(())
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -214,21 +251,31 @@ mod tests {
     fn storage_keys_are_context_bound() {
         let game = [7_u8; 32];
 
-        let white_turn_zero = dice_secret_storage_key(&game, 0, Player::White);
+        let white_turn_zero =
+            dice_secret_storage_key("contract-one", &game, 0, Player::White).unwrap();
 
         assert_ne!(
             white_turn_zero,
-            dice_secret_storage_key(&game, 1, Player::White),
+            dice_secret_storage_key("contract-two", &game, 0, Player::White).unwrap(),
         );
 
         assert_ne!(
             white_turn_zero,
-            dice_secret_storage_key(&game, 0, Player::Black),
+            dice_secret_storage_key("contract-one", &game, 1, Player::White).unwrap(),
         );
 
         assert_ne!(
             white_turn_zero,
-            dice_secret_storage_key(&[8_u8; 32], 0, Player::White),
+            dice_secret_storage_key("contract-one", &game, 0, Player::Black).unwrap(),
         );
+
+        assert_ne!(
+            white_turn_zero,
+            dice_secret_storage_key("contract-one", &[8_u8; 32], 0, Player::White).unwrap(),
+        );
+
+        assert!(dice_secret_storage_key("", &game, 0, Player::White).is_err());
+        assert!(dice_secret_storage_key("contains space", &game, 0, Player::White).is_err());
+        assert!(dice_secret_storage_key("contains/slash", &game, 0, Player::White).is_err());
     }
 }
