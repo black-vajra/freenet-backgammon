@@ -13,22 +13,22 @@ pub mod transport;
 #[cfg(target_arch = "wasm32")]
 mod browser {
     use backgammon_core::{Dice, GameStatus, MoveSource, MoveTarget, Player, TurnPhase};
-    use backgammon_protocol::{DiceCommit, DiceSecret, GameActionPayload};
+    use backgammon_protocol::{replay_game, DiceSecret, GameActionPayload};
     use yew::prelude::*;
 
+    use crate::commitment_planner::{plan_commitment, CommitmentPlan, CommitmentPlannerInput};
     use crate::components::board::Board;
     use crate::components::controls::GameControls;
     use crate::components::dice::DiceDisplay;
     use crate::components::history::MoveHistory;
     use crate::components::player_panel::PlayerPanel;
     use crate::controller::{LocalGameController, LocalGameOutcome};
-    use crate::ledger_codec::{build_encoded_action_delta, decode_verified_ledger};
-    use crate::pending_action::{PendingAction, PendingActionResolution};
+    use crate::ledger_codec::decode_verified_ledger;
     use crate::pending_action_store::{
         load_pending_action, remove_pending_action, store_pending_action,
     };
     use crate::projection::BoardView;
-    use crate::secret_store::{load_dice_secret, store_dice_secret, verify_dice_secret_commitment};
+    use crate::secret_store::{load_dice_secret, store_dice_secret};
     use crate::transport::{
         classify_response, connect, request_test_contract, submit_action_delta,
         submit_first_create_delta, ClassifiedResponse, ConnectionStatus, ContractProbeStatus,
@@ -88,168 +88,128 @@ mod browser {
         Ok(bytes)
     }
 
-    fn prepare_first_white_commitment(
+    const LOCAL_PLAYER: Player = Player::White;
+
+    fn local_commitment_storage_context(
         authoritative_state: &[u8],
-    ) -> Result<(DiceSecret, PendingAction), String> {
+    ) -> Result<Option<([u8; 32], u32, Player)>, String> {
         let ledger = decode_verified_ledger(authoritative_state)?;
 
-        if ledger.action_count() != 1 {
-            return Err(format!(
-                "White's first commitment requires exactly one existing action; found {}.",
-                ledger.action_count()
-            ));
-        }
+        let replay = replay_game(ledger.typed_actions())
+            .map_err(|error| format!("Could not replay verified browser state: {error:?}"))?;
 
-        let create = ledger
-            .typed_actions()
-            .first()
-            .ok_or_else(|| "Verified ledger unexpectedly contained no create action.".to_owned())?;
-
-        let secret = secure_random_32("White dice secret")?;
-        let action_id = secure_random_32("network action ID")?;
-
-        let commitment = DiceCommit::new(&create.game_id, 0, Player::White, &secret);
-
-        let (record, delta) = build_encoded_action_delta(
-            authoritative_state,
-            action_id,
-            GameActionPayload::CommitDice {
-                turn: commitment.turn,
-                player: commitment.player,
-                commitment: commitment.commitment,
-            },
-        )?;
-
-        if record.sequence != 1 {
-            return Err(format!(
-                "Refusing unexpected commitment sequence {}; expected 1.",
-                record.sequence
-            ));
-        }
-
-        let pending = PendingAction::new(TEST_CONTRACT_ID, &record, delta)?;
-
-        Ok((secret, pending))
-    }
-
-    fn recover_first_white_dice_secret(
-        authoritative_state: &[u8],
-    ) -> Result<Option<DiceSecret>, String> {
-        let ledger = decode_verified_ledger(authoritative_state)?;
-
-        for record in ledger.typed_actions() {
-            let GameActionPayload::CommitDice {
-                turn,
-                player,
-                commitment,
-            } = &record.payload
-            else {
-                continue;
+        Ok(ledger.typed_actions().iter().find_map(|record| {
+            let GameActionPayload::CommitDice { turn, player, .. } = &record.payload else {
+                return None;
             };
 
-            if *turn != 0 || *player != Player::White {
-                continue;
-            }
-
-            let secret = load_dice_secret(TEST_CONTRACT_ID, &record.game_id, *turn, *player)?
-                .ok_or_else(|| {
-                    "The accepted White commitment has no locally stored secret.".to_owned()
-                })?;
-
-            verify_dice_secret_commitment(&record.game_id, *turn, *player, commitment, &secret)?;
-
-            return Ok(Some(secret));
-        }
-
-        Ok(None)
+            (*turn == replay.next_turn && *player == LOCAL_PLAYER).then_some((
+                record.game_id,
+                *turn,
+                *player,
+            ))
+        }))
     }
 
-    enum WhiteCommitmentPlan {
-        None,
-        Accepted {
-            secret: DiceSecret,
-        },
-        Submit {
-            secret: DiceSecret,
-            delta: Vec<u8>,
-            recovered_pending: bool,
-        },
-    }
+    fn plan_browser_commitment(authoritative_state: &[u8]) -> Result<CommitmentPlan, String> {
+        let pending = load_pending_action(TEST_CONTRACT_ID)?;
 
-    fn plan_first_white_commitment(
-        authoritative_state: &[u8],
-    ) -> Result<WhiteCommitmentPlan, String> {
-        if let Some(pending) = load_pending_action(TEST_CONTRACT_ID)? {
+        let stored_secret = if let Some(pending) = pending.as_ref() {
             let record = pending.verify()?;
 
-            let GameActionPayload::CommitDice {
-                turn,
-                player,
-                commitment,
-            } = &record.payload
-            else {
+            let GameActionPayload::CommitDice { turn, player, .. } = &record.payload else {
                 return Err("Stored pending action is not a dice commitment.".to_owned());
             };
 
-            if *turn != 0 || *player != Player::White {
-                return Err("Stored pending action is not White's turn-zero commitment.".to_owned());
+            if *player != LOCAL_PLAYER {
+                return Err(
+                    "Stored pending commitment belongs to a different local player.".to_owned(),
+                );
             }
 
-            let secret = load_dice_secret(TEST_CONTRACT_ID, &pending.game_id, *turn, *player)?
-                .ok_or_else(|| {
-                    "Stored pending commitment has no matching local dice secret.".to_owned()
-                })?;
-
-            verify_dice_secret_commitment(&pending.game_id, *turn, *player, commitment, &secret)?;
-
-            match pending.reconcile(authoritative_state)? {
-                PendingActionResolution::Pending => {
-                    return Ok(WhiteCommitmentPlan::Submit {
-                        secret,
-                        delta: pending.delta,
-                        recovered_pending: true,
-                    });
-                }
-
-                PendingActionResolution::Accepted => {
-                    remove_pending_action(TEST_CONTRACT_ID)?;
-
-                    return Ok(WhiteCommitmentPlan::Accepted { secret });
-                }
-            }
-        }
-
-        if let Some(secret) = recover_first_white_dice_secret(authoritative_state)? {
-            return Ok(WhiteCommitmentPlan::Accepted { secret });
-        }
-
-        let ledger = decode_verified_ledger(authoritative_state)?;
-
-        if ledger.action_count() != 1 {
-            return Ok(WhiteCommitmentPlan::None);
-        }
-
-        let (secret, pending) = prepare_first_white_commitment(authoritative_state)?;
-
-        store_dice_secret(
-            TEST_CONTRACT_ID,
-            &pending.game_id,
-            0,
-            Player::White,
-            &secret,
-        )?;
+            load_dice_secret(TEST_CONTRACT_ID, &pending.game_id, *turn, *player)?
+        } else if let Some((game_id, turn, player)) =
+            local_commitment_storage_context(authoritative_state)?
+        {
+            load_dice_secret(TEST_CONTRACT_ID, &game_id, turn, player)?
+        } else {
+            None
+        };
 
         /*
-         * The exact pending record must be durably stored before any network
-         * submission can begin.
+         * Entropy is supplied only as candidate material. The planner decides
+         * whether the verified authoritative state permits a new commitment.
+         * Candidate material is never stored unless the planner returns a
+         * newly created Submit plan.
          */
-        store_pending_action(&pending)?;
+        let new_secret = if pending.is_none() && stored_secret.is_none() {
+            Some(secure_random_32("local dice secret")?)
+        } else {
+            None
+        };
 
-        Ok(WhiteCommitmentPlan::Submit {
-            secret,
-            delta: pending.delta,
-            recovered_pending: false,
-        })
+        let new_action_id = if pending.is_none() && stored_secret.is_none() {
+            Some(secure_random_32("network action ID")?)
+        } else {
+            None
+        };
+
+        let plan = plan_commitment(CommitmentPlannerInput {
+            contract_id: TEST_CONTRACT_ID,
+            local_player: LOCAL_PLAYER,
+            authoritative_state,
+            pending: pending.as_ref(),
+            stored_secret,
+            new_secret,
+            new_action_id,
+        })?;
+
+        match &plan {
+            CommitmentPlan::NoAction => {}
+
+            CommitmentPlan::Accepted { .. } => {
+                if pending.is_some() {
+                    remove_pending_action(TEST_CONTRACT_ID)?;
+                }
+            }
+
+            CommitmentPlan::Submit {
+                secret,
+                pending,
+                recovered_pending,
+            } => {
+                if !recovered_pending {
+                    let record = pending.verify()?;
+
+                    let GameActionPayload::CommitDice { turn, player, .. } = record.payload else {
+                        return Err(
+                            "New commitment plan produced a non-commitment action.".to_owned()
+                        );
+                    };
+
+                    if player != LOCAL_PLAYER {
+                        return Err(
+                            "New commitment plan produced an action for another player.".to_owned()
+                        );
+                    }
+
+                    /*
+                     * Persist the secret before the action that commits to it.
+                     * A crash must never leave a retryable commitment without
+                     * its corresponding reveal material.
+                     */
+                    store_dice_secret(TEST_CONTRACT_ID, &pending.game_id, turn, player, secret)?;
+
+                    /*
+                     * Persist the exact encoded delta before network
+                     * submission. Retries must use these same bytes.
+                     */
+                    store_pending_action(pending)?;
+                }
+            }
+        }
+
+        Ok(plan)
     }
 
     fn player_name(player: Player) -> &'static str {
@@ -311,8 +271,8 @@ mod browser {
         let subscription_status = use_state(|| SubscriptionStatus::Pending);
         let freenet_api = use_mut_ref(|| None::<freenet_stdlib::client_api::WebApi>);
         let first_delta_submitted = use_mut_ref(|| false);
-        let first_commitment_submitted = use_mut_ref(|| false);
-        let pending_white_dice_secret = use_mut_ref(|| None::<DiceSecret>);
+        let local_commitment_submitted = use_mut_ref(|| false);
+        let local_dice_secret = use_mut_ref(|| None::<DiceSecret>);
         let dice_secret_status = use_state(|| "Checking browser storage".to_owned());
 
         {
@@ -321,8 +281,8 @@ mod browser {
             let subscription_status = subscription_status.clone();
             let freenet_api = freenet_api.clone();
             let first_delta_submitted = first_delta_submitted.clone();
-            let first_commitment_submitted = first_commitment_submitted.clone();
-            let pending_white_dice_secret = pending_white_dice_secret.clone();
+            let local_commitment_submitted = local_commitment_submitted.clone();
+            let local_dice_secret = local_dice_secret.clone();
             let dice_secret_status = dice_secret_status.clone();
 
             use_effect_with((), move |_| {
@@ -332,8 +292,8 @@ mod browser {
                 let subscription_for_status = subscription_status.clone();
                 let api_for_response = freenet_api.clone();
                 let submitted_for_response = first_delta_submitted.clone();
-                let commitment_for_response = first_commitment_submitted.clone();
-                let secret_for_response = pending_white_dice_secret.clone();
+                let commitment_for_response = local_commitment_submitted.clone();
+                let secret_for_response = local_dice_secret.clone();
                 let secret_status_for_response = dice_secret_status.clone();
 
                 let api_for_open = freenet_api.clone();
@@ -446,7 +406,7 @@ mod browser {
                             if let (Some(key), Some(state_bytes)) =
                                 (contract_key, authoritative_state)
                             {
-                                let plan = match plan_first_white_commitment(&state_bytes) {
+                                let plan = match plan_browser_commitment(&state_bytes) {
                                     Ok(plan) => plan,
                                     Err(error) => {
                                         secret_status_for_response
@@ -460,9 +420,9 @@ mod browser {
                                 };
 
                                 match plan {
-                                    WhiteCommitmentPlan::None => {}
+                                    CommitmentPlan::NoAction => {}
 
-                                    WhiteCommitmentPlan::Accepted { secret } => {
+                                    CommitmentPlan::Accepted { secret } => {
                                         *secret_for_response.borrow_mut() = Some(secret);
                                         *commitment_for_response.borrow_mut() = true;
 
@@ -471,11 +431,12 @@ mod browser {
                                         );
                                     }
 
-                                    WhiteCommitmentPlan::Submit {
+                                    CommitmentPlan::Submit {
                                         secret,
-                                        delta,
+                                        pending,
                                         recovered_pending,
                                     } => {
+                                        let delta = pending.delta;
                                         {
                                             let mut submitted =
                                                 commitment_for_response.borrow_mut();
@@ -883,8 +844,8 @@ mod browser {
             let subscription_status = subscription_status.clone();
             let freenet_api = freenet_api.clone();
             let first_delta_submitted = first_delta_submitted.clone();
-            let first_commitment_submitted = first_commitment_submitted.clone();
-            let pending_white_dice_secret = pending_white_dice_secret.clone();
+            let local_commitment_submitted = local_commitment_submitted.clone();
+            let local_dice_secret = local_dice_secret.clone();
             let dice_secret_status = dice_secret_status.clone();
 
             Callback::from(move |_| {
@@ -894,7 +855,7 @@ mod browser {
                  * Permit one submission attempt on the new connection.
                  * The durable pending action itself remains unchanged.
                  */
-                *first_commitment_submitted.borrow_mut() = false;
+                *local_commitment_submitted.borrow_mut() = false;
 
                 contract_status.set(ContractProbeStatus::WaitingForConnection);
                 subscription_status.set(SubscriptionStatus::Pending);
@@ -906,8 +867,8 @@ mod browser {
                 let subscription_for_status = subscription_status.clone();
                 let api_for_response = freenet_api.clone();
                 let submitted_for_response = first_delta_submitted.clone();
-                let commitment_for_response = first_commitment_submitted.clone();
-                let secret_for_response = pending_white_dice_secret.clone();
+                let commitment_for_response = local_commitment_submitted.clone();
+                let secret_for_response = local_dice_secret.clone();
                 let secret_status_for_response = dice_secret_status.clone();
 
                 let api_for_open = freenet_api.clone();
@@ -1020,7 +981,7 @@ mod browser {
                             if let (Some(key), Some(state_bytes)) =
                                 (contract_key, authoritative_state)
                             {
-                                let plan = match plan_first_white_commitment(&state_bytes) {
+                                let plan = match plan_browser_commitment(&state_bytes) {
                                     Ok(plan) => plan,
                                     Err(error) => {
                                         secret_status_for_response
@@ -1034,9 +995,9 @@ mod browser {
                                 };
 
                                 match plan {
-                                    WhiteCommitmentPlan::None => {}
+                                    CommitmentPlan::NoAction => {}
 
-                                    WhiteCommitmentPlan::Accepted { secret } => {
+                                    CommitmentPlan::Accepted { secret } => {
                                         *secret_for_response.borrow_mut() = Some(secret);
                                         *commitment_for_response.borrow_mut() = true;
 
@@ -1045,11 +1006,12 @@ mod browser {
                                         );
                                     }
 
-                                    WhiteCommitmentPlan::Submit {
+                                    CommitmentPlan::Submit {
                                         secret,
-                                        delta,
+                                        pending,
                                         recovered_pending,
                                     } => {
+                                        let delta = pending.delta;
                                         {
                                             let mut submitted =
                                                 commitment_for_response.borrow_mut();
