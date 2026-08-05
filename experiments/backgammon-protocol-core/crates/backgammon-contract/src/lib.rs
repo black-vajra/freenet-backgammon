@@ -247,9 +247,7 @@ mod tests {
     };
 
     fn params() -> LedgerParameters {
-        LedgerParameters {
-            protocol_version: PROTOCOL_VERSION,
-        }
+        LedgerParameters::current()
     }
 
     fn state_hash(id: u8) -> StateHash {
@@ -801,6 +799,7 @@ mod tests {
         let state = LedgerState::default();
         let unsupported = LedgerParameters {
             protocol_version: PROTOCOL_VERSION + 1,
+            instance_nonce: [0_u8; 32],
         };
         assert_eq!(
             state.verify(&state, &unsupported),

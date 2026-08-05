@@ -18,11 +18,23 @@ pub const GENESIS_STATE_HASH: StateHash = [0_u8; 32];
 
 pub type GameId = [u8; 32];
 pub type ActionId = [u8; 32];
+pub type InstanceNonce = [u8; 32];
 pub type StateHash = [u8; 32];
 
 #[derive(Serialize, Deserialize, Clone, Default, PartialEq, Eq, Debug)]
 pub struct LedgerParameters {
     pub protocol_version: u16,
+
+    /*
+     * The exact parameter bytes form part of the Freenet contract identity.
+     * A unique nonce permits multiple independent game-ledger instances to
+     * use the same verified contract code.
+     *
+     * The default preserves decoding compatibility with the original
+     * protocol-v2 parameter encoding, which contained only protocol_version.
+     */
+    #[serde(default)]
+    pub instance_nonce: InstanceNonce,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
@@ -129,8 +141,13 @@ pub fn verify_typed_action_history(actions: &[Action]) -> Result<(), String> {
 
 impl LedgerParameters {
     pub const fn current() -> Self {
+        Self::for_instance([0_u8; 32])
+    }
+
+    pub const fn for_instance(instance_nonce: InstanceNonce) -> Self {
         Self {
             protocol_version: PROTOCOL_VERSION,
+            instance_nonce,
         }
     }
 
@@ -304,13 +321,54 @@ mod tests {
         let parameters = LedgerParameters::current();
 
         assert_eq!(parameters.protocol_version, PROTOCOL_VERSION);
+        assert_eq!(parameters.instance_nonce, [0_u8; 32]);
         assert_eq!(parameters.verify(), Ok(()));
+    }
+
+    #[test]
+    fn instance_parameters_preserve_nonce_and_change_encoding() {
+        let first = LedgerParameters::for_instance([1_u8; 32]);
+        let second = LedgerParameters::for_instance([2_u8; 32]);
+
+        assert_eq!(first.instance_nonce, [1_u8; 32]);
+        assert_eq!(second.instance_nonce, [2_u8; 32]);
+        assert_eq!(first.verify(), Ok(()));
+        assert_eq!(second.verify(), Ok(()));
+
+        let mut first_encoded = Vec::new();
+        let mut second_encoded = Vec::new();
+
+        ciborium::ser::into_writer(&first, &mut first_encoded).unwrap();
+        ciborium::ser::into_writer(&second, &mut second_encoded).unwrap();
+
+        assert_ne!(first_encoded, second_encoded);
+    }
+
+    #[test]
+    fn legacy_parameter_encoding_defaults_instance_nonce() {
+        #[derive(serde::Serialize)]
+        struct LegacyLedgerParameters {
+            protocol_version: u16,
+        }
+
+        let legacy = LegacyLedgerParameters {
+            protocol_version: PROTOCOL_VERSION,
+        };
+
+        let mut encoded = Vec::new();
+        ciborium::ser::into_writer(&legacy, &mut encoded).unwrap();
+
+        let decoded: LedgerParameters = ciborium::de::from_reader(encoded.as_slice()).unwrap();
+
+        assert_eq!(decoded, LedgerParameters::current());
+        assert_eq!(decoded.verify(), Ok(()));
     }
 
     #[test]
     fn unsupported_version_is_rejected() {
         let parameters = LedgerParameters {
             protocol_version: PROTOCOL_VERSION + 1,
+            instance_nonce: [0_u8; 32],
         };
 
         assert_eq!(
