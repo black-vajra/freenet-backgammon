@@ -231,14 +231,30 @@ mod browser {
                 let status_for_callback = connection_status.clone();
                 let contract_for_response = contract_status.clone();
                 let subscription_for_response = subscription_status.clone();
+                let subscription_for_status = subscription_status.clone();
                 let api_for_response = freenet_api.clone();
                 let submitted_for_response = first_delta_submitted.clone();
                 let commitment_for_response = first_commitment_submitted.clone();
                 let secret_for_response = pending_white_dice_secret.clone();
                 let secret_status_for_response = dice_secret_status.clone();
 
+                let api_for_open = freenet_api.clone();
+                let connection_for_open = connection_status.clone();
+                let contract_for_open = contract_status.clone();
+                let subscription_for_open = subscription_status.clone();
+
                 match connect(
                     move |status| {
+                        match &status {
+                            ConnectionStatus::Connecting => {
+                                subscription_for_status.set(SubscriptionStatus::Pending);
+                            }
+                            ConnectionStatus::Connected => {}
+                            ConnectionStatus::Disconnected | ConnectionStatus::Failed(_) => {
+                                subscription_for_status.set(SubscriptionStatus::Inactive);
+                            }
+                        }
+
                         status_for_callback.set(status);
                     },
                     move |response| {
@@ -451,18 +467,15 @@ mod browser {
                             }
                         }
                     },
-                ) {
-                    Ok(api) => {
-                        *freenet_api.borrow_mut() = Some(api);
-
-                        let api_for_request = freenet_api.clone();
-                        let contract_for_request = contract_status.clone();
-                        let subscription_for_request = subscription_status.clone();
+                    move || {
+                        let api_for_request = api_for_open.clone();
+                        let connection_for_request = connection_for_open.clone();
+                        let contract_for_request = contract_for_open.clone();
+                        let subscription_for_request = subscription_for_open.clone();
 
                         wasm_bindgen_futures::spawn_local(async move {
-                            gloo_timers::future::TimeoutFuture::new(150).await;
-
                             contract_for_request.set(ContractProbeStatus::Requesting);
+
                             subscription_for_request.set(SubscriptionStatus::Pending);
 
                             let result = {
@@ -471,19 +484,24 @@ mod browser {
                                 match api.as_mut() {
                                     Some(api) => request_test_contract(api).await,
                                     None => Err(
-                                        "Freenet connection closed before the contract request."
+                                        "Freenet WebSocket opened without an active API handle."
                                             .to_owned(),
                                     ),
                                 }
                             };
 
                             if let Err(error) = result {
+                                connection_for_request.set(ConnectionStatus::Failed(error.clone()));
+
                                 contract_for_request.set(ContractProbeStatus::Failed(error));
-                                subscription_for_request.set(SubscriptionStatus::Failed(
-                                    "Subscription request was not sent.".to_owned(),
-                                ));
+
+                                subscription_for_request.set(SubscriptionStatus::Inactive);
                             }
                         });
+                    },
+                ) {
+                    Ok(api) => {
+                        *freenet_api.borrow_mut() = Some(api);
                     }
                     Err(error) => {
                         connection_status.set(ConnectionStatus::Failed(error));
@@ -777,14 +795,30 @@ mod browser {
                 let status_for_callback = connection_status.clone();
                 let contract_for_response = contract_status.clone();
                 let subscription_for_response = subscription_status.clone();
+                let subscription_for_status = subscription_status.clone();
                 let api_for_response = freenet_api.clone();
                 let submitted_for_response = first_delta_submitted.clone();
                 let commitment_for_response = first_commitment_submitted.clone();
                 let secret_for_response = pending_white_dice_secret.clone();
                 let secret_status_for_response = dice_secret_status.clone();
 
+                let api_for_open = freenet_api.clone();
+                let connection_for_open = connection_status.clone();
+                let contract_for_open = contract_status.clone();
+                let subscription_for_open = subscription_status.clone();
+
                 match connect(
                     move |status| {
+                        match &status {
+                            ConnectionStatus::Connecting => {
+                                subscription_for_status.set(SubscriptionStatus::Pending);
+                            }
+                            ConnectionStatus::Connected => {}
+                            ConnectionStatus::Disconnected | ConnectionStatus::Failed(_) => {
+                                subscription_for_status.set(SubscriptionStatus::Inactive);
+                            }
+                        }
+
                         status_for_callback.set(status);
                     },
                     move |response| {
@@ -997,18 +1031,16 @@ mod browser {
                             }
                         }
                     },
-                ) {
-                    Ok(api) => {
-                        *freenet_api.borrow_mut() = Some(api);
-
-                        let api_for_request = freenet_api.clone();
-                        let contract_for_request = contract_status.clone();
-                        let subscription_for_request = subscription_status.clone();
+                    move || {
+                        let api_for_request = api_for_open.clone();
+                        let connection_for_request = connection_for_open.clone();
+                        let contract_for_request = contract_for_open.clone();
+                        let subscription_for_request = subscription_for_open.clone();
 
                         wasm_bindgen_futures::spawn_local(async move {
-                            gloo_timers::future::TimeoutFuture::new(150).await;
-
                             contract_for_request.set(ContractProbeStatus::Requesting);
+
+                            subscription_for_request.set(SubscriptionStatus::Pending);
 
                             let result = {
                                 let mut api = api_for_request.borrow_mut();
@@ -1016,19 +1048,24 @@ mod browser {
                                 match api.as_mut() {
                                     Some(api) => request_test_contract(api).await,
                                     None => Err(
-                                        "Freenet connection closed before the contract request."
+                                        "Freenet WebSocket opened without an active API handle."
                                             .to_owned(),
                                     ),
                                 }
                             };
 
                             if let Err(error) = result {
+                                connection_for_request.set(ConnectionStatus::Failed(error.clone()));
+
                                 contract_for_request.set(ContractProbeStatus::Failed(error));
-                                subscription_for_request.set(SubscriptionStatus::Failed(
-                                    "Subscription request was not sent.".to_owned(),
-                                ));
+
+                                subscription_for_request.set(SubscriptionStatus::Inactive);
                             }
                         });
+                    },
+                ) {
+                    Ok(api) => {
+                        *freenet_api.borrow_mut() = Some(api);
                     }
                     Err(error) => {
                         connection_status.set(ConnectionStatus::Failed(error));

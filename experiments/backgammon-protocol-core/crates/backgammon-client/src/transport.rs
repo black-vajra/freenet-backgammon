@@ -142,6 +142,7 @@ pub const TEST_CONTRACT_ID: &str = "5fyAKtPnwDEPdT3Ey9qryJTRZ7E6ztofRPxDHRtbL1S5
 pub fn connect(
     status_handler: impl Fn(ConnectionStatus) + Clone + 'static,
     response_handler: impl Fn(freenet_stdlib::client_api::HostResponse) + 'static,
+    open_handler: impl Fn() + 'static,
 ) -> Result<freenet_stdlib::client_api::WebApi, String> {
     use freenet_stdlib::client_api::WebApi;
 
@@ -169,6 +170,7 @@ pub fn connect(
         },
         move || {
             open_status(ConnectionStatus::Connected);
+            open_handler();
         },
     ))
 }
