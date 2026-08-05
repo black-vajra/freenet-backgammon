@@ -333,6 +333,67 @@ impl ReplayedGame {
     }
 }
 
+/// Builds one canonical action extending an already verified game history.
+///
+/// The existing history is replayed first. The candidate payload is then
+/// applied to a cloned replay state so that its sequence number,
+/// previous-state hash, and resulting-state hash are derived rather than
+/// trusted from the caller.
+///
+/// This function does not mutate the supplied history.
+pub fn build_next_game_action(
+    records: &[GameActionRecord],
+    action_id: crate::ActionId,
+    payload: GameActionPayload,
+) -> Result<GameActionRecord, ReplayError> {
+    let current = replay_game(records)?;
+
+    if records.iter().any(|record| record.action_id == action_id) {
+        return Err(ReplayError::DuplicateActionId);
+    }
+
+    let sequence = current.next_sequence;
+
+    /*
+     * The replicated ledger currently stores its sequence as u32 even
+     * though the typed action envelope exposes u64. Reject an action that
+     * could not subsequently be represented by the ledger.
+     */
+    u32::try_from(sequence).map_err(|_| ReplayError::SequenceNumberOverflow)?;
+
+    let mut record = GameActionRecord {
+        protocol_version: crate::PROTOCOL_VERSION,
+        game_id: current.game_id,
+        action_id,
+        sequence,
+        previous_state_hash: current.latest_state_hash,
+        resulting_state_hash: [0_u8; 32],
+        payload,
+    };
+
+    record
+        .verify()
+        .map_err(|error| ReplayError::InvalidAction { sequence, error })?;
+
+    let mut next = current;
+    next.apply_record(&record)?;
+
+    record.resulting_state_hash = next
+        .canonical_hash()
+        .map_err(|error| ReplayError::StateHash { sequence, error })?;
+
+    /*
+     * Replay the complete candidate history once more. This independently
+     * verifies sequence ordering, action-ID uniqueness, the hash chain,
+     * payload legality, and the derived resulting-state hash.
+     */
+    let mut candidate_history = records.to_vec();
+    candidate_history.push(record.clone());
+    replay_game(&candidate_history)?;
+
+    Ok(record)
+}
+
 pub fn replay_game(records: &[GameActionRecord]) -> Result<ReplayedGame, ReplayError> {
     let first = records.first().ok_or(ReplayError::EmptyHistory)?;
 
@@ -573,6 +634,70 @@ mod tests {
         );
 
         crate::derive_dice(&game_id, turn, &white_secret, &black_secret).unwrap()
+    }
+
+    #[test]
+    fn next_action_builder_derives_sequence_and_hash() {
+        let create = create_record();
+
+        let resign = build_next_game_action(
+            std::slice::from_ref(&create),
+            [42; 32],
+            GameActionPayload::Resign {
+                player: Player::White,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resign.game_id, create.game_id);
+        assert_eq!(resign.sequence, 1);
+        assert_eq!(resign.previous_state_hash, create.resulting_state_hash);
+
+        let replay = replay_game(&[create, resign.clone()]).unwrap();
+
+        assert_eq!(
+            replay.status,
+            ReplayStatus::Resigned {
+                resigned: Player::White,
+                winner: Player::Black,
+            }
+        );
+        assert_eq!(resign.resulting_state_hash, replay.latest_state_hash);
+        assert_eq!(replay.next_sequence, 2);
+    }
+
+    #[test]
+    fn next_action_builder_rejects_duplicate_action_id() {
+        let create = create_record();
+
+        assert_eq!(
+            build_next_game_action(
+                std::slice::from_ref(&create),
+                create.action_id,
+                GameActionPayload::Resign {
+                    player: Player::White,
+                },
+            ),
+            Err(ReplayError::DuplicateActionId)
+        );
+    }
+
+    #[test]
+    fn next_action_builder_rejects_illegal_transition() {
+        let create = create_record();
+
+        assert_eq!(
+            build_next_game_action(
+                std::slice::from_ref(&create),
+                [43; 32],
+                GameActionPayload::PlayTurn {
+                    turn: 0,
+                    player: Player::White,
+                    sequence: Default::default(),
+                },
+            ),
+            Err(ReplayError::RollExpected)
+        );
     }
 
     #[test]
