@@ -48,6 +48,7 @@ dependencies = [
  "ciborium",
  "freenet-stdlib",
  "gloo-timers",
+ "serde",
  "wasm-bindgen-futures",
  "web-sys",
  "yew",

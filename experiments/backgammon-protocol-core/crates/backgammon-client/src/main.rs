@@ -3,6 +3,7 @@ mod components;
 
 pub mod controller;
 pub mod ledger_codec;
+pub mod pending_action;
 pub mod projection;
 pub mod secret_store;
 pub mod transport;
