@@ -1,6 +1,7 @@
 #[cfg(target_arch = "wasm32")]
 mod components;
 
+pub mod commitment_planner;
 pub mod controller;
 pub mod ledger_codec;
 pub mod pending_action;
