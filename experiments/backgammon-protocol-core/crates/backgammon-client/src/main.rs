@@ -21,7 +21,7 @@ mod browser {
     use crate::controller::{LocalGameController, LocalGameOutcome};
     use crate::ledger_codec::{build_encoded_action_delta, decode_verified_ledger};
     use crate::projection::BoardView;
-    use crate::secret_store::store_dice_secret;
+    use crate::secret_store::{load_dice_secret, store_dice_secret, verify_dice_secret_commitment};
     use crate::transport::{
         classify_response, connect, request_test_contract, submit_action_delta,
         submit_first_create_delta, ClassifiedResponse, ConnectionStatus, ContractProbeStatus,
@@ -123,6 +123,37 @@ mod browser {
         Ok((create.game_id, secret, delta))
     }
 
+    fn recover_first_white_dice_secret(
+        authoritative_state: &[u8],
+    ) -> Result<Option<DiceSecret>, String> {
+        let ledger = decode_verified_ledger(authoritative_state)?;
+
+        for record in ledger.typed_actions() {
+            let GameActionPayload::CommitDice {
+                turn,
+                player,
+                commitment,
+            } = &record.payload
+            else {
+                continue;
+            };
+
+            if *turn != 0 || *player != Player::White {
+                continue;
+            }
+
+            let secret = load_dice_secret(&record.game_id, *turn, *player)?.ok_or_else(|| {
+                "The accepted White commitment has no locally stored secret.".to_owned()
+            })?;
+
+            verify_dice_secret_commitment(&record.game_id, *turn, *player, commitment, &secret)?;
+
+            return Ok(Some(secret));
+        }
+
+        Ok(None)
+    }
+
     fn player_name(player: Player) -> &'static str {
         match player {
             Player::White => "White",
@@ -184,6 +215,7 @@ mod browser {
         let first_delta_submitted = use_mut_ref(|| false);
         let first_commitment_submitted = use_mut_ref(|| false);
         let pending_white_dice_secret = use_mut_ref(|| None::<DiceSecret>);
+        let dice_secret_status = use_state(|| "Checking browser storage".to_owned());
 
         {
             let connection_status = connection_status.clone();
@@ -193,6 +225,7 @@ mod browser {
             let first_delta_submitted = first_delta_submitted.clone();
             let first_commitment_submitted = first_commitment_submitted.clone();
             let pending_white_dice_secret = pending_white_dice_secret.clone();
+            let dice_secret_status = dice_secret_status.clone();
 
             use_effect_with((), move |_| {
                 let status_for_callback = connection_status.clone();
@@ -202,6 +235,7 @@ mod browser {
                 let submitted_for_response = first_delta_submitted.clone();
                 let commitment_for_response = first_commitment_submitted.clone();
                 let secret_for_response = pending_white_dice_secret.clone();
+                let secret_status_for_response = dice_secret_status.clone();
 
                 match connect(
                     move |status| {
@@ -301,6 +335,26 @@ mod browser {
                                 let action_count = decode_verified_ledger(&state_bytes)
                                     .map(|ledger| ledger.action_count());
 
+                                match recover_first_white_dice_secret(&state_bytes) {
+                                    Ok(Some(secret)) => {
+                                        *secret_for_response.borrow_mut() = Some(secret);
+
+                                        secret_status_for_response.set(
+                                            "Recovered and matched accepted commitment".to_owned(),
+                                        );
+                                    }
+                                    Ok(None) => {}
+                                    Err(error) => {
+                                        secret_status_for_response
+                                            .set(format!("Recovery failed: {error}"));
+
+                                        contract_for_response
+                                            .set(ContractProbeStatus::Failed(error));
+
+                                        return;
+                                    }
+                                }
+
                                 if action_count == Ok(1) {
                                     {
                                         let mut submitted = commitment_for_response.borrow_mut();
@@ -333,6 +387,10 @@ mod browser {
                                     }
 
                                     *secret_for_response.borrow_mut() = Some(secret);
+
+                                    secret_status_for_response.set(
+                                        "Stored locally; awaiting network verification".to_owned(),
+                                    );
 
                                     contract_for_response.set(ContractProbeStatus::Updating);
 
@@ -708,11 +766,13 @@ mod browser {
             let first_delta_submitted = first_delta_submitted.clone();
             let first_commitment_submitted = first_commitment_submitted.clone();
             let pending_white_dice_secret = pending_white_dice_secret.clone();
+            let dice_secret_status = dice_secret_status.clone();
 
             Callback::from(move |_| {
                 freenet_api.borrow_mut().take();
                 contract_status.set(ContractProbeStatus::WaitingForConnection);
                 subscription_status.set(SubscriptionStatus::Pending);
+                dice_secret_status.set("Checking browser storage".to_owned());
 
                 let status_for_callback = connection_status.clone();
                 let contract_for_response = contract_status.clone();
@@ -721,6 +781,7 @@ mod browser {
                 let submitted_for_response = first_delta_submitted.clone();
                 let commitment_for_response = first_commitment_submitted.clone();
                 let secret_for_response = pending_white_dice_secret.clone();
+                let secret_status_for_response = dice_secret_status.clone();
 
                 match connect(
                     move |status| {
@@ -820,6 +881,26 @@ mod browser {
                                 let action_count = decode_verified_ledger(&state_bytes)
                                     .map(|ledger| ledger.action_count());
 
+                                match recover_first_white_dice_secret(&state_bytes) {
+                                    Ok(Some(secret)) => {
+                                        *secret_for_response.borrow_mut() = Some(secret);
+
+                                        secret_status_for_response.set(
+                                            "Recovered and matched accepted commitment".to_owned(),
+                                        );
+                                    }
+                                    Ok(None) => {}
+                                    Err(error) => {
+                                        secret_status_for_response
+                                            .set(format!("Recovery failed: {error}"));
+
+                                        contract_for_response
+                                            .set(ContractProbeStatus::Failed(error));
+
+                                        return;
+                                    }
+                                }
+
                                 if action_count == Ok(1) {
                                     {
                                         let mut submitted = commitment_for_response.borrow_mut();
@@ -852,6 +933,10 @@ mod browser {
                                     }
 
                                     *secret_for_response.borrow_mut() = Some(secret);
+
+                                    secret_status_for_response.set(
+                                        "Stored locally; awaiting network verification".to_owned(),
+                                    );
 
                                     contract_for_response.set(ContractProbeStatus::Updating);
 
@@ -1163,6 +1248,11 @@ mod browser {
                                 <div>
                                     <dt>{ "State check" }</dt>
                                     <dd>{ contract_status.state_label() }</dd>
+                                </div>
+
+                                <div>
+                                    <dt>{ "Dice secret" }</dt>
+                                    <dd>{ (*dice_secret_status).clone() }</dd>
                                 </div>
 
                                 <div>

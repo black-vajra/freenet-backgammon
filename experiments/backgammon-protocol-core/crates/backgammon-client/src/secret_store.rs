@@ -1,5 +1,5 @@
 use backgammon_core::Player;
-use backgammon_protocol::{DiceSecret, GameId};
+use backgammon_protocol::{DiceCommit, DiceCommitment, DiceSecret, GameId};
 
 const STORAGE_PREFIX: &str = "freenet-backgammon.dice-secret.v1";
 
@@ -10,6 +10,24 @@ pub fn dice_secret_storage_key(game_id: &GameId, turn: u32, player: Player) -> S
         turn,
         player_label(player),
     )
+}
+
+pub fn verify_dice_secret_commitment(
+    game_id: &GameId,
+    turn: u32,
+    player: Player,
+    expected_commitment: &DiceCommitment,
+    secret: &DiceSecret,
+) -> Result<(), String> {
+    let derived = DiceCommit::new(game_id, turn, player, secret);
+
+    if derived.commitment != *expected_commitment {
+        return Err(
+            "Stored dice secret does not match the accepted network commitment.".to_owned(),
+        );
+    }
+
+    Ok(())
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -140,6 +158,41 @@ fn decode_hex_nibble(value: u8) -> Result<u8, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn matching_secret_verifies_against_commitment() {
+        let game_id = [7_u8; 32];
+        let secret = [11_u8; 32];
+
+        let commitment = DiceCommit::new(&game_id, 0, Player::White, &secret);
+
+        assert_eq!(
+            verify_dice_secret_commitment(
+                &game_id,
+                0,
+                Player::White,
+                &commitment.commitment,
+                &secret,
+            ),
+            Ok(()),
+        );
+    }
+
+    #[test]
+    fn wrong_secret_is_rejected_against_commitment() {
+        let game_id = [7_u8; 32];
+
+        let commitment = DiceCommit::new(&game_id, 0, Player::White, &[11_u8; 32]);
+
+        assert!(verify_dice_secret_commitment(
+            &game_id,
+            0,
+            Player::White,
+            &commitment.commitment,
+            &[12_u8; 32],
+        )
+        .is_err());
+    }
 
     #[test]
     fn secret_encoding_round_trips_exactly() {
