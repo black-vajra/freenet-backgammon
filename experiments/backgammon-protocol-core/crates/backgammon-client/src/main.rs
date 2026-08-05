@@ -25,6 +25,7 @@ mod browser {
     use crate::components::player_panel::PlayerPanel;
     use crate::controller::{LocalGameController, LocalGameOutcome};
     use crate::ledger_codec::decode_verified_ledger;
+    use crate::local_role_store::{load_local_role, store_local_role};
     use crate::pending_action_store::{
         load_pending_action, remove_pending_action, store_pending_action,
     };
@@ -89,10 +90,9 @@ mod browser {
         Ok(bytes)
     }
 
-    const LOCAL_PLAYER: Player = Player::White;
-
     fn local_commitment_storage_context(
         authoritative_state: &[u8],
+        local_player: Player,
     ) -> Result<Option<([u8; 32], u32, Player)>, String> {
         let ledger = decode_verified_ledger(authoritative_state)?;
 
@@ -104,7 +104,7 @@ mod browser {
                 return None;
             };
 
-            (*turn == replay.next_turn && *player == LOCAL_PLAYER).then_some((
+            (*turn == replay.next_turn && *player == local_player).then_some((
                 record.game_id,
                 *turn,
                 *player,
@@ -112,7 +112,10 @@ mod browser {
         }))
     }
 
-    fn plan_browser_commitment(authoritative_state: &[u8]) -> Result<CommitmentPlan, String> {
+    fn plan_browser_commitment(
+        authoritative_state: &[u8],
+        local_player: Player,
+    ) -> Result<CommitmentPlan, String> {
         let pending = load_pending_action(TEST_CONTRACT_ID)?;
 
         let stored_secret = if let Some(pending) = pending.as_ref() {
@@ -122,7 +125,7 @@ mod browser {
                 return Err("Stored pending action is not a dice commitment.".to_owned());
             };
 
-            if *player != LOCAL_PLAYER {
+            if *player != local_player {
                 return Err(
                     "Stored pending commitment belongs to a different local player.".to_owned(),
                 );
@@ -130,7 +133,7 @@ mod browser {
 
             load_dice_secret(TEST_CONTRACT_ID, &pending.game_id, *turn, *player)?
         } else if let Some((game_id, turn, player)) =
-            local_commitment_storage_context(authoritative_state)?
+            local_commitment_storage_context(authoritative_state, local_player)?
         {
             load_dice_secret(TEST_CONTRACT_ID, &game_id, turn, player)?
         } else {
@@ -157,7 +160,7 @@ mod browser {
 
         let plan = plan_commitment(CommitmentPlannerInput {
             contract_id: TEST_CONTRACT_ID,
-            local_player: LOCAL_PLAYER,
+            local_player,
             authoritative_state,
             pending: pending.as_ref(),
             stored_secret,
@@ -188,7 +191,7 @@ mod browser {
                         );
                     };
 
-                    if player != LOCAL_PLAYER {
+                    if player != local_player {
                         return Err(
                             "New commitment plan produced an action for another player.".to_owned()
                         );
@@ -211,6 +214,23 @@ mod browser {
         }
 
         Ok(plan)
+    }
+
+    fn choose_local_role(player: Player) -> Result<(), String> {
+        if load_pending_action(TEST_CONTRACT_ID)?.is_some() {
+            return Err("The local role cannot change while an action is pending.".to_owned());
+        }
+
+        match load_local_role(TEST_CONTRACT_ID)? {
+            Some(existing) if existing == player => Ok(()),
+
+            Some(existing) => Err(format!(
+                "This browser profile is already locked as {} for this contract.",
+                player_name(existing),
+            )),
+
+            None => store_local_role(TEST_CONTRACT_ID, player),
+        }
     }
 
     fn player_name(player: Player) -> &'static str {
@@ -276,6 +296,18 @@ mod browser {
         let local_dice_secret = use_mut_ref(|| None::<DiceSecret>);
         let dice_secret_status = use_state(|| "Checking browser storage".to_owned());
 
+        /*
+         * The stored role is scoped to this exact contract instance.
+         * An invalid stored value is retained as an error rather than silently
+         * converted into a player role.
+         */
+        let local_role = use_state(|| load_local_role(TEST_CONTRACT_ID));
+
+        let selected_local_role = match &*local_role {
+            Ok(role) => *role,
+            Err(_) => None,
+        };
+
         {
             let connection_status = connection_status.clone();
             let contract_status = contract_status.clone();
@@ -286,7 +318,17 @@ mod browser {
             let local_dice_secret = local_dice_secret.clone();
             let dice_secret_status = dice_secret_status.clone();
 
-            use_effect_with((), move |_| {
+            use_effect_with(selected_local_role, move |selected_role| {
+                let selected_role = *selected_role;
+
+                /*
+                 * Replacing the role dependency replaces the active transport
+                 * closure. Any durable pending action remains in storage.
+                 */
+                freenet_api.borrow_mut().take();
+                *local_commitment_submitted.borrow_mut() = false;
+                *local_dice_secret.borrow_mut() = None;
+
                 let status_for_callback = connection_status.clone();
                 let contract_for_response = contract_status.clone();
                 let subscription_for_response = subscription_status.clone();
@@ -407,7 +449,14 @@ mod browser {
                             if let (Some(key), Some(state_bytes)) =
                                 (contract_key, authoritative_state)
                             {
-                                let plan = match plan_browser_commitment(&state_bytes) {
+                                let Some(local_player) = selected_role else {
+                                    secret_status_for_response
+                                        .set("Select White or Black to join the game".to_owned());
+                                    return;
+                                };
+
+                                let plan = match plan_browser_commitment(&state_bytes, local_player)
+                                {
                                     Ok(plan) => plan,
                                     Err(error) => {
                                         secret_status_for_response
@@ -625,6 +674,43 @@ mod browser {
             Vec::new()
         };
 
+        let pending_role_check = load_pending_action(TEST_CONTRACT_ID);
+
+        let role_selection_locked =
+            selected_local_role.is_some() || !matches!(&pending_role_check, Ok(None));
+
+        let on_select_white = {
+            let local_role = local_role.clone();
+            let interface_error = interface_error.clone();
+
+            Callback::from(move |_| match choose_local_role(Player::White) {
+                Ok(()) => {
+                    interface_error.set(None);
+                    local_role.set(Ok(Some(Player::White)));
+                }
+
+                Err(error) => {
+                    interface_error.set(Some(format!("White role could not be selected: {error}")));
+                }
+            })
+        };
+
+        let on_select_black = {
+            let local_role = local_role.clone();
+            let interface_error = interface_error.clone();
+
+            Callback::from(move |_| match choose_local_role(Player::Black) {
+                Ok(()) => {
+                    interface_error.set(None);
+                    local_role.set(Ok(Some(Player::Black)));
+                }
+
+                Err(error) => {
+                    interface_error.set(Some(format!("Black role could not be selected: {error}")));
+                }
+            })
+        };
+
         let on_roll = {
             let controller = controller.clone();
             let interface_error = interface_error.clone();
@@ -840,6 +926,7 @@ mod browser {
         );
 
         let on_reconnect = {
+            let selected_local_role = selected_local_role;
             let connection_status = connection_status.clone();
             let contract_status = contract_status.clone();
             let subscription_status = subscription_status.clone();
@@ -982,7 +1069,14 @@ mod browser {
                             if let (Some(key), Some(state_bytes)) =
                                 (contract_key, authoritative_state)
                             {
-                                let plan = match plan_browser_commitment(&state_bytes) {
+                                let Some(local_player) = selected_local_role else {
+                                    secret_status_for_response
+                                        .set("Select White or Black to join the game".to_owned());
+                                    return;
+                                };
+
+                                let plan = match plan_browser_commitment(&state_bytes, local_player)
+                                {
                                     Ok(plan) => plan,
                                     Err(error) => {
                                         secret_status_for_response
@@ -1330,10 +1424,106 @@ mod browser {
                         <section class="panel status-panel" aria-labelledby="status-heading">
                             <h2 id="status-heading">{ "Connection" }</h2>
 
+                            <div
+                                class="role-selector"
+                                aria-label="Choose local player role"
+                            >
+                                <button
+                                    type="button"
+                                    class={classes!(
+                                        "role-choice",
+                                        (
+                                            selected_local_role
+                                                == Some(Player::White)
+                                        )
+                                            .then_some("selected"),
+                                    )}
+                                    aria-pressed={
+                                        (
+                                            selected_local_role
+                                                == Some(Player::White)
+                                        )
+                                            .to_string()
+                                    }
+                                    disabled={role_selection_locked}
+                                    onclick={on_select_white}
+                                >
+                                    { "Play as White" }
+                                </button>
+
+                                <button
+                                    type="button"
+                                    class={classes!(
+                                        "role-choice",
+                                        (
+                                            selected_local_role
+                                                == Some(Player::Black)
+                                        )
+                                            .then_some("selected"),
+                                    )}
+                                    aria-pressed={
+                                        (
+                                            selected_local_role
+                                                == Some(Player::Black)
+                                        )
+                                            .to_string()
+                                    }
+                                    disabled={role_selection_locked}
+                                    onclick={on_select_black}
+                                >
+                                    { "Play as Black" }
+                                </button>
+                            </div>
+
+                            {
+                                match &*local_role {
+                                    Err(error) => html! {
+                                        <p class="interface-error" role="alert">
+                                            {
+                                                format!(
+                                                    "Stored local role failed validation: {error}"
+                                                )
+                                            }
+                                        </p>
+                                    },
+
+                                    Ok(_) => html! {},
+                                }
+                            }
+
+                            {
+                                match &pending_role_check {
+                                    Err(error) => html! {
+                                        <p class="interface-error" role="alert">
+                                            {
+                                                format!(
+                                                    "Pending-action role guard failed: {error}"
+                                                )
+                                            }
+                                        </p>
+                                    },
+
+                                    Ok(_) => html! {},
+                                }
+                            }
+
                             <dl class="status-list">
                                 <div>
                                     <dt>{ "Game mode" }</dt>
-                                    <dd>{ "Local two-player" }</dd>
+                                    <dd>{ "Network commitment test" }</dd>
+                                </div>
+
+                                <div class="role-status-row">
+                                    <dt>{ "Local role" }</dt>
+                                    <dd>
+                                        {
+                                            match &*local_role {
+                                                Ok(Some(player)) => player_name(*player),
+                                                Ok(None) => "Not selected",
+                                                Err(_) => "Storage error",
+                                            }
+                                        }
+                                    </dd>
                                 </div>
 
                                 <div>

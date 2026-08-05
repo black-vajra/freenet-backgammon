@@ -896,3 +896,35 @@ h2 {
         transform: scale(1);
     }
 }
+
+/* Temporary multiplayer role selector */
+
+.role-selector {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.55rem;
+    margin-top: 0.85rem;
+}
+
+.role-choice {
+    min-width: 0;
+    padding: 0.55rem 0.45rem;
+    font-size: 0.78rem;
+    cursor: pointer;
+}
+
+.role-choice.selected {
+    border-color: #e1b56c;
+    color: #1a100b;
+    background: #e1b56c;
+}
+
+.role-status-row dd {
+    text-transform: capitalize;
+}
+
+@media (max-width: 48rem) {
+    .role-selector {
+        grid-template-columns: 1fr;
+    }
+}
