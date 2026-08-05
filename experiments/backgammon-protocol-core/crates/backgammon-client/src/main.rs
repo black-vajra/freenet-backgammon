@@ -18,8 +18,8 @@ mod browser {
     use crate::controller::{LocalGameController, LocalGameOutcome};
     use crate::projection::BoardView;
     use crate::transport::{
-        classify_response, connect, request_test_contract, ConnectionStatus, ContractProbeStatus,
-        SubscriptionStatus,
+        classify_response, connect, request_test_contract, submit_first_create_delta,
+        ClassifiedResponse, ConnectionStatus, ContractProbeStatus, SubscriptionStatus,
     };
 
     fn secure_local_dice() -> Result<Dice, String> {
@@ -116,30 +116,112 @@ mod browser {
         let contract_status = use_state(|| ContractProbeStatus::WaitingForConnection);
         let subscription_status = use_state(|| SubscriptionStatus::Pending);
         let freenet_api = use_mut_ref(|| None::<freenet_stdlib::client_api::WebApi>);
+        let first_delta_submitted = use_mut_ref(|| false);
 
         {
             let connection_status = connection_status.clone();
             let contract_status = contract_status.clone();
             let subscription_status = subscription_status.clone();
             let freenet_api = freenet_api.clone();
+            let first_delta_submitted = first_delta_submitted.clone();
 
             use_effect_with((), move |_| {
                 let status_for_callback = connection_status.clone();
                 let contract_for_response = contract_status.clone();
                 let subscription_for_response = subscription_status.clone();
+                let api_for_response = freenet_api.clone();
+                let submitted_for_response = first_delta_submitted.clone();
 
                 match connect(
                     move |status| {
                         status_for_callback.set(status);
                     },
                     move |response| {
-                        if let Some((contract, subscription)) = classify_response(response) {
-                            if let Some(contract) = contract {
+                        if let Some(classified) = classify_response(response) {
+                            let ClassifiedResponse {
+                                contract_status,
+                                subscription_status,
+                                contract_key,
+                                should_submit_first_delta,
+                            } = classified;
+
+                            if let Some(contract) = contract_status {
                                 contract_for_response.set(contract);
                             }
 
-                            if let Some(subscription) = subscription {
+                            if let Some(subscription) = subscription_status {
                                 subscription_for_response.set(subscription);
+                            }
+
+                            if should_submit_first_delta {
+                                let Some(key) = contract_key else {
+                                    contract_for_response.set(ContractProbeStatus::Failed(
+                                        "The empty ledger response did not include a full contract key."
+                                            .to_owned(),
+                                    ));
+                                    return;
+                                };
+
+                                {
+                                    let mut submitted = submitted_for_response.borrow_mut();
+
+                                    if *submitted {
+                                        return;
+                                    }
+
+                                    *submitted = true;
+                                }
+
+                                contract_for_response.set(ContractProbeStatus::Updating);
+
+                                let api_for_update = api_for_response.clone();
+                                let contract_for_update = contract_for_response.clone();
+                                let submitted_for_update = submitted_for_response.clone();
+
+                                wasm_bindgen_futures::spawn_local(async move {
+                                    let submit_result = {
+                                        let mut api = api_for_update.borrow_mut();
+
+                                        match api.as_mut() {
+                                            Some(api) => submit_first_create_delta(api, key).await,
+                                            None => {
+                                                Err("Freenet connection closed before the update."
+                                                    .to_owned())
+                                            }
+                                        }
+                                    };
+
+                                    match submit_result {
+                                        Ok(()) => {
+                                            contract_for_update
+                                                .set(ContractProbeStatus::VerifyingUpdate);
+
+                                            gloo_timers::future::TimeoutFuture::new(750).await;
+
+                                            let refresh_result = {
+                                                let mut api = api_for_update.borrow_mut();
+
+                                                match api.as_mut() {
+                                                    Some(api) => request_test_contract(api).await,
+                                                    None => Err(
+                                                        "Freenet connection closed before update verification."
+                                                            .to_owned(),
+                                                    ),
+                                                }
+                                            };
+
+                                            if let Err(error) = refresh_result {
+                                                contract_for_update
+                                                    .set(ContractProbeStatus::Failed(error));
+                                            }
+                                        }
+                                        Err(error) => {
+                                            *submitted_for_update.borrow_mut() = false;
+                                            contract_for_update
+                                                .set(ContractProbeStatus::Failed(error));
+                                        }
+                                    }
+                                });
                             }
                         }
                     },
@@ -455,6 +537,7 @@ mod browser {
             let contract_status = contract_status.clone();
             let subscription_status = subscription_status.clone();
             let freenet_api = freenet_api.clone();
+            let first_delta_submitted = first_delta_submitted.clone();
 
             Callback::from(move |_| {
                 freenet_api.borrow_mut().take();
@@ -464,19 +547,99 @@ mod browser {
                 let status_for_callback = connection_status.clone();
                 let contract_for_response = contract_status.clone();
                 let subscription_for_response = subscription_status.clone();
+                let api_for_response = freenet_api.clone();
+                let submitted_for_response = first_delta_submitted.clone();
 
                 match connect(
                     move |status| {
                         status_for_callback.set(status);
                     },
                     move |response| {
-                        if let Some((contract, subscription)) = classify_response(response) {
-                            if let Some(contract) = contract {
+                        if let Some(classified) = classify_response(response) {
+                            let ClassifiedResponse {
+                                contract_status,
+                                subscription_status,
+                                contract_key,
+                                should_submit_first_delta,
+                            } = classified;
+
+                            if let Some(contract) = contract_status {
                                 contract_for_response.set(contract);
                             }
 
-                            if let Some(subscription) = subscription {
+                            if let Some(subscription) = subscription_status {
                                 subscription_for_response.set(subscription);
+                            }
+
+                            if should_submit_first_delta {
+                                let Some(key) = contract_key else {
+                                    contract_for_response.set(ContractProbeStatus::Failed(
+                                        "The empty ledger response did not include a full contract key."
+                                            .to_owned(),
+                                    ));
+                                    return;
+                                };
+
+                                {
+                                    let mut submitted = submitted_for_response.borrow_mut();
+
+                                    if *submitted {
+                                        return;
+                                    }
+
+                                    *submitted = true;
+                                }
+
+                                contract_for_response.set(ContractProbeStatus::Updating);
+
+                                let api_for_update = api_for_response.clone();
+                                let contract_for_update = contract_for_response.clone();
+                                let submitted_for_update = submitted_for_response.clone();
+
+                                wasm_bindgen_futures::spawn_local(async move {
+                                    let submit_result = {
+                                        let mut api = api_for_update.borrow_mut();
+
+                                        match api.as_mut() {
+                                            Some(api) => submit_first_create_delta(api, key).await,
+                                            None => {
+                                                Err("Freenet connection closed before the update."
+                                                    .to_owned())
+                                            }
+                                        }
+                                    };
+
+                                    match submit_result {
+                                        Ok(()) => {
+                                            contract_for_update
+                                                .set(ContractProbeStatus::VerifyingUpdate);
+
+                                            gloo_timers::future::TimeoutFuture::new(750).await;
+
+                                            let refresh_result = {
+                                                let mut api = api_for_update.borrow_mut();
+
+                                                match api.as_mut() {
+                                                    Some(api) => request_test_contract(api).await,
+                                                    None => Err(
+                                                        "Freenet connection closed before update verification."
+                                                            .to_owned(),
+                                                    ),
+                                                }
+                                            };
+
+                                            if let Err(error) = refresh_result {
+                                                contract_for_update
+                                                    .set(ContractProbeStatus::Failed(error));
+                                            }
+                                        }
+                                        Err(error) => {
+                                            *submitted_for_update.borrow_mut() = false;
+                                            contract_for_update
+                                                .set(ContractProbeStatus::Failed(error));
+                                        }
+                                    }
+                                });
                             }
                         }
                     },
