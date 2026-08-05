@@ -9,5 +9,6 @@ publish = false
 backgammon-core = { path = "../backgammon-core" }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-web-sys = { version = "0.3", features = ["Crypto", "Window"] }
+freenet-stdlib = { version = "0.8.5", features = ["net"] }
+web-sys = { version = "0.3", features = ["Crypto", "WebSocket", "Window"] }
 yew = { version = "0.23.0", features = ["csr"] }

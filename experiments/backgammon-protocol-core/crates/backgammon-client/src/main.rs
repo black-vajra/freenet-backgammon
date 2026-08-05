@@ -3,6 +3,7 @@ mod components;
 
 pub mod controller;
 pub mod projection;
+pub mod transport;
 
 #[cfg(target_arch = "wasm32")]
 mod browser {
@@ -16,6 +17,7 @@ mod browser {
     use crate::components::player_panel::PlayerPanel;
     use crate::controller::{LocalGameController, LocalGameOutcome};
     use crate::projection::BoardView;
+    use crate::transport::{connect, ConnectionStatus};
 
     fn secure_local_dice() -> Result<Dice, String> {
         let window =
@@ -107,6 +109,33 @@ mod browser {
         let controller = use_state(LocalGameController::new);
         let interface_error = use_state(|| None::<String>);
         let pending_confirmation = use_state(|| None::<PendingConfirmation>);
+        let connection_status = use_state(|| ConnectionStatus::Disconnected);
+        let freenet_api =
+            use_mut_ref(|| None::<freenet_stdlib::client_api::WebApi>);
+
+        {
+            let connection_status = connection_status.clone();
+            let freenet_api = freenet_api.clone();
+
+            use_effect_with((), move |_| {
+                let status_for_callback = connection_status.clone();
+
+                match connect(move |status| {
+                    status_for_callback.set(status);
+                }) {
+                    Ok(api) => {
+                        *freenet_api.borrow_mut() = Some(api);
+                    }
+                    Err(error) => {
+                        connection_status.set(ConnectionStatus::Failed(error));
+                    }
+                }
+
+                move || {
+                    freenet_api.borrow_mut().take();
+                }
+            });
+        }
 
         let board = BoardView::from(controller.visible_state());
         let outcome = controller.outcome();
@@ -370,6 +399,28 @@ mod browser {
             },
         );
 
+        let on_reconnect = {
+            let connection_status = connection_status.clone();
+            let freenet_api = freenet_api.clone();
+
+            Callback::from(move |_| {
+                freenet_api.borrow_mut().take();
+
+                let status_for_callback = connection_status.clone();
+
+                match connect(move |status| {
+                    status_for_callback.set(status);
+                }) {
+                    Ok(api) => {
+                        *freenet_api.borrow_mut() = Some(api);
+                    }
+                    Err(error) => {
+                        connection_status.set(ConnectionStatus::Failed(error));
+                    }
+                }
+            })
+        };
+
         let terminal_overlay = if left_table {
             html! {
                 <div class="game-overlay" role="dialog" aria-modal="true">
@@ -460,15 +511,15 @@ mod browser {
                         <h1>{ "Freenet Backgammon" }</h1>
                     </div>
 
-                    <div class="connection-badge" role="status">
+                    <div
+                        class={classes!(
+                            "connection-badge",
+                            connection_status.css_class(),
+                        )}
+                        role="status"
+                    >
                         <span class="connection-dot" aria-hidden="true"></span>
-                        {
-                            if left_table {
-                                "Table left"
-                            } else {
-                                "Local mode"
-                            }
-                        }
+                        { connection_status.label() }
                     </div>
                 </header>
 
@@ -525,10 +576,12 @@ mod browser {
                             can_pass={can_pass}
                             can_resign={can_resign}
                             can_leave={!left_table}
+                            can_reconnect={connection_status.can_reconnect()}
                             on_roll={on_roll}
                             on_pass={on_pass}
                             on_resign={on_resign}
                             on_new_game={on_new_game.clone()}
+                            on_reconnect={on_reconnect}
                             on_leave={on_leave}
                         />
                     </aside>
@@ -552,17 +605,22 @@ mod browser {
 
                             <dl class="status-list">
                                 <div>
-                                    <dt>{ "Mode" }</dt>
-                                    <dd>{ "Local" }</dd>
+                                    <dt>{ "Game mode" }</dt>
+                                    <dd>{ "Local two-player" }</dd>
                                 </div>
 
                                 <div>
-                                    <dt>{ "Opponent" }</dt>
-                                    <dd>{ "Same device" }</dd>
+                                    <dt>{ "Freenet" }</dt>
+                                    <dd>{ connection_status.label() }</dd>
                                 </div>
 
                                 <div>
-                                    <dt>{ "State" }</dt>
+                                    <dt>{ "Network detail" }</dt>
+                                    <dd>{ connection_status.detail() }</dd>
+                                </div>
+
+                                <div>
+                                    <dt>{ "Game state" }</dt>
                                     <dd>
                                         {
                                             if left_table {

@@ -6,10 +6,12 @@ pub struct GameControlsProps {
     pub can_pass: bool,
     pub can_resign: bool,
     pub can_leave: bool,
+    pub can_reconnect: bool,
     pub on_roll: Callback<MouseEvent>,
     pub on_pass: Callback<MouseEvent>,
     pub on_resign: Callback<MouseEvent>,
     pub on_new_game: Callback<MouseEvent>,
+    pub on_reconnect: Callback<MouseEvent>,
     pub on_leave: Callback<MouseEvent>,
 }
 
@@ -54,7 +56,12 @@ pub fn game_controls(props: &GameControlsProps) -> Html {
                     { "New game" }
                 </button>
 
-                <button type="button" disabled=true>
+                <button
+                    type="button"
+                    class="reconnect-control"
+                    disabled={!props.can_reconnect}
+                    onclick={props.on_reconnect.clone()}
+                >
                     { "Reconnect" }
                 </button>
 
@@ -82,7 +89,7 @@ pub fn game_controls(props: &GameControlsProps) -> Html {
             </p>
 
             <p class="control-footnote">
-                { "Reconnect becomes available in multiplayer mode." }
+                { "Reconnect currently restores the local Freenet node connection." }
             </p>
         </section>
     }

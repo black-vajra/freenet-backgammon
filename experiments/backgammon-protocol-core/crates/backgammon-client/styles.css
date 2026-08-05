@@ -849,3 +849,40 @@ h2 {
         grid-template-columns: 1fr;
     }
 }
+
+/* Freenet transport probe */
+
+.connection-badge.connecting .connection-dot {
+    animation: connection-pulse 1.2s ease-in-out infinite;
+}
+
+.connection-badge.connected .connection-dot {
+    box-shadow: 0 0 10px currentColor;
+}
+
+.connection-badge.disconnected,
+.connection-badge.failed {
+    opacity: 0.88;
+}
+
+.connection-badge.failed .connection-dot,
+.connection-badge.disconnected .connection-dot {
+    filter: grayscale(1);
+}
+
+.reconnect-control:not(:disabled) {
+    font-weight: 800;
+}
+
+@keyframes connection-pulse {
+    0%,
+    100% {
+        opacity: 0.35;
+        transform: scale(0.82);
+    }
+
+    50% {
+        opacity: 1;
+        transform: scale(1);
+    }
+}
