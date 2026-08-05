@@ -8,6 +8,7 @@ pub mod local_role_store;
 pub mod pending_action;
 pub mod pending_action_store;
 pub mod projection;
+pub mod reveal_planner;
 pub mod secret_store;
 pub mod transport;
 
