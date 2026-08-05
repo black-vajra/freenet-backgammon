@@ -17,7 +17,10 @@ mod browser {
     use crate::components::player_panel::PlayerPanel;
     use crate::controller::{LocalGameController, LocalGameOutcome};
     use crate::projection::BoardView;
-    use crate::transport::{connect, ConnectionStatus};
+    use crate::transport::{
+        classify_response, connect, request_test_contract, ConnectionStatus, ContractProbeStatus,
+        SubscriptionStatus,
+    };
 
     fn secure_local_dice() -> Result<Dice, String> {
         let window =
@@ -110,21 +113,69 @@ mod browser {
         let interface_error = use_state(|| None::<String>);
         let pending_confirmation = use_state(|| None::<PendingConfirmation>);
         let connection_status = use_state(|| ConnectionStatus::Disconnected);
-        let freenet_api =
-            use_mut_ref(|| None::<freenet_stdlib::client_api::WebApi>);
+        let contract_status = use_state(|| ContractProbeStatus::WaitingForConnection);
+        let subscription_status = use_state(|| SubscriptionStatus::Pending);
+        let freenet_api = use_mut_ref(|| None::<freenet_stdlib::client_api::WebApi>);
 
         {
             let connection_status = connection_status.clone();
+            let contract_status = contract_status.clone();
+            let subscription_status = subscription_status.clone();
             let freenet_api = freenet_api.clone();
 
             use_effect_with((), move |_| {
                 let status_for_callback = connection_status.clone();
+                let contract_for_response = contract_status.clone();
+                let subscription_for_response = subscription_status.clone();
 
-                match connect(move |status| {
-                    status_for_callback.set(status);
-                }) {
+                match connect(
+                    move |status| {
+                        status_for_callback.set(status);
+                    },
+                    move |response| {
+                        if let Some((contract, subscription)) = classify_response(response) {
+                            if let Some(contract) = contract {
+                                contract_for_response.set(contract);
+                            }
+
+                            if let Some(subscription) = subscription {
+                                subscription_for_response.set(subscription);
+                            }
+                        }
+                    },
+                ) {
                     Ok(api) => {
                         *freenet_api.borrow_mut() = Some(api);
+
+                        let api_for_request = freenet_api.clone();
+                        let contract_for_request = contract_status.clone();
+                        let subscription_for_request = subscription_status.clone();
+
+                        wasm_bindgen_futures::spawn_local(async move {
+                            gloo_timers::future::TimeoutFuture::new(150).await;
+
+                            contract_for_request.set(ContractProbeStatus::Requesting);
+                            subscription_for_request.set(SubscriptionStatus::Pending);
+
+                            let result = {
+                                let mut api = api_for_request.borrow_mut();
+
+                                match api.as_mut() {
+                                    Some(api) => request_test_contract(api).await,
+                                    None => Err(
+                                        "Freenet connection closed before the contract request."
+                                            .to_owned(),
+                                    ),
+                                }
+                            };
+
+                            if let Err(error) = result {
+                                contract_for_request.set(ContractProbeStatus::Failed(error));
+                                subscription_for_request.set(SubscriptionStatus::Failed(
+                                    "Subscription request was not sent.".to_owned(),
+                                ));
+                            }
+                        });
                     }
                     Err(error) => {
                         connection_status.set(ConnectionStatus::Failed(error));
@@ -401,18 +452,66 @@ mod browser {
 
         let on_reconnect = {
             let connection_status = connection_status.clone();
+            let contract_status = contract_status.clone();
+            let subscription_status = subscription_status.clone();
             let freenet_api = freenet_api.clone();
 
             Callback::from(move |_| {
                 freenet_api.borrow_mut().take();
+                contract_status.set(ContractProbeStatus::WaitingForConnection);
+                subscription_status.set(SubscriptionStatus::Pending);
 
                 let status_for_callback = connection_status.clone();
+                let contract_for_response = contract_status.clone();
+                let subscription_for_response = subscription_status.clone();
 
-                match connect(move |status| {
-                    status_for_callback.set(status);
-                }) {
+                match connect(
+                    move |status| {
+                        status_for_callback.set(status);
+                    },
+                    move |response| {
+                        if let Some((contract, subscription)) = classify_response(response) {
+                            if let Some(contract) = contract {
+                                contract_for_response.set(contract);
+                            }
+
+                            if let Some(subscription) = subscription {
+                                subscription_for_response.set(subscription);
+                            }
+                        }
+                    },
+                ) {
                     Ok(api) => {
                         *freenet_api.borrow_mut() = Some(api);
+
+                        let api_for_request = freenet_api.clone();
+                        let contract_for_request = contract_status.clone();
+                        let subscription_for_request = subscription_status.clone();
+
+                        wasm_bindgen_futures::spawn_local(async move {
+                            gloo_timers::future::TimeoutFuture::new(150).await;
+
+                            contract_for_request.set(ContractProbeStatus::Requesting);
+
+                            let result = {
+                                let mut api = api_for_request.borrow_mut();
+
+                                match api.as_mut() {
+                                    Some(api) => request_test_contract(api).await,
+                                    None => Err(
+                                        "Freenet connection closed before the contract request."
+                                            .to_owned(),
+                                    ),
+                                }
+                            };
+
+                            if let Err(error) = result {
+                                contract_for_request.set(ContractProbeStatus::Failed(error));
+                                subscription_for_request.set(SubscriptionStatus::Failed(
+                                    "Subscription request was not sent.".to_owned(),
+                                ));
+                            }
+                        });
                     }
                     Err(error) => {
                         connection_status.set(ConnectionStatus::Failed(error));
@@ -617,6 +716,21 @@ mod browser {
                                 <div>
                                     <dt>{ "Network detail" }</dt>
                                     <dd>{ connection_status.detail() }</dd>
+                                </div>
+
+                                <div>
+                                    <dt>{ "Contract" }</dt>
+                                    <dd>{ contract_status.contract_label() }</dd>
+                                </div>
+
+                                <div>
+                                    <dt>{ "Subscription" }</dt>
+                                    <dd>{ subscription_status.label() }</dd>
+                                </div>
+
+                                <div>
+                                    <dt>{ "State check" }</dt>
+                                    <dd>{ contract_status.state_label() }</dd>
                                 </div>
 
                                 <div>
