@@ -2,6 +2,7 @@
 mod components;
 
 pub mod controller;
+pub mod ledger_codec;
 pub mod projection;
 pub mod transport;
 
