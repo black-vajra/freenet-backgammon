@@ -9,6 +9,7 @@ pub mod transport;
 #[cfg(target_arch = "wasm32")]
 mod browser {
     use backgammon_core::{Dice, GameStatus, MoveSource, MoveTarget, Player, TurnPhase};
+    use backgammon_protocol::{DiceCommit, DiceSecret, GameActionPayload};
     use yew::prelude::*;
 
     use crate::components::board::Board;
@@ -17,10 +18,12 @@ mod browser {
     use crate::components::history::MoveHistory;
     use crate::components::player_panel::PlayerPanel;
     use crate::controller::{LocalGameController, LocalGameOutcome};
+    use crate::ledger_codec::{build_encoded_action_delta, decode_verified_ledger};
     use crate::projection::BoardView;
     use crate::transport::{
-        classify_response, connect, request_test_contract, submit_first_create_delta,
-        ClassifiedResponse, ConnectionStatus, ContractProbeStatus, SubscriptionStatus,
+        classify_response, connect, request_test_contract, submit_action_delta,
+        submit_first_create_delta, ClassifiedResponse, ConnectionStatus, ContractProbeStatus,
+        SubscriptionStatus,
     };
 
     fn secure_local_dice() -> Result<Dice, String> {
@@ -57,6 +60,65 @@ mod browser {
             first: dice[0],
             second: dice[1],
         })
+    }
+
+    fn secure_random_32(purpose: &str) -> Result<[u8; 32], String> {
+        let window =
+            web_sys::window().ok_or_else(|| "Browser window is unavailable.".to_owned())?;
+
+        let crypto = window
+            .crypto()
+            .map_err(|error| format!("Browser randomness is unavailable: {error:?}"))?;
+
+        let mut bytes = [0_u8; 32];
+
+        crypto
+            .get_random_values_with_u8_array(&mut bytes)
+            .map_err(|error| format!("Could not generate {purpose}: {error:?}"))?;
+
+        Ok(bytes)
+    }
+
+    fn prepare_first_white_commitment(
+        authoritative_state: &[u8],
+    ) -> Result<(DiceSecret, Vec<u8>), String> {
+        let ledger = decode_verified_ledger(authoritative_state)?;
+
+        if ledger.action_count() != 1 {
+            return Err(format!(
+                "White's first commitment requires exactly one existing action; found {}.",
+                ledger.action_count()
+            ));
+        }
+
+        let create = ledger
+            .typed_actions()
+            .first()
+            .ok_or_else(|| "Verified ledger unexpectedly contained no create action.".to_owned())?;
+
+        let secret = secure_random_32("White dice secret")?;
+        let action_id = secure_random_32("network action ID")?;
+
+        let commitment = DiceCommit::new(&create.game_id, 0, Player::White, &secret);
+
+        let (record, delta) = build_encoded_action_delta(
+            authoritative_state,
+            action_id,
+            GameActionPayload::CommitDice {
+                turn: commitment.turn,
+                player: commitment.player,
+                commitment: commitment.commitment,
+            },
+        )?;
+
+        if record.sequence != 1 {
+            return Err(format!(
+                "Refusing unexpected commitment sequence {}; expected 1.",
+                record.sequence
+            ));
+        }
+
+        Ok((secret, delta))
     }
 
     fn player_name(player: Player) -> &'static str {
@@ -118,6 +180,8 @@ mod browser {
         let subscription_status = use_state(|| SubscriptionStatus::Pending);
         let freenet_api = use_mut_ref(|| None::<freenet_stdlib::client_api::WebApi>);
         let first_delta_submitted = use_mut_ref(|| false);
+        let first_commitment_submitted = use_mut_ref(|| false);
+        let pending_white_dice_secret = use_mut_ref(|| None::<DiceSecret>);
 
         {
             let connection_status = connection_status.clone();
@@ -125,6 +189,8 @@ mod browser {
             let subscription_status = subscription_status.clone();
             let freenet_api = freenet_api.clone();
             let first_delta_submitted = first_delta_submitted.clone();
+            let first_commitment_submitted = first_commitment_submitted.clone();
+            let pending_white_dice_secret = pending_white_dice_secret.clone();
 
             use_effect_with((), move |_| {
                 let status_for_callback = connection_status.clone();
@@ -132,6 +198,8 @@ mod browser {
                 let subscription_for_response = subscription_status.clone();
                 let api_for_response = freenet_api.clone();
                 let submitted_for_response = first_delta_submitted.clone();
+                let commitment_for_response = first_commitment_submitted.clone();
+                let secret_for_response = pending_white_dice_secret.clone();
 
                 match connect(
                     move |status| {
@@ -143,6 +211,7 @@ mod browser {
                                 contract_status,
                                 subscription_status,
                                 contract_key,
+                                authoritative_state,
                                 should_submit_first_delta,
                             } = classified;
 
@@ -223,6 +292,93 @@ mod browser {
                                         }
                                     }
                                 });
+                            }
+                            if let (Some(key), Some(state_bytes)) =
+                                (contract_key, authoritative_state)
+                            {
+                                let action_count = decode_verified_ledger(&state_bytes)
+                                    .map(|ledger| ledger.action_count());
+
+                                if action_count == Ok(1) {
+                                    {
+                                        let mut submitted = commitment_for_response.borrow_mut();
+
+                                        if *submitted {
+                                            return;
+                                        }
+
+                                        *submitted = true;
+                                    }
+
+                                    let (secret, delta) =
+                                        match prepare_first_white_commitment(&state_bytes) {
+                                            Ok(prepared) => prepared,
+                                            Err(error) => {
+                                                *commitment_for_response.borrow_mut() = false;
+                                                contract_for_response
+                                                    .set(ContractProbeStatus::Failed(error));
+                                                return;
+                                            }
+                                        };
+
+                                    *secret_for_response.borrow_mut() = Some(secret);
+
+                                    contract_for_response.set(ContractProbeStatus::Updating);
+
+                                    let api_for_update = api_for_response.clone();
+                                    let contract_for_update = contract_for_response.clone();
+                                    let commitment_for_update = commitment_for_response.clone();
+
+                                    wasm_bindgen_futures::spawn_local(async move {
+                                        let submit_result = {
+                                            let mut api = api_for_update.borrow_mut();
+
+                                            match api.as_mut() {
+                                                Some(api) => {
+                                                    submit_action_delta(api, key, delta).await
+                                                }
+                                                None => Err(
+                                                    "Freenet connection closed before the dynamic commitment update."
+                                                        .to_owned(),
+                                                ),
+                                            }
+                                        };
+
+                                        match submit_result {
+                                            Ok(()) => {
+                                                contract_for_update
+                                                    .set(ContractProbeStatus::VerifyingUpdate);
+
+                                                gloo_timers::future::TimeoutFuture::new(750).await;
+
+                                                let refresh_result = {
+                                                    let mut api = api_for_update.borrow_mut();
+
+                                                    match api.as_mut() {
+                                                        Some(api) => {
+                                                            request_test_contract(api).await
+                                                        }
+                                                        None => Err(
+                                                            "Freenet connection closed before commitment verification."
+                                                                .to_owned(),
+                                                        ),
+                                                    }
+                                                };
+
+                                                if let Err(error) = refresh_result {
+                                                    contract_for_update
+                                                        .set(ContractProbeStatus::Failed(error));
+                                                }
+                                            }
+                                            Err(error) => {
+                                                *commitment_for_update.borrow_mut() = false;
+
+                                                contract_for_update
+                                                    .set(ContractProbeStatus::Failed(error));
+                                            }
+                                        }
+                                    });
+                                }
                             }
                         }
                     },
@@ -539,6 +695,8 @@ mod browser {
             let subscription_status = subscription_status.clone();
             let freenet_api = freenet_api.clone();
             let first_delta_submitted = first_delta_submitted.clone();
+            let first_commitment_submitted = first_commitment_submitted.clone();
+            let pending_white_dice_secret = pending_white_dice_secret.clone();
 
             Callback::from(move |_| {
                 freenet_api.borrow_mut().take();
@@ -550,6 +708,8 @@ mod browser {
                 let subscription_for_response = subscription_status.clone();
                 let api_for_response = freenet_api.clone();
                 let submitted_for_response = first_delta_submitted.clone();
+                let commitment_for_response = first_commitment_submitted.clone();
+                let secret_for_response = pending_white_dice_secret.clone();
 
                 match connect(
                     move |status| {
@@ -561,6 +721,7 @@ mod browser {
                                 contract_status,
                                 subscription_status,
                                 contract_key,
+                                authoritative_state,
                                 should_submit_first_delta,
                             } = classified;
 
@@ -641,6 +802,93 @@ mod browser {
                                         }
                                     }
                                 });
+                            }
+                            if let (Some(key), Some(state_bytes)) =
+                                (contract_key, authoritative_state)
+                            {
+                                let action_count = decode_verified_ledger(&state_bytes)
+                                    .map(|ledger| ledger.action_count());
+
+                                if action_count == Ok(1) {
+                                    {
+                                        let mut submitted = commitment_for_response.borrow_mut();
+
+                                        if *submitted {
+                                            return;
+                                        }
+
+                                        *submitted = true;
+                                    }
+
+                                    let (secret, delta) =
+                                        match prepare_first_white_commitment(&state_bytes) {
+                                            Ok(prepared) => prepared,
+                                            Err(error) => {
+                                                *commitment_for_response.borrow_mut() = false;
+                                                contract_for_response
+                                                    .set(ContractProbeStatus::Failed(error));
+                                                return;
+                                            }
+                                        };
+
+                                    *secret_for_response.borrow_mut() = Some(secret);
+
+                                    contract_for_response.set(ContractProbeStatus::Updating);
+
+                                    let api_for_update = api_for_response.clone();
+                                    let contract_for_update = contract_for_response.clone();
+                                    let commitment_for_update = commitment_for_response.clone();
+
+                                    wasm_bindgen_futures::spawn_local(async move {
+                                        let submit_result = {
+                                            let mut api = api_for_update.borrow_mut();
+
+                                            match api.as_mut() {
+                                                Some(api) => {
+                                                    submit_action_delta(api, key, delta).await
+                                                }
+                                                None => Err(
+                                                    "Freenet connection closed before the dynamic commitment update."
+                                                        .to_owned(),
+                                                ),
+                                            }
+                                        };
+
+                                        match submit_result {
+                                            Ok(()) => {
+                                                contract_for_update
+                                                    .set(ContractProbeStatus::VerifyingUpdate);
+
+                                                gloo_timers::future::TimeoutFuture::new(750).await;
+
+                                                let refresh_result = {
+                                                    let mut api = api_for_update.borrow_mut();
+
+                                                    match api.as_mut() {
+                                                        Some(api) => {
+                                                            request_test_contract(api).await
+                                                        }
+                                                        None => Err(
+                                                            "Freenet connection closed before commitment verification."
+                                                                .to_owned(),
+                                                        ),
+                                                    }
+                                                };
+
+                                                if let Err(error) = refresh_result {
+                                                    contract_for_update
+                                                        .set(ContractProbeStatus::Failed(error));
+                                                }
+                                            }
+                                            Err(error) => {
+                                                *commitment_for_update.borrow_mut() = false;
+
+                                                contract_for_update
+                                                    .set(ContractProbeStatus::Failed(error));
+                                            }
+                                        }
+                                    });
+                                }
                             }
                         }
                     },
