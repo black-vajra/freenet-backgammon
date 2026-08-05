@@ -4,12 +4,13 @@ mod components;
 pub mod controller;
 pub mod ledger_codec;
 pub mod projection;
+pub mod secret_store;
 pub mod transport;
 
 #[cfg(target_arch = "wasm32")]
 mod browser {
     use backgammon_core::{Dice, GameStatus, MoveSource, MoveTarget, Player, TurnPhase};
-    use backgammon_protocol::{DiceCommit, DiceSecret, GameActionPayload};
+    use backgammon_protocol::{DiceCommit, DiceSecret, GameActionPayload, GameId};
     use yew::prelude::*;
 
     use crate::components::board::Board;
@@ -20,6 +21,7 @@ mod browser {
     use crate::controller::{LocalGameController, LocalGameOutcome};
     use crate::ledger_codec::{build_encoded_action_delta, decode_verified_ledger};
     use crate::projection::BoardView;
+    use crate::secret_store::store_dice_secret;
     use crate::transport::{
         classify_response, connect, request_test_contract, submit_action_delta,
         submit_first_create_delta, ClassifiedResponse, ConnectionStatus, ContractProbeStatus,
@@ -81,7 +83,7 @@ mod browser {
 
     fn prepare_first_white_commitment(
         authoritative_state: &[u8],
-    ) -> Result<(DiceSecret, Vec<u8>), String> {
+    ) -> Result<(GameId, DiceSecret, Vec<u8>), String> {
         let ledger = decode_verified_ledger(authoritative_state)?;
 
         if ledger.action_count() != 1 {
@@ -118,7 +120,7 @@ mod browser {
             ));
         }
 
-        Ok((secret, delta))
+        Ok((create.game_id, secret, delta))
     }
 
     fn player_name(player: Player) -> &'static str {
@@ -310,7 +312,7 @@ mod browser {
                                         *submitted = true;
                                     }
 
-                                    let (secret, delta) =
+                                    let (game_id, secret, delta) =
                                         match prepare_first_white_commitment(&state_bytes) {
                                             Ok(prepared) => prepared,
                                             Err(error) => {
@@ -320,6 +322,15 @@ mod browser {
                                                 return;
                                             }
                                         };
+
+                                    if let Err(error) =
+                                        store_dice_secret(&game_id, 0, Player::White, &secret)
+                                    {
+                                        *commitment_for_response.borrow_mut() = false;
+                                        contract_for_response
+                                            .set(ContractProbeStatus::Failed(error));
+                                        return;
+                                    }
 
                                     *secret_for_response.borrow_mut() = Some(secret);
 
@@ -820,7 +831,7 @@ mod browser {
                                         *submitted = true;
                                     }
 
-                                    let (secret, delta) =
+                                    let (game_id, secret, delta) =
                                         match prepare_first_white_commitment(&state_bytes) {
                                             Ok(prepared) => prepared,
                                             Err(error) => {
@@ -830,6 +841,15 @@ mod browser {
                                                 return;
                                             }
                                         };
+
+                                    if let Err(error) =
+                                        store_dice_secret(&game_id, 0, Player::White, &secret)
+                                    {
+                                        *commitment_for_response.borrow_mut() = false;
+                                        contract_for_response
+                                            .set(ContractProbeStatus::Failed(error));
+                                        return;
+                                    }
 
                                     *secret_for_response.borrow_mut() = Some(secret);
 
