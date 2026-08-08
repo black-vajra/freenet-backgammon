@@ -7,14 +7,16 @@ pub mod ledger_codec;
 pub mod local_role_store;
 pub mod pending_action;
 pub mod pending_action_store;
+pub mod play_turn_planner;
 pub mod projection;
+pub mod request_roll_planner;
 pub mod reveal_planner;
 pub mod secret_store;
 pub mod transport;
 
 #[cfg(target_arch = "wasm32")]
 mod browser {
-    use backgammon_core::{Dice, GameStatus, MoveSource, MoveTarget, Player, TurnPhase};
+    use backgammon_core::{GameState, MoveSource, MoveTarget, Player, TurnPhase, TurnSequence};
     use backgammon_protocol::{replay_game, DiceSecret, GameActionPayload};
     use yew::prelude::*;
 
@@ -25,54 +27,23 @@ mod browser {
     use crate::components::history::MoveHistory;
     use crate::components::player_panel::PlayerPanel;
     use crate::controller::{LocalGameController, LocalGameOutcome};
-    use crate::ledger_codec::decode_verified_ledger;
+    use crate::ledger_codec::{decode_verified_ledger, decode_verified_replay};
     use crate::local_role_store::{load_local_role, store_local_role};
     use crate::pending_action_store::{
         load_pending_action, remove_pending_action, store_pending_action,
     };
+    use crate::play_turn_planner::{plan_play_turn, PlayTurnPlan, PlayTurnPlannerInput};
     use crate::projection::BoardView;
+    use crate::request_roll_planner::{
+        plan_request_roll, RequestRollPlan, RequestRollPlannerInput,
+    };
+    use crate::reveal_planner::{plan_reveal, RevealPlan, RevealPlannerInput};
     use crate::secret_store::{load_dice_secret, store_dice_secret};
     use crate::transport::{
         classify_response, connect, request_test_contract, submit_action_delta,
         submit_first_create_delta, ClassifiedResponse, ConnectionStatus, ContractProbeStatus,
         SubscriptionStatus, TEST_CONTRACT_ID,
     };
-
-    fn secure_local_dice() -> Result<Dice, String> {
-        let window =
-            web_sys::window().ok_or_else(|| "Browser window is unavailable.".to_owned())?;
-
-        let crypto = window
-            .crypto()
-            .map_err(|error| format!("Browser randomness is unavailable: {error:?}"))?;
-
-        let mut dice = [0_u8; 2];
-        let mut accepted = 0_usize;
-
-        while accepted < dice.len() {
-            let mut random_bytes = [0_u8; 8];
-
-            crypto
-                .get_random_values_with_u8_array(&mut random_bytes)
-                .map_err(|error| format!("Could not generate dice: {error:?}"))?;
-
-            for byte in random_bytes {
-                if byte < 252 {
-                    dice[accepted] = byte % 6 + 1;
-                    accepted += 1;
-
-                    if accepted == dice.len() {
-                        break;
-                    }
-                }
-            }
-        }
-
-        Ok(Dice {
-            first: dice[0],
-            second: dice[1],
-        })
-    }
 
     fn secure_random_32(purpose: &str) -> Result<[u8; 32], String> {
         let window =
@@ -217,6 +188,435 @@ mod browser {
         Ok(plan)
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum NetworkActionKind {
+        Commitment,
+        Reveal,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum SecretlessNetworkActionKind {
+        PlayTurn,
+        RequestRoll,
+    }
+
+    enum BrowserNetworkActionPlan {
+        NoAction,
+
+        Accepted {
+            secret: DiceSecret,
+            kind: NetworkActionKind,
+        },
+
+        Submit {
+            secret: DiceSecret,
+            pending: crate::pending_action::PendingAction,
+            recovered_pending: bool,
+            kind: NetworkActionKind,
+        },
+
+        SecretlessAccepted {
+            kind: SecretlessNetworkActionKind,
+        },
+
+        SecretlessSubmit {
+            pending: crate::pending_action::PendingAction,
+            recovered_pending: bool,
+            kind: SecretlessNetworkActionKind,
+        },
+    }
+
+    fn plan_browser_reveal(
+        authoritative_state: &[u8],
+        local_player: Player,
+    ) -> Result<RevealPlan, String> {
+        let pending = load_pending_action(TEST_CONTRACT_ID)?;
+
+        let stored_secret = if let Some(pending) = pending.as_ref() {
+            let record = pending.verify()?;
+
+            let GameActionPayload::RevealDice { turn, player, .. } = &record.payload else {
+                return Err("Stored pending action is not a dice reveal.".to_owned());
+            };
+
+            if *player != local_player {
+                return Err("Stored pending reveal belongs to a different local player.".to_owned());
+            }
+
+            load_dice_secret(TEST_CONTRACT_ID, &pending.game_id, *turn, *player)?
+        } else if let Some((game_id, turn, player)) =
+            local_commitment_storage_context(authoritative_state, local_player)?
+        {
+            load_dice_secret(TEST_CONTRACT_ID, &game_id, turn, player)?
+        } else {
+            None
+        };
+
+        /*
+         * A fresh action ID is candidate material only. It is unavailable while
+         * an exact durable pending action exists, so retry cannot regenerate it.
+         */
+        let new_action_id = if pending.is_none() && stored_secret.is_some() {
+            Some(secure_random_32("network action ID")?)
+        } else {
+            None
+        };
+
+        let plan = plan_reveal(RevealPlannerInput {
+            contract_id: TEST_CONTRACT_ID,
+            local_player,
+            authoritative_state,
+            pending: pending.as_ref(),
+            stored_secret,
+            new_action_id,
+        })?;
+
+        match &plan {
+            RevealPlan::NoAction => {}
+
+            RevealPlan::Accepted { .. } => {
+                if pending.is_some() {
+                    remove_pending_action(TEST_CONTRACT_ID)?;
+                }
+            }
+
+            RevealPlan::Submit {
+                pending,
+                recovered_pending,
+                ..
+            } => {
+                if !recovered_pending {
+                    let record = pending.verify()?;
+
+                    let GameActionPayload::RevealDice { player, .. } = record.payload else {
+                        return Err("New reveal plan produced a non-reveal action.".to_owned());
+                    };
+
+                    if player != local_player {
+                        return Err(
+                            "New reveal plan produced an action for another player.".to_owned()
+                        );
+                    }
+
+                    /*
+                     * The commitment path already persisted the secret. Preserve
+                     * it through reveal acceptance for restart verification.
+                     */
+                    store_pending_action(pending)?;
+                }
+            }
+        }
+
+        Ok(plan)
+    }
+
+    fn map_reveal_plan(plan: RevealPlan) -> BrowserNetworkActionPlan {
+        match plan {
+            RevealPlan::NoAction => BrowserNetworkActionPlan::NoAction,
+
+            RevealPlan::Accepted { secret } => BrowserNetworkActionPlan::Accepted {
+                secret,
+                kind: NetworkActionKind::Reveal,
+            },
+
+            RevealPlan::Submit {
+                secret,
+                pending,
+                recovered_pending,
+            } => BrowserNetworkActionPlan::Submit {
+                secret,
+                pending,
+                recovered_pending,
+                kind: NetworkActionKind::Reveal,
+            },
+        }
+    }
+
+    fn plan_browser_play_turn(
+        authoritative_state: &[u8],
+        local_player: Player,
+        sequence: Option<&TurnSequence>,
+    ) -> Result<PlayTurnPlan, String> {
+        let pending = load_pending_action(TEST_CONTRACT_ID)?;
+
+        if let Some(pending) = pending.as_ref() {
+            let record = pending.verify()?;
+
+            let GameActionPayload::PlayTurn { player, .. } = &record.payload else {
+                return Err("Stored pending action is not a completed game turn.".to_owned());
+            };
+
+            if *player != local_player {
+                return Err("Stored pending turn belongs to a different local player.".to_owned());
+            }
+        }
+
+        /*
+         * Fresh entropy is supplied only when the interface has completed a
+         * sequence and no exact durable pending action already exists.
+         */
+        let new_action_id = if pending.is_none() && sequence.is_some() {
+            Some(secure_random_32("network turn action ID")?)
+        } else {
+            None
+        };
+
+        let plan = plan_play_turn(PlayTurnPlannerInput {
+            contract_id: TEST_CONTRACT_ID,
+            local_player,
+            authoritative_state,
+            pending: pending.as_ref(),
+            sequence,
+            new_action_id,
+        })?;
+
+        match &plan {
+            PlayTurnPlan::NoAction => {}
+
+            PlayTurnPlan::Accepted => {
+                if pending.is_some() {
+                    remove_pending_action(TEST_CONTRACT_ID)?;
+                }
+            }
+
+            PlayTurnPlan::Submit {
+                pending,
+                recovered_pending,
+            } => {
+                if !recovered_pending {
+                    let record = pending.verify()?;
+
+                    let GameActionPayload::PlayTurn { player, .. } = record.payload else {
+                        return Err("New turn plan produced a non-turn action.".to_owned());
+                    };
+
+                    if player != local_player {
+                        return Err(
+                            "New turn plan produced an action for another player.".to_owned()
+                        );
+                    }
+
+                    /*
+                     * Persist the exact encoded turn before any network
+                     * submission. Reload and reconnect must retry these same
+                     * bytes rather than rebuilding the action.
+                     */
+                    store_pending_action(pending)?;
+                }
+            }
+        }
+
+        Ok(plan)
+    }
+
+    fn map_play_turn_plan(plan: PlayTurnPlan) -> BrowserNetworkActionPlan {
+        match plan {
+            PlayTurnPlan::NoAction => BrowserNetworkActionPlan::NoAction,
+
+            PlayTurnPlan::Accepted => BrowserNetworkActionPlan::SecretlessAccepted {
+                kind: SecretlessNetworkActionKind::PlayTurn,
+            },
+
+            PlayTurnPlan::Submit {
+                pending,
+                recovered_pending,
+            } => BrowserNetworkActionPlan::SecretlessSubmit {
+                pending,
+                recovered_pending,
+                kind: SecretlessNetworkActionKind::PlayTurn,
+            },
+        }
+    }
+
+    fn plan_browser_request_roll(
+        authoritative_state: &[u8],
+        local_player: Player,
+        requested: bool,
+    ) -> Result<RequestRollPlan, String> {
+        let pending = load_pending_action(TEST_CONTRACT_ID)?;
+
+        if let Some(pending) = pending.as_ref() {
+            let record = pending.verify()?;
+
+            let GameActionPayload::RequestRoll { player, .. } = &record.payload else {
+                return Err("Stored pending action is not a roll request.".to_owned());
+            };
+
+            if *player != local_player {
+                return Err(
+                    "Stored pending roll request belongs to a different local player.".to_owned(),
+                );
+            }
+        }
+
+        /*
+         * Fresh entropy is candidate material only for an explicit human request.
+         * Recovery of an exact durable pending RequestRoll never regenerates it.
+         */
+        let new_action_id = if pending.is_none() && requested {
+            Some(secure_random_32("network roll-request action ID")?)
+        } else {
+            None
+        };
+
+        let plan = plan_request_roll(RequestRollPlannerInput {
+            contract_id: TEST_CONTRACT_ID,
+            local_player,
+            authoritative_state,
+            pending: pending.as_ref(),
+            requested,
+            new_action_id,
+        })?;
+
+        match &plan {
+            RequestRollPlan::NoAction => {}
+
+            RequestRollPlan::Accepted => {
+                if pending.is_some() {
+                    remove_pending_action(TEST_CONTRACT_ID)?;
+                }
+            }
+
+            RequestRollPlan::Submit {
+                pending,
+                recovered_pending,
+            } => {
+                if !recovered_pending {
+                    let record = pending.verify()?;
+
+                    let GameActionPayload::RequestRoll { player, .. } = record.payload else {
+                        return Err("New roll-request plan produced a non-roll action.".to_owned());
+                    };
+
+                    if player != local_player {
+                        return Err(
+                            "New roll-request plan produced an action for another player."
+                                .to_owned(),
+                        );
+                    }
+
+                    /*
+                     * Persist the exact encoded request before any network submission.
+                     * Reload and reconnect must retry these same bytes.
+                     */
+                    store_pending_action(pending)?;
+                }
+            }
+        }
+
+        Ok(plan)
+    }
+
+    fn map_request_roll_plan(plan: RequestRollPlan) -> BrowserNetworkActionPlan {
+        match plan {
+            RequestRollPlan::NoAction => BrowserNetworkActionPlan::NoAction,
+
+            RequestRollPlan::Accepted => BrowserNetworkActionPlan::SecretlessAccepted {
+                kind: SecretlessNetworkActionKind::RequestRoll,
+            },
+
+            RequestRollPlan::Submit {
+                pending,
+                recovered_pending,
+            } => BrowserNetworkActionPlan::SecretlessSubmit {
+                pending,
+                recovered_pending,
+                kind: SecretlessNetworkActionKind::RequestRoll,
+            },
+        }
+    }
+
+    fn plan_browser_network_action(
+        authoritative_state: &[u8],
+        local_player: Player,
+    ) -> Result<BrowserNetworkActionPlan, String> {
+        if let Some(pending) = load_pending_action(TEST_CONTRACT_ID)? {
+            let record = pending.verify()?;
+
+            return match record.payload {
+                GameActionPayload::CommitDice { .. } => {
+                    match plan_browser_commitment(authoritative_state, local_player)? {
+                        CommitmentPlan::NoAction => Ok(BrowserNetworkActionPlan::NoAction),
+
+                        CommitmentPlan::Accepted { secret } => {
+                            /*
+                             * Acceptance removes the pending commitment. Continue
+                             * immediately into reveal planning so the browser does
+                             * not require an unrelated later update to advance.
+                             */
+                            match plan_browser_reveal(authoritative_state, local_player)? {
+                                RevealPlan::NoAction => Ok(BrowserNetworkActionPlan::Accepted {
+                                    secret,
+                                    kind: NetworkActionKind::Commitment,
+                                }),
+
+                                reveal => Ok(map_reveal_plan(reveal)),
+                            }
+                        }
+
+                        CommitmentPlan::Submit {
+                            secret,
+                            pending,
+                            recovered_pending,
+                        } => Ok(BrowserNetworkActionPlan::Submit {
+                            secret,
+                            pending,
+                            recovered_pending,
+                            kind: NetworkActionKind::Commitment,
+                        }),
+                    }
+                }
+
+                GameActionPayload::RevealDice { .. } => Ok(map_reveal_plan(plan_browser_reveal(
+                    authoritative_state,
+                    local_player,
+                )?)),
+
+                GameActionPayload::RequestRoll { .. } => Ok(map_request_roll_plan(
+                    plan_browser_request_roll(authoritative_state, local_player, false)?,
+                )),
+
+                GameActionPayload::PlayTurn { .. } => Ok(map_play_turn_plan(
+                    plan_browser_play_turn(authoritative_state, local_player, None)?,
+                )),
+
+                _ => Err(
+                    "Stored pending action is not supported by the browser network-action loop."
+                        .to_owned(),
+                ),
+            };
+        }
+
+        match plan_browser_commitment(authoritative_state, local_player)? {
+            CommitmentPlan::NoAction => Ok(map_reveal_plan(plan_browser_reveal(
+                authoritative_state,
+                local_player,
+            )?)),
+
+            CommitmentPlan::Accepted { secret } => {
+                match plan_browser_reveal(authoritative_state, local_player)? {
+                    RevealPlan::NoAction => Ok(BrowserNetworkActionPlan::Accepted {
+                        secret,
+                        kind: NetworkActionKind::Commitment,
+                    }),
+
+                    reveal => Ok(map_reveal_plan(reveal)),
+                }
+            }
+
+            CommitmentPlan::Submit {
+                secret,
+                pending,
+                recovered_pending,
+            } => Ok(BrowserNetworkActionPlan::Submit {
+                secret,
+                pending,
+                recovered_pending,
+                kind: NetworkActionKind::Commitment,
+            }),
+        }
+    }
+
     fn choose_local_role(player: Player) -> Result<(), String> {
         if load_pending_action(TEST_CONTRACT_ID)?.is_some() {
             return Err("The local role cannot change while an action is pending.".to_owned());
@@ -283,6 +683,22 @@ mod browser {
         }
     }
 
+    fn authoritative_game_state(state_bytes: &[u8]) -> Result<Option<GameState>, String> {
+        let ledger = decode_verified_ledger(state_bytes)?;
+
+        /*
+         * An empty ledger has no CreateGame action and therefore cannot yet
+         * produce a ReplayedGame. The first-create submission path handles it.
+         */
+        if ledger.action_count() == 0 {
+            return Ok(None);
+        }
+
+        let replay = decode_verified_replay(state_bytes)?;
+
+        Ok(Some(replay.state))
+    }
+
     #[function_component(App)]
     fn app() -> Html {
         let controller = use_state(LocalGameController::new);
@@ -293,9 +709,17 @@ mod browser {
         let subscription_status = use_state(|| SubscriptionStatus::Pending);
         let freenet_api = use_mut_ref(|| None::<freenet_stdlib::client_api::WebApi>);
         let first_delta_submitted = use_mut_ref(|| false);
-        let local_commitment_submitted = use_mut_ref(|| false);
+        let local_network_action_submitted = use_mut_ref(|| None::<[u8; 32]>);
         let local_dice_secret = use_mut_ref(|| None::<DiceSecret>);
         let dice_secret_status = use_state(|| "Checking browser storage".to_owned());
+
+        /*
+         * User-triggered PlayTurn submission needs the exact full ContractKey
+         * and verified parent bytes from the latest GetResponse. Subscription
+         * notifications alone do not provide both values.
+         */
+        let latest_contract_key = use_mut_ref(|| None::<freenet_stdlib::prelude::ContractKey>);
+        let latest_authoritative_state = use_mut_ref(|| None::<Vec<u8>>);
 
         /*
          * The stored role is scoped to this exact contract instance.
@@ -315,9 +739,12 @@ mod browser {
             let subscription_status = subscription_status.clone();
             let freenet_api = freenet_api.clone();
             let first_delta_submitted = first_delta_submitted.clone();
-            let local_commitment_submitted = local_commitment_submitted.clone();
+            let local_network_action_submitted = local_network_action_submitted.clone();
             let local_dice_secret = local_dice_secret.clone();
             let dice_secret_status = dice_secret_status.clone();
+            let latest_contract_key = latest_contract_key.clone();
+            let latest_authoritative_state = latest_authoritative_state.clone();
+            let controller_for_effect = controller.clone();
 
             use_effect_with(selected_local_role, move |selected_role| {
                 let selected_role = *selected_role;
@@ -327,8 +754,10 @@ mod browser {
                  * closure. Any durable pending action remains in storage.
                  */
                 freenet_api.borrow_mut().take();
-                *local_commitment_submitted.borrow_mut() = false;
+                *local_network_action_submitted.borrow_mut() = None;
                 *local_dice_secret.borrow_mut() = None;
+                latest_contract_key.borrow_mut().take();
+                latest_authoritative_state.borrow_mut().take();
 
                 let status_for_callback = connection_status.clone();
                 let contract_for_response = contract_status.clone();
@@ -336,9 +765,12 @@ mod browser {
                 let subscription_for_status = subscription_status.clone();
                 let api_for_response = freenet_api.clone();
                 let submitted_for_response = first_delta_submitted.clone();
-                let commitment_for_response = local_commitment_submitted.clone();
+                let network_action_for_response = local_network_action_submitted.clone();
                 let secret_for_response = local_dice_secret.clone();
                 let secret_status_for_response = dice_secret_status.clone();
+                let key_for_response = latest_contract_key.clone();
+                let state_for_response = latest_authoritative_state.clone();
+                let controller_for_response = controller_for_effect.clone();
 
                 let api_for_open = freenet_api.clone();
                 let connection_for_open = connection_status.clone();
@@ -450,62 +882,238 @@ mod browser {
                             if let (Some(key), Some(state_bytes)) =
                                 (contract_key, authoritative_state)
                             {
+                                let authoritative_state =
+                                    match authoritative_game_state(&state_bytes) {
+                                        Ok(state) => state,
+
+                                        Err(error) => {
+                                            contract_for_response.set(ContractProbeStatus::Failed(
+                                                format!("Authoritative replay failed: {error}"),
+                                            ));
+
+                                            return;
+                                        }
+                                    };
+
+                                /*
+                                 * An unchanged parent ledger must not erase a
+                                 * local checker preview while a turn is being
+                                 * prepared or awaiting authoritative acceptance.
+                                 */
+                                let state_changed =
+                                    state_for_response.borrow().as_ref() != Some(&state_bytes);
+
+                                /*
+                                 * Cache only after complete ledger decoding and
+                                 * deterministic protocol replay have succeeded.
+                                 */
+                                *key_for_response.borrow_mut() = Some(key.clone());
+                                *state_for_response.borrow_mut() = Some(state_bytes.clone());
+
+                                if state_changed {
+                                    if let Some(authoritative_state) = authoritative_state {
+                                        let mut next = (*controller_for_response).clone();
+
+                                        if let Err(error) =
+                                            next.sync_authoritative_state(authoritative_state)
+                                        {
+                                            contract_for_response.set(
+                                                ContractProbeStatus::Failed(
+                                                    format!(
+                                                        "Authoritative board synchronization failed: {error:?}"
+                                                    ),
+                                                ),
+                                            );
+
+                                            return;
+                                        }
+
+                                        controller_for_response.set(next);
+                                    }
+                                }
+
                                 let Some(local_player) = selected_role else {
                                     secret_status_for_response
                                         .set("Select White or Black to join the game".to_owned());
                                     return;
                                 };
 
-                                let plan = match plan_browser_commitment(&state_bytes, local_player)
-                                {
-                                    Ok(plan) => plan,
-                                    Err(error) => {
-                                        secret_status_for_response
-                                            .set(format!("Recovery failed: {error}"));
+                                let plan =
+                                    match plan_browser_network_action(&state_bytes, local_player) {
+                                        Ok(plan) => plan,
+                                        Err(error) => {
+                                            secret_status_for_response
+                                                .set(format!("Recovery failed: {error}"));
 
-                                        contract_for_response
-                                            .set(ContractProbeStatus::Failed(error));
+                                            contract_for_response
+                                                .set(ContractProbeStatus::Failed(error));
 
-                                        return;
-                                    }
-                                };
+                                            return;
+                                        }
+                                    };
 
                                 match plan {
-                                    CommitmentPlan::NoAction => {}
+                                    BrowserNetworkActionPlan::NoAction => {}
 
-                                    CommitmentPlan::Accepted { secret } => {
+                                    BrowserNetworkActionPlan::Accepted { secret, kind } => {
                                         *secret_for_response.borrow_mut() = Some(secret);
-                                        *commitment_for_response.borrow_mut() = true;
+                                        *network_action_for_response.borrow_mut() = None;
 
-                                        secret_status_for_response.set(
-                                            "Recovered and matched accepted commitment".to_owned(),
-                                        );
+                                        secret_status_for_response.set(match kind {
+                                            NetworkActionKind::Commitment => {
+                                                "Recovered and matched accepted commitment"
+                                                    .to_owned()
+                                            }
+
+                                            NetworkActionKind::Reveal => {
+                                                "Recovered and matched accepted reveal".to_owned()
+                                            }
+                                        });
                                     }
 
-                                    CommitmentPlan::Submit {
-                                        secret,
+                                    BrowserNetworkActionPlan::SecretlessAccepted { kind: _ } => {
+                                        /*
+                                         * The authoritative board was already
+                                         * synchronized above from the accepted
+                                         * history. Only the local submission
+                                         * guard remains to be cleared.
+                                         */
+                                        *network_action_for_response.borrow_mut() = None;
+                                    }
+
+                                    BrowserNetworkActionPlan::SecretlessSubmit {
                                         pending,
                                         recovered_pending,
+                                        kind: _,
                                     } => {
+                                        let action_id = pending.action_id;
                                         let delta = pending.delta;
+
                                         {
                                             let mut submitted =
-                                                commitment_for_response.borrow_mut();
+                                                network_action_for_response.borrow_mut();
 
-                                            if *submitted {
+                                            if submitted.as_ref() == Some(&action_id) {
                                                 return;
                                             }
 
-                                            *submitted = true;
+                                            *submitted = Some(action_id);
+                                        }
+
+                                        contract_for_response.set(ContractProbeStatus::Updating);
+
+                                        let api_for_update = api_for_response.clone();
+                                        let contract_for_update = contract_for_response.clone();
+
+                                        wasm_bindgen_futures::spawn_local(async move {
+                                            let submit_result = {
+                                                let mut api = api_for_update.borrow_mut();
+
+                                                match api.as_mut() {
+                                                        Some(api) => {
+                                                            submit_action_delta(
+                                                                api,
+                                                                key,
+                                                                delta,
+                                                            )
+                                                            .await
+                                                        }
+
+                                                        None => Err(
+                                                            "Freenet connection closed before the pending turn update."
+                                                                .to_owned(),
+                                                        ),
+                                                    }
+                                            };
+
+                                            match submit_result {
+                                                Ok(()) => {
+                                                    contract_for_update
+                                                        .set(ContractProbeStatus::VerifyingUpdate);
+
+                                                    gloo_timers::future::TimeoutFuture::new(750)
+                                                        .await;
+
+                                                    let refresh_result = {
+                                                        let mut api = api_for_update.borrow_mut();
+
+                                                        match api.as_mut() {
+                                                                Some(api) => {
+                                                                    request_test_contract(api)
+                                                                        .await
+                                                                }
+
+                                                                None => Err(
+                                                                    "Freenet connection closed before turn verification."
+                                                                        .to_owned(),
+                                                                ),
+                                                            }
+                                                    };
+
+                                                    if let Err(error) = refresh_result {
+                                                        contract_for_update.set(
+                                                            ContractProbeStatus::Failed(error),
+                                                        );
+                                                    }
+                                                }
+
+                                                Err(error) => {
+                                                    /*
+                                                     * Keep the exact pending
+                                                     * turn. Reconnect will
+                                                     * retry the same bytes.
+                                                     */
+                                                    contract_for_update.set(
+                                                        ContractProbeStatus::Failed(format!(
+                                                            "{}{}",
+                                                            if recovered_pending {
+                                                                "Recovered turn retry failed: "
+                                                            } else {
+                                                                "Turn submission failed: "
+                                                            },
+                                                            error,
+                                                        )),
+                                                    );
+                                                }
+                                            }
+                                        });
+                                    }
+
+                                    BrowserNetworkActionPlan::Submit {
+                                        secret,
+                                        pending,
+                                        recovered_pending,
+                                        kind,
+                                    } => {
+                                        let action_id = pending.action_id;
+                                        let delta = pending.delta;
+
+                                        {
+                                            let mut submitted =
+                                                network_action_for_response.borrow_mut();
+
+                                            if submitted.as_ref() == Some(&action_id) {
+                                                return;
+                                            }
+
+                                            *submitted = Some(action_id);
                                         }
 
                                         *secret_for_response.borrow_mut() = Some(secret);
 
+                                        let action_name = match kind {
+                                            NetworkActionKind::Commitment => "commitment",
+                                            NetworkActionKind::Reveal => "reveal",
+                                        };
+
                                         secret_status_for_response.set(if recovered_pending {
-                                            "Recovered exact pending action; retrying".to_owned()
+                                            format!(
+                                                "Recovered exact pending {action_name}; retrying"
+                                            )
                                         } else {
-                                            "Stored locally; awaiting network verification"
-                                                .to_owned()
+                                            format!(
+                                                "Stored {action_name} locally; awaiting network verification"
+                                            )
                                         });
 
                                         contract_for_response.set(ContractProbeStatus::Updating);
@@ -519,17 +1127,12 @@ mod browser {
 
                                                 match api.as_mut() {
                                                     Some(api) => {
-                                                        submit_action_delta(
-                                                            api,
-                                                            key,
-                                                            delta,
-                                                        )
-                                                        .await
+                                                        submit_action_delta(api, key, delta).await
                                                     }
-                                                    None => Err(
-                                                        "Freenet connection closed before the pending commitment update."
-                                                            .to_owned(),
-                                                    ),
+
+                                                    None => Err(format!(
+                                                        "Freenet connection closed before the pending {action_name} update."
+                                                    )),
                                                 }
                                             };
 
@@ -546,13 +1149,12 @@ mod browser {
 
                                                         match api.as_mut() {
                                                             Some(api) => {
-                                                                request_test_contract(api)
-                                                                    .await
+                                                                request_test_contract(api).await
                                                             }
-                                                            None => Err(
-                                                                "Freenet connection closed before commitment verification."
-                                                                    .to_owned(),
-                                                            ),
+
+                                                            None => Err(format!(
+                                                                "Freenet connection closed before {action_name} verification."
+                                                            )),
                                                         }
                                                     };
 
@@ -632,14 +1234,48 @@ mod browser {
         let left_table = controller.has_left_table();
         let session_active = controller.is_active();
 
+        let pending_role_check = load_pending_action(TEST_CONTRACT_ID);
+
+        let no_pending_action = matches!(&pending_role_check, Ok(None));
+
+        /*
+         * Only the browser profile holding the active player role may prepare
+         * checker movement. The protocol still independently validates the
+         * completed sequence before any network submission.
+         */
+        let controls_authoritative_turn = session_active
+            && no_pending_action
+            && selected_local_role == Some(controller.state().active_player);
+
+        /*
+         * Dice are produced by the commit-and-reveal action loop. The former
+         * local random Roll control must not alter a network game.
+         */
+        let authoritative_roll_ready = latest_authoritative_state
+            .borrow()
+            .as_ref()
+            .and_then(|state_bytes| decode_verified_replay(state_bytes).ok())
+            .map(|replay| {
+                selected_local_role == Some(replay.state.active_player)
+                    && replay.state.turn_phase == TurnPhase::AwaitingRoll
+                    && replay.state.dice.is_none()
+                    && replay.roll_requested_by.is_none()
+                    && replay.dice_round.is_empty()
+            })
+            .unwrap_or(false);
+
         let can_roll = session_active
-            && matches!(controller.state().status, GameStatus::InProgress)
-            && controller.state().turn_phase == TurnPhase::AwaitingRoll;
+            && no_pending_action
+            && latest_contract_key.borrow().is_some()
+            && authoritative_roll_ready;
 
-        let can_pass = session_active && controller.must_pass();
+        let can_pass = controls_authoritative_turn && controller.must_pass();
 
-        let can_resign =
-            session_active && matches!(controller.state().status, GameStatus::InProgress);
+        /*
+         * Resignation is not networked yet. Disable the local-only mutation so
+         * it cannot falsely present a terminal network result.
+         */
+        let can_resign = false;
 
         let active_name = player_name(board.active_player);
 
@@ -651,31 +1287,33 @@ mod browser {
             format!("{active_name} must pass")
         } else {
             match board.turn_phase {
-                TurnPhase::AwaitingRoll => format!("{active_name} to roll"),
-                TurnPhase::Moving => format!("{active_name} is moving"),
+                TurnPhase::AwaitingRoll => {
+                    format!("{active_name} awaiting fair roll")
+                }
+                TurnPhase::Moving => {
+                    format!("{active_name} is moving")
+                }
             }
         };
 
-        let legal_sources = if session_active && controller.state().turn_phase == TurnPhase::Moving
-        {
-            controller.legal_sources()
-        } else {
-            Vec::new()
-        };
+        let legal_sources =
+            if controls_authoritative_turn && controller.state().turn_phase == TurnPhase::Moving {
+                controller.legal_sources()
+            } else {
+                Vec::new()
+            };
 
-        let selected_source = if session_active {
+        let selected_source = if controls_authoritative_turn {
             controller.selected_source()
         } else {
             None
         };
 
-        let legal_destinations = if session_active && selected_source.is_some() {
+        let legal_destinations = if controls_authoritative_turn && selected_source.is_some() {
             controller.legal_destinations().unwrap_or_default()
         } else {
             Vec::new()
         };
-
-        let pending_role_check = load_pending_action(TEST_CONTRACT_ID);
 
         let role_selection_locked =
             selected_local_role.is_some() || !matches!(&pending_role_check, Ok(None));
@@ -712,25 +1350,158 @@ mod browser {
             })
         };
 
-        let on_roll = {
-            let controller = controller.clone();
+        let submit_pending_secretless_action = {
+            let freenet_api = freenet_api.clone();
+            let contract_status = contract_status.clone();
             let interface_error = interface_error.clone();
+            let local_network_action_submitted = local_network_action_submitted.clone();
+
+            Callback::from(
+                move |(key, pending): (
+                    freenet_stdlib::prelude::ContractKey,
+                    crate::pending_action::PendingAction,
+                )| {
+                    let action_id = pending.action_id;
+                    let delta = pending.delta;
+
+                    {
+                        let mut submitted = local_network_action_submitted.borrow_mut();
+
+                        if submitted.as_ref() == Some(&action_id) {
+                            return;
+                        }
+
+                        *submitted = Some(action_id);
+                    }
+
+                    interface_error.set(None);
+                    contract_status.set(ContractProbeStatus::Updating);
+
+                    let api_for_update = freenet_api.clone();
+                    let contract_for_update = contract_status.clone();
+                    let interface_for_update = interface_error.clone();
+
+                    wasm_bindgen_futures::spawn_local(async move {
+                        let submit_result = {
+                            let mut api = api_for_update.borrow_mut();
+
+                            match api.as_mut() {
+                                Some(api) => submit_action_delta(api, key, delta).await,
+
+                                None => Err(
+                                    "Freenet connection closed before the pending action update."
+                                        .to_owned(),
+                                ),
+                            }
+                        };
+
+                        match submit_result {
+                            Ok(()) => {
+                                contract_for_update.set(ContractProbeStatus::VerifyingUpdate);
+
+                                gloo_timers::future::TimeoutFuture::new(750).await;
+
+                                let refresh_result = {
+                                    let mut api = api_for_update.borrow_mut();
+
+                                    match api.as_mut() {
+                                        Some(api) => request_test_contract(api).await,
+
+                                        None => Err(
+                                            "Freenet connection closed before pending action verification."
+                                                .to_owned(),
+                                        ),
+                                    }
+                                };
+
+                                if let Err(error) = refresh_result {
+                                    interface_for_update.set(Some(format!(
+                                        "The submitted action could not be refreshed: {error}"
+                                    )));
+
+                                    contract_for_update.set(ContractProbeStatus::Failed(error));
+                                }
+                            }
+
+                            Err(error) => {
+                                /*
+                                 * The durable pending action remains intact.
+                                 * Reconnect retries the same action ID and
+                                 * exact encoded delta.
+                                 */
+                                interface_for_update
+                                    .set(Some(format!("The action submission failed: {error}")));
+
+                                contract_for_update.set(ContractProbeStatus::Failed(error));
+                            }
+                        }
+                    });
+                },
+            )
+        };
+
+        let on_roll = {
+            let interface_error = interface_error.clone();
+            let latest_contract_key = latest_contract_key.clone();
+            let latest_authoritative_state = latest_authoritative_state.clone();
+            let submit_pending_secretless_action = submit_pending_secretless_action.clone();
+            let selected_local_role = selected_local_role;
 
             Callback::from(move |_| {
-                let mut next = (*controller).clone();
+                let prepared = (|| -> Result<
+                    (
+                        freenet_stdlib::prelude::ContractKey,
+                        crate::pending_action::PendingAction,
+                    ),
+                    String,
+                > {
+                    let local_player = selected_local_role
+                        .ok_or_else(|| "Select the local player role before rolling.".to_owned())?;
 
-                match secure_local_dice() {
-                    Ok(dice) => match next.begin_turn(dice) {
-                        Ok(()) => {
-                            interface_error.set(None);
-                            controller.set(next);
+                    let key = latest_contract_key
+                        .borrow()
+                        .clone()
+                        .ok_or_else(|| "No verified Freenet contract key is available.".to_owned())?;
+
+                    let state_bytes = latest_authoritative_state
+                        .borrow()
+                        .clone()
+                        .ok_or_else(|| "No verified authoritative parent state is available.".to_owned())?;
+
+                    match plan_browser_request_roll(&state_bytes, local_player, true)? {
+                        RequestRollPlan::Submit {
+                            pending,
+                            recovered_pending: false,
+                        } => Ok((key, pending)),
+
+                        RequestRollPlan::Submit {
+                            recovered_pending: true,
+                            ..
+                        } => Err(
+                            "A prior pending roll request already exists; reconnect to recover it."
+                                .to_owned(),
+                        ),
+
+                        RequestRollPlan::NoAction => {
+                            Err("The roll request did not produce a network action.".to_owned())
                         }
-                        Err(error) => {
-                            interface_error
-                                .set(Some(format!("The roll could not be applied: {error:?}")));
-                        }
-                    },
-                    Err(error) => interface_error.set(Some(error)),
+
+                        RequestRollPlan::Accepted => Err(
+                            "The roll request was already accepted before this submission."
+                                .to_owned(),
+                        ),
+                    }
+                })();
+
+                match prepared {
+                    Ok((key, pending)) => {
+                        interface_error.set(None);
+                        submit_pending_secretless_action.emit((key, pending));
+                    }
+
+                    Err(error) => {
+                        interface_error.set(Some(error));
+                    }
                 }
             })
         };
@@ -738,18 +1509,90 @@ mod browser {
         let on_pass = {
             let controller = controller.clone();
             let interface_error = interface_error.clone();
+            let latest_contract_key = latest_contract_key.clone();
+            let latest_authoritative_state = latest_authoritative_state.clone();
+            let submit_pending_secretless_action = submit_pending_secretless_action.clone();
+            let selected_local_role = selected_local_role;
 
             Callback::from(move |_| {
                 let mut next = (*controller).clone();
 
-                match next.pass_turn() {
-                    Ok(()) => {
+                let prepared = (|| -> Result<
+                    (
+                        freenet_stdlib::prelude::ContractKey,
+                        crate::pending_action::PendingAction,
+                    ),
+                    String,
+                > {
+                    let sequence = next
+                        .prepare_pass_for_submission()
+                        .map_err(|error| {
+                            format!(
+                                "The forced pass could not be prepared: {error:?}"
+                            )
+                        })?;
+
+                    let local_player =
+                        selected_local_role.ok_or_else(|| {
+                            "Select the local player role before passing."
+                                .to_owned()
+                        })?;
+
+                    let key = latest_contract_key
+                        .borrow()
+                        .clone()
+                        .ok_or_else(|| {
+                            "No verified Freenet contract key is available."
+                                .to_owned()
+                        })?;
+
+                    let state_bytes = latest_authoritative_state
+                        .borrow()
+                        .clone()
+                        .ok_or_else(|| {
+                            "No verified authoritative parent state is available."
+                                .to_owned()
+                        })?;
+
+                    match plan_browser_play_turn(
+                        &state_bytes,
+                        local_player,
+                        Some(&sequence),
+                    )? {
+                        PlayTurnPlan::Submit {
+                            pending,
+                            recovered_pending: false,
+                        } => Ok((key, pending)),
+
+                        PlayTurnPlan::Submit {
+                            recovered_pending: true,
+                            ..
+                        } => Err(
+                            "A prior pending turn already exists; reconnect to recover it."
+                                .to_owned(),
+                        ),
+
+                        PlayTurnPlan::NoAction => Err(
+                            "The prepared pass did not produce a network action."
+                                .to_owned(),
+                        ),
+
+                        PlayTurnPlan::Accepted => Err(
+                            "The pass was already accepted before this submission."
+                                .to_owned(),
+                        ),
+                    }
+                })();
+
+                match prepared {
+                    Ok((key, pending)) => {
                         interface_error.set(None);
                         controller.set(next);
+                        submit_pending_secretless_action.emit((key, pending));
                     }
+
                     Err(error) => {
-                        interface_error
-                            .set(Some(format!("The turn could not be passed: {error:?}")));
+                        interface_error.set(Some(error));
                     }
                 }
             })
@@ -778,15 +1621,107 @@ mod browser {
         let on_destination = {
             let controller = controller.clone();
             let interface_error = interface_error.clone();
+            let latest_contract_key = latest_contract_key.clone();
+            let latest_authoritative_state = latest_authoritative_state.clone();
+            let submit_pending_secretless_action = submit_pending_secretless_action.clone();
+            let selected_local_role = selected_local_role;
 
             Callback::from(move |destination: MoveTarget| {
                 let mut next = (*controller).clone();
 
-                match next.choose_destination(destination) {
-                    Ok(_) => {
+                match next.choose_destination_for_submission(destination) {
+                    Ok(None) => {
+                        /*
+                         * A partial legal sequence changes only the transient
+                         * preview. No network action exists yet.
+                         */
                         interface_error.set(None);
                         controller.set(next);
                     }
+
+                    Ok(Some(sequence)) => {
+                        let prepared = (|| -> Result<
+                            (
+                                freenet_stdlib::prelude::ContractKey,
+                                crate::pending_action::PendingAction,
+                            ),
+                            String,
+                        > {
+                            let local_player =
+                                selected_local_role.ok_or_else(|| {
+                                    "Select the local player role before moving."
+                                        .to_owned()
+                                })?;
+
+                            let key = latest_contract_key
+                                .borrow()
+                                .clone()
+                                .ok_or_else(|| {
+                                    "No verified Freenet contract key is available."
+                                        .to_owned()
+                                })?;
+
+                            let state_bytes =
+                                latest_authoritative_state
+                                    .borrow()
+                                    .clone()
+                                    .ok_or_else(|| {
+                                        "No verified authoritative parent state is available."
+                                            .to_owned()
+                                    })?;
+
+                            match plan_browser_play_turn(
+                                &state_bytes,
+                                local_player,
+                                Some(&sequence),
+                            )? {
+                                PlayTurnPlan::Submit {
+                                    pending,
+                                    recovered_pending: false,
+                                } => Ok((key, pending)),
+
+                                PlayTurnPlan::Submit {
+                                    recovered_pending: true,
+                                    ..
+                                } => Err(
+                                    "A prior pending turn already exists; reconnect to recover it."
+                                        .to_owned(),
+                                ),
+
+                                PlayTurnPlan::NoAction => Err(
+                                    "The completed checker sequence did not produce a network action."
+                                        .to_owned(),
+                                ),
+
+                                PlayTurnPlan::Accepted => Err(
+                                    "The completed turn was already accepted before submission."
+                                        .to_owned(),
+                                ),
+                            }
+                        })();
+
+                        match prepared {
+                            Ok((key, pending)) => {
+                                /*
+                                 * Keep the completed checker arrangement only
+                                 * as a preview. Authoritative acceptance will
+                                 * replace committed and preview state together.
+                                 */
+                                interface_error.set(None);
+                                controller.set(next);
+                                submit_pending_secretless_action.emit((key, pending));
+                            }
+
+                            Err(error) => {
+                                /*
+                                 * Do not retain the final preview move when no
+                                 * durable canonical action was created.
+                                 */
+                                interface_error.set(Some(error));
+                            }
+                        }
+                    }
+
                     Err(error) => {
                         interface_error
                             .set(Some(format!("That destination is not legal: {error:?}")));
@@ -933,9 +1868,12 @@ mod browser {
             let subscription_status = subscription_status.clone();
             let freenet_api = freenet_api.clone();
             let first_delta_submitted = first_delta_submitted.clone();
-            let local_commitment_submitted = local_commitment_submitted.clone();
+            let local_network_action_submitted = local_network_action_submitted.clone();
             let local_dice_secret = local_dice_secret.clone();
             let dice_secret_status = dice_secret_status.clone();
+            let latest_contract_key = latest_contract_key.clone();
+            let latest_authoritative_state = latest_authoritative_state.clone();
+            let controller_for_reconnect = controller.clone();
 
             Callback::from(move |_| {
                 freenet_api.borrow_mut().take();
@@ -944,7 +1882,9 @@ mod browser {
                  * Permit one submission attempt on the new connection.
                  * The durable pending action itself remains unchanged.
                  */
-                *local_commitment_submitted.borrow_mut() = false;
+                *local_network_action_submitted.borrow_mut() = None;
+                latest_contract_key.borrow_mut().take();
+                latest_authoritative_state.borrow_mut().take();
 
                 contract_status.set(ContractProbeStatus::WaitingForConnection);
                 subscription_status.set(SubscriptionStatus::Pending);
@@ -956,9 +1896,12 @@ mod browser {
                 let subscription_for_status = subscription_status.clone();
                 let api_for_response = freenet_api.clone();
                 let submitted_for_response = first_delta_submitted.clone();
-                let commitment_for_response = local_commitment_submitted.clone();
+                let network_action_for_response = local_network_action_submitted.clone();
                 let secret_for_response = local_dice_secret.clone();
                 let secret_status_for_response = dice_secret_status.clone();
+                let key_for_response = latest_contract_key.clone();
+                let state_for_response = latest_authoritative_state.clone();
+                let controller_for_response = controller_for_reconnect.clone();
 
                 let api_for_open = freenet_api.clone();
                 let connection_for_open = connection_status.clone();
@@ -1070,62 +2013,238 @@ mod browser {
                             if let (Some(key), Some(state_bytes)) =
                                 (contract_key, authoritative_state)
                             {
+                                let authoritative_state =
+                                    match authoritative_game_state(&state_bytes) {
+                                        Ok(state) => state,
+
+                                        Err(error) => {
+                                            contract_for_response.set(ContractProbeStatus::Failed(
+                                                format!("Authoritative replay failed: {error}"),
+                                            ));
+
+                                            return;
+                                        }
+                                    };
+
+                                /*
+                                 * An unchanged parent ledger must not erase a
+                                 * local checker preview while a turn is being
+                                 * prepared or awaiting authoritative acceptance.
+                                 */
+                                let state_changed =
+                                    state_for_response.borrow().as_ref() != Some(&state_bytes);
+
+                                /*
+                                 * Cache only after complete ledger decoding and
+                                 * deterministic protocol replay have succeeded.
+                                 */
+                                *key_for_response.borrow_mut() = Some(key.clone());
+                                *state_for_response.borrow_mut() = Some(state_bytes.clone());
+
+                                if state_changed {
+                                    if let Some(authoritative_state) = authoritative_state {
+                                        let mut next = (*controller_for_response).clone();
+
+                                        if let Err(error) =
+                                            next.sync_authoritative_state(authoritative_state)
+                                        {
+                                            contract_for_response.set(
+                                                ContractProbeStatus::Failed(
+                                                    format!(
+                                                        "Authoritative board synchronization failed: {error:?}"
+                                                    ),
+                                                ),
+                                            );
+
+                                            return;
+                                        }
+
+                                        controller_for_response.set(next);
+                                    }
+                                }
+
                                 let Some(local_player) = selected_local_role else {
                                     secret_status_for_response
                                         .set("Select White or Black to join the game".to_owned());
                                     return;
                                 };
 
-                                let plan = match plan_browser_commitment(&state_bytes, local_player)
-                                {
-                                    Ok(plan) => plan,
-                                    Err(error) => {
-                                        secret_status_for_response
-                                            .set(format!("Recovery failed: {error}"));
+                                let plan =
+                                    match plan_browser_network_action(&state_bytes, local_player) {
+                                        Ok(plan) => plan,
+                                        Err(error) => {
+                                            secret_status_for_response
+                                                .set(format!("Recovery failed: {error}"));
 
-                                        contract_for_response
-                                            .set(ContractProbeStatus::Failed(error));
+                                            contract_for_response
+                                                .set(ContractProbeStatus::Failed(error));
 
-                                        return;
-                                    }
-                                };
+                                            return;
+                                        }
+                                    };
 
                                 match plan {
-                                    CommitmentPlan::NoAction => {}
+                                    BrowserNetworkActionPlan::NoAction => {}
 
-                                    CommitmentPlan::Accepted { secret } => {
+                                    BrowserNetworkActionPlan::Accepted { secret, kind } => {
                                         *secret_for_response.borrow_mut() = Some(secret);
-                                        *commitment_for_response.borrow_mut() = true;
+                                        *network_action_for_response.borrow_mut() = None;
 
-                                        secret_status_for_response.set(
-                                            "Recovered and matched accepted commitment".to_owned(),
-                                        );
+                                        secret_status_for_response.set(match kind {
+                                            NetworkActionKind::Commitment => {
+                                                "Recovered and matched accepted commitment"
+                                                    .to_owned()
+                                            }
+
+                                            NetworkActionKind::Reveal => {
+                                                "Recovered and matched accepted reveal".to_owned()
+                                            }
+                                        });
                                     }
 
-                                    CommitmentPlan::Submit {
-                                        secret,
+                                    BrowserNetworkActionPlan::SecretlessAccepted { kind: _ } => {
+                                        /*
+                                         * The authoritative board was already
+                                         * synchronized above from the accepted
+                                         * history. Only the local submission
+                                         * guard remains to be cleared.
+                                         */
+                                        *network_action_for_response.borrow_mut() = None;
+                                    }
+
+                                    BrowserNetworkActionPlan::SecretlessSubmit {
                                         pending,
                                         recovered_pending,
+                                        kind: _,
                                     } => {
+                                        let action_id = pending.action_id;
                                         let delta = pending.delta;
+
                                         {
                                             let mut submitted =
-                                                commitment_for_response.borrow_mut();
+                                                network_action_for_response.borrow_mut();
 
-                                            if *submitted {
+                                            if submitted.as_ref() == Some(&action_id) {
                                                 return;
                                             }
 
-                                            *submitted = true;
+                                            *submitted = Some(action_id);
+                                        }
+
+                                        contract_for_response.set(ContractProbeStatus::Updating);
+
+                                        let api_for_update = api_for_response.clone();
+                                        let contract_for_update = contract_for_response.clone();
+
+                                        wasm_bindgen_futures::spawn_local(async move {
+                                            let submit_result = {
+                                                let mut api = api_for_update.borrow_mut();
+
+                                                match api.as_mut() {
+                                                        Some(api) => {
+                                                            submit_action_delta(
+                                                                api,
+                                                                key,
+                                                                delta,
+                                                            )
+                                                            .await
+                                                        }
+
+                                                        None => Err(
+                                                            "Freenet connection closed before the pending turn update."
+                                                                .to_owned(),
+                                                        ),
+                                                    }
+                                            };
+
+                                            match submit_result {
+                                                Ok(()) => {
+                                                    contract_for_update
+                                                        .set(ContractProbeStatus::VerifyingUpdate);
+
+                                                    gloo_timers::future::TimeoutFuture::new(750)
+                                                        .await;
+
+                                                    let refresh_result = {
+                                                        let mut api = api_for_update.borrow_mut();
+
+                                                        match api.as_mut() {
+                                                                Some(api) => {
+                                                                    request_test_contract(api)
+                                                                        .await
+                                                                }
+
+                                                                None => Err(
+                                                                    "Freenet connection closed before turn verification."
+                                                                        .to_owned(),
+                                                                ),
+                                                            }
+                                                    };
+
+                                                    if let Err(error) = refresh_result {
+                                                        contract_for_update.set(
+                                                            ContractProbeStatus::Failed(error),
+                                                        );
+                                                    }
+                                                }
+
+                                                Err(error) => {
+                                                    /*
+                                                     * Keep the exact pending
+                                                     * turn. Reconnect will
+                                                     * retry the same bytes.
+                                                     */
+                                                    contract_for_update.set(
+                                                        ContractProbeStatus::Failed(format!(
+                                                            "{}{}",
+                                                            if recovered_pending {
+                                                                "Recovered turn retry failed: "
+                                                            } else {
+                                                                "Turn submission failed: "
+                                                            },
+                                                            error,
+                                                        )),
+                                                    );
+                                                }
+                                            }
+                                        });
+                                    }
+
+                                    BrowserNetworkActionPlan::Submit {
+                                        secret,
+                                        pending,
+                                        recovered_pending,
+                                        kind,
+                                    } => {
+                                        let action_id = pending.action_id;
+                                        let delta = pending.delta;
+
+                                        {
+                                            let mut submitted =
+                                                network_action_for_response.borrow_mut();
+
+                                            if submitted.as_ref() == Some(&action_id) {
+                                                return;
+                                            }
+
+                                            *submitted = Some(action_id);
                                         }
 
                                         *secret_for_response.borrow_mut() = Some(secret);
 
+                                        let action_name = match kind {
+                                            NetworkActionKind::Commitment => "commitment",
+                                            NetworkActionKind::Reveal => "reveal",
+                                        };
+
                                         secret_status_for_response.set(if recovered_pending {
-                                            "Recovered exact pending action; retrying".to_owned()
+                                            format!(
+                                                "Recovered exact pending {action_name}; retrying"
+                                            )
                                         } else {
-                                            "Stored locally; awaiting network verification"
-                                                .to_owned()
+                                            format!(
+                                                "Stored {action_name} locally; awaiting network verification"
+                                            )
                                         });
 
                                         contract_for_response.set(ContractProbeStatus::Updating);
@@ -1139,17 +2258,12 @@ mod browser {
 
                                                 match api.as_mut() {
                                                     Some(api) => {
-                                                        submit_action_delta(
-                                                            api,
-                                                            key,
-                                                            delta,
-                                                        )
-                                                        .await
+                                                        submit_action_delta(api, key, delta).await
                                                     }
-                                                    None => Err(
-                                                        "Freenet connection closed before the pending commitment update."
-                                                            .to_owned(),
-                                                    ),
+
+                                                    None => Err(format!(
+                                                        "Freenet connection closed before the pending {action_name} update."
+                                                    )),
                                                 }
                                             };
 
@@ -1166,13 +2280,12 @@ mod browser {
 
                                                         match api.as_mut() {
                                                             Some(api) => {
-                                                                request_test_contract(api)
-                                                                    .await
+                                                                request_test_contract(api).await
                                                             }
-                                                            None => Err(
-                                                                "Freenet connection closed before commitment verification."
-                                                                    .to_owned(),
-                                                            ),
+
+                                                            None => Err(format!(
+                                                                "Freenet connection closed before {action_name} verification."
+                                                            )),
                                                         }
                                                     };
 
@@ -1185,10 +2298,9 @@ mod browser {
 
                                                 Err(error) => {
                                                     /*
-                                                     * Do not clear the durable pending record
-                                                     * and do not regenerate the action. A later
-                                                     * reconnect will reconcile and retry these
-                                                     * exact stored bytes.
+                                                     * Preserve the exact durable pending record.
+                                                     * A reconnect retries the same action ID and
+                                                     * exact encoded delta.
                                                      */
                                                     contract_for_update
                                                         .set(ContractProbeStatus::Failed(error));

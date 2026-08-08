@@ -70,6 +70,69 @@ impl LocalGameController {
         }
     }
 
+    /// Replaces local committed and preview state with an independently
+    /// verified authoritative game state.
+    ///
+    /// Any uncommitted checker selection is discarded. The caller must only
+    /// supply state produced by verified protocol replay.
+    pub fn sync_authoritative_state(&mut self, state: GameState) -> Result<(), ControllerError> {
+        state.verify().map_err(ControllerError::InvalidState)?;
+
+        let legal_sequences = if state.turn_phase == TurnPhase::Moving {
+            state
+                .legal_turn_sequences()
+                .map_err(ControllerError::TurnGeneration)?
+        } else {
+            Vec::new()
+        };
+
+        self.state = state.clone();
+        self.preview_state = state.clone();
+        self.turn_start_state = if state.turn_phase == TurnPhase::Moving {
+            Some(state)
+        } else {
+            None
+        };
+        self.legal_sequences = legal_sequences;
+        self.selected_moves.clear();
+        self.selected_source = None;
+        self.left_table = false;
+
+        self.sync_outcome_from_state();
+
+        if self.outcome.is_none() {
+            self.status_message = match self.state.turn_phase {
+                TurnPhase::AwaitingRoll => {
+                    format!("{} to roll.", player_name(self.state.active_player))
+                }
+                TurnPhase::Moving => {
+                    let dice = self
+                        .state
+                        .dice
+                        .ok_or(ControllerError::TurnGeneration(TurnError::MissingDice))?;
+
+                    if self.must_pass() {
+                        format!(
+                            "{} rolled {} and {} but has no legal move. Select Pass turn.",
+                            player_name(self.state.active_player),
+                            dice.first,
+                            dice.second,
+                        )
+                    } else {
+                        format!(
+                            "{} rolled {} and {}.",
+                            player_name(self.state.active_player),
+                            dice.first,
+                            dice.second,
+                        )
+                    }
+                }
+            };
+        }
+
+        Ok(())
+    }
+
     pub fn state(&self) -> &GameState {
         &self.state
     }
@@ -208,6 +271,25 @@ impl LocalGameController {
         self.commit_sequence(TurnSequence::default())
     }
 
+    /// Prepares a forced pass for network submission without advancing the
+    /// locally committed state.
+    ///
+    /// The authoritative replay must remain the committed source of truth
+    /// until Freenet accepts and returns the corresponding PlayTurn action.
+    pub fn prepare_pass_for_submission(&mut self) -> Result<TurnSequence, ControllerError> {
+        if !self.is_active() {
+            return Err(ControllerError::SessionInactive);
+        }
+
+        if !self.must_pass() {
+            return Err(ControllerError::NoForcedPassPending);
+        }
+
+        self.status_message = "Forced pass ready for network submission.".to_owned();
+
+        Ok(TurnSequence::default())
+    }
+
     pub fn legal_sources(&self) -> Vec<MoveSource> {
         if !self.is_active() {
             return Vec::new();
@@ -285,6 +367,48 @@ impl LocalGameController {
     }
 
     pub fn choose_destination(&mut self, destination: MoveTarget) -> Result<bool, ControllerError> {
+        let turn_is_complete = self.select_destination_for_turn(destination)?;
+
+        if turn_is_complete {
+            let sequence = TurnSequence {
+                moves: self.selected_moves.clone(),
+            };
+
+            self.commit_sequence(sequence)?;
+        }
+
+        Ok(turn_is_complete)
+    }
+
+    /// Applies one legal checker selection to the transient preview.
+    ///
+    /// When the complete legal turn has been selected, this returns the
+    /// canonical TurnSequence but deliberately leaves the committed state,
+    /// dice, active player, and history unchanged. The sequence can then be
+    /// submitted as a durable PlayTurn action.
+    pub fn choose_destination_for_submission(
+        &mut self,
+        destination: MoveTarget,
+    ) -> Result<Option<TurnSequence>, ControllerError> {
+        let turn_is_complete = self.select_destination_for_turn(destination)?;
+
+        if !turn_is_complete {
+            return Ok(None);
+        }
+
+        let sequence = TurnSequence {
+            moves: self.selected_moves.clone(),
+        };
+
+        self.status_message = "Turn ready for network submission.".to_owned();
+
+        Ok(Some(sequence))
+    }
+
+    fn select_destination_for_turn(
+        &mut self,
+        destination: MoveTarget,
+    ) -> Result<bool, ControllerError> {
         if !self.is_active() {
             return Err(ControllerError::SessionInactive);
         }
@@ -317,21 +441,14 @@ impl LocalGameController {
             .iter()
             .all(|sequence| sequence.moves.len() == self.selected_moves.len());
 
-        if turn_is_complete {
-            let sequence = TurnSequence {
-                moves: self.selected_moves.clone(),
-            };
-
-            self.commit_sequence(sequence)?;
-            return Ok(true);
+        if !turn_is_complete {
+            self.status_message = format!(
+                "{} move selected. Choose the next checker.",
+                self.selected_moves.len()
+            );
         }
 
-        self.status_message = format!(
-            "{} move selected. Choose the next checker.",
-            self.selected_moves.len()
-        );
-
-        Ok(false)
+        Ok(turn_is_complete)
     }
 
     fn next_legal_moves(&self) -> Vec<CheckerMove> {
@@ -485,6 +602,22 @@ mod tests {
         }
     }
 
+    fn prepare_first_available_turn(controller: &mut LocalGameController) -> TurnSequence {
+        loop {
+            let source = controller.legal_sources()[0];
+            controller.select_source(source).unwrap();
+
+            let destination = controller.legal_destinations().unwrap()[0];
+
+            if let Some(sequence) = controller
+                .choose_destination_for_submission(destination)
+                .unwrap()
+            {
+                return sequence;
+            }
+        }
+    }
+
     #[test]
     fn new_controller_starts_with_standard_game() {
         let controller = LocalGameController::new();
@@ -497,6 +630,83 @@ mod tests {
         assert!(!controller.has_left_table());
         assert!(controller.is_active());
         assert_eq!(controller.status_message(), "White to roll.");
+    }
+
+    #[test]
+    fn authoritative_awaiting_roll_state_replaces_local_progress() {
+        let mut controller = LocalGameController::new();
+
+        controller
+            .begin_turn(Dice {
+                first: 1,
+                second: 2,
+            })
+            .unwrap();
+
+        let mut authoritative = GameState::standard_start();
+        authoritative.active_player = Player::Black;
+        authoritative.verify().unwrap();
+
+        controller
+            .sync_authoritative_state(authoritative.clone())
+            .unwrap();
+
+        assert_eq!(controller.state(), &authoritative);
+        assert_eq!(controller.visible_state(), &authoritative);
+        assert_eq!(controller.selected_source(), None);
+        assert!(controller.selected_moves().is_empty());
+        assert!(controller.legal_sources().is_empty());
+        assert_eq!(controller.status_message(), "Black to roll.");
+    }
+
+    #[test]
+    fn authoritative_moving_state_restores_derived_dice_and_legal_moves() {
+        let mut authoritative = GameState::standard_start();
+        authoritative.turn_phase = TurnPhase::Moving;
+        authoritative.dice = Some(Dice {
+            first: 3,
+            second: 1,
+        });
+        authoritative.verify().unwrap();
+
+        let expected_sequences = authoritative.legal_turn_sequences().unwrap();
+
+        let mut controller = LocalGameController::new();
+
+        controller
+            .sync_authoritative_state(authoritative.clone())
+            .unwrap();
+
+        assert_eq!(controller.state(), &authoritative);
+        assert_eq!(controller.visible_state(), &authoritative);
+        assert_eq!(
+            controller.state().dice,
+            Some(Dice {
+                first: 3,
+                second: 1,
+            })
+        );
+        assert!(!expected_sequences.is_empty());
+        assert!(!controller.legal_sources().is_empty());
+        assert_eq!(controller.status_message(), "White rolled 3 and 1.");
+    }
+
+    #[test]
+    fn invalid_authoritative_state_is_rejected_without_mutation() {
+        let mut controller = LocalGameController::new();
+        let original = controller.state().clone();
+
+        let mut invalid = GameState::standard_start();
+        invalid.turn_phase = TurnPhase::Moving;
+        invalid.dice = None;
+
+        assert!(matches!(
+            controller.sync_authoritative_state(invalid),
+            Err(ControllerError::InvalidState(_))
+        ));
+
+        assert_eq!(controller.state(), &original);
+        assert_eq!(controller.visible_state(), &original);
     }
 
     #[test]
@@ -597,6 +807,68 @@ mod tests {
     }
 
     #[test]
+    fn completed_network_turn_preserves_authoritative_state() {
+        let mut controller = LocalGameController::new();
+
+        controller
+            .begin_turn(Dice {
+                first: 1,
+                second: 2,
+            })
+            .unwrap();
+
+        let authoritative = controller.state().clone();
+        let sequence = prepare_first_available_turn(&mut controller);
+
+        assert!(!sequence.moves.is_empty());
+        assert_eq!(controller.state(), &authoritative);
+        assert_eq!(controller.state().active_player, Player::White);
+        assert_eq!(controller.state().turn_phase, TurnPhase::Moving);
+        assert_eq!(
+            controller.state().dice,
+            Some(Dice {
+                first: 1,
+                second: 2,
+            })
+        );
+        assert!(controller.history().is_empty());
+        assert_eq!(controller.selected_moves(), sequence.moves.as_slice());
+        assert_ne!(controller.visible_state(), controller.state());
+        assert!(controller.legal_sources().is_empty());
+        assert_eq!(
+            controller.status_message(),
+            "Turn ready for network submission."
+        );
+    }
+
+    #[test]
+    fn authoritative_sync_discards_prepared_network_turn() {
+        let mut controller = LocalGameController::new();
+
+        controller
+            .begin_turn(Dice {
+                first: 1,
+                second: 2,
+            })
+            .unwrap();
+
+        let authoritative = controller.state().clone();
+
+        let _sequence = prepare_first_available_turn(&mut controller);
+
+        controller
+            .sync_authoritative_state(authoritative.clone())
+            .unwrap();
+
+        assert_eq!(controller.state(), &authoritative);
+        assert_eq!(controller.visible_state(), &authoritative);
+        assert!(controller.selected_moves().is_empty());
+        assert_eq!(controller.selected_source(), None);
+        assert!(!controller.legal_sources().is_empty());
+        assert_eq!(controller.status_message(), "White rolled 1 and 2.");
+    }
+
+    #[test]
     fn complete_turn_commits_and_switches_player() {
         let mut controller = LocalGameController::new();
 
@@ -688,6 +960,70 @@ mod tests {
         assert_eq!(controller.history()[0].player, Player::White);
         assert_eq!(controller.history()[0].dice, dice);
         assert!(controller.history()[0].moves.is_empty());
+    }
+
+    #[test]
+    fn forced_pass_can_be_prepared_without_local_commit() {
+        use backgammon_core::{PlayerArea, Point};
+
+        let dice = Dice {
+            first: 4,
+            second: 2,
+        };
+
+        let mut points = [Point::EMPTY; 24];
+
+        points[1] = Point::occupied(Player::Black, 2);
+        points[3] = Point::occupied(Player::Black, 2);
+
+        let blocked_state = GameState {
+            points,
+            white: PlayerArea {
+                bar: 1,
+                borne_off: 14,
+            },
+            black: PlayerArea {
+                bar: 0,
+                borne_off: 11,
+            },
+            active_player: Player::White,
+            turn_phase: TurnPhase::AwaitingRoll,
+            dice: None,
+            status: GameStatus::InProgress,
+        };
+
+        blocked_state.verify().unwrap();
+
+        let mut controller = LocalGameController::new();
+
+        controller.sync_authoritative_state(blocked_state).unwrap();
+
+        controller.begin_turn(dice).unwrap();
+
+        let authoritative = controller.state().clone();
+
+        let sequence = controller.prepare_pass_for_submission().unwrap();
+
+        assert!(sequence.moves.is_empty());
+        assert_eq!(controller.state(), &authoritative);
+        assert_eq!(controller.state().active_player, Player::White);
+        assert_eq!(controller.state().turn_phase, TurnPhase::Moving);
+        assert_eq!(controller.state().dice, Some(dice));
+        assert!(controller.history().is_empty());
+        assert_eq!(
+            controller.status_message(),
+            "Forced pass ready for network submission."
+        );
+    }
+
+    #[test]
+    fn prepare_pass_is_rejected_without_forced_pass() {
+        let mut controller = LocalGameController::new();
+
+        assert_eq!(
+            controller.prepare_pass_for_submission(),
+            Err(ControllerError::NoForcedPassPending)
+        );
     }
 
     #[test]

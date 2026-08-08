@@ -25,6 +25,11 @@ pub struct GameConfiguration {
 pub enum GameActionPayload {
     CreateGame(GameConfiguration),
 
+    RequestRoll {
+        turn: u32,
+        player: Player,
+    },
+
     CommitDice {
         turn: u32,
         player: Player,
@@ -112,7 +117,7 @@ impl GameActionPayload {
         match self {
             Self::CreateGame(configuration) => configuration.verify(),
 
-            Self::CommitDice { .. } | Self::RevealDice { .. } => Ok(()),
+            Self::RequestRoll { .. } | Self::CommitDice { .. } | Self::RevealDice { .. } => Ok(()),
 
             Self::PlayTurn {
                 player, sequence, ..
@@ -249,6 +254,16 @@ mod tests {
 
             assert_eq!(payload.verify(), Err(GameActionError::InvalidMatchLength));
         }
+    }
+
+    #[test]
+    fn roll_request_action_is_accepted() {
+        let payload = GameActionPayload::RequestRoll {
+            turn: 3,
+            player: Player::Black,
+        };
+
+        assert_eq!(record(payload).verify(), Ok(()));
     }
 
     #[test]

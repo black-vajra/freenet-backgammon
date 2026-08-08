@@ -365,31 +365,58 @@ mod tests {
         let sequence = rolled_state.legal_turn_sequences().unwrap()[0].clone();
 
         let state_hash =
-            |state: &GameState, next_turn: u32, dice_round: backgammon_protocol::DiceRoundState| {
-                CanonicalReplayState::new(
+            |state: &GameState,
+             next_turn: u32,
+             roll_requested_by: Option<Player>,
+             dice_round: backgammon_protocol::DiceRoundState| {
+                let mut canonical = CanonicalReplayState::new(
                     game_id,
                     configuration(),
                     state.clone(),
                     next_turn,
                     dice_round,
                     ReplayStatus::InProgress,
-                )
-                .hash()
-                .unwrap()
+                );
+
+                canonical.roll_requested_by = roll_requested_by;
+                canonical.hash().unwrap()
             };
 
         let create = action(1, 0);
+
+        let request_hash = state_hash(
+            &initial_state,
+            0,
+            Some(Player::White),
+            backgammon_protocol::DiceRoundState::default(),
+        );
+
+        let request_roll_action = typed_action(
+            2,
+            1,
+            create_hash(),
+            request_hash,
+            GameActionPayload::RequestRoll {
+                turn: 0,
+                player: Player::White,
+            },
+        );
 
         let mut white_committed = backgammon_protocol::DiceRoundState::default();
 
         white_committed.white_commitment = Some(white_commit.commitment);
 
-        let white_commit_hash = state_hash(&initial_state, 0, white_committed.clone());
+        let white_commit_hash = state_hash(
+            &initial_state,
+            0,
+            Some(Player::White),
+            white_committed.clone(),
+        );
 
         let white_commit_action = typed_action(
+            3,
             2,
-            1,
-            create_hash(),
+            request_hash,
             white_commit_hash,
             GameActionPayload::CommitDice {
                 turn: 0,
@@ -401,11 +428,16 @@ mod tests {
         let mut both_committed = white_committed;
         both_committed.black_commitment = Some(black_commit.commitment);
 
-        let black_commit_hash = state_hash(&initial_state, 0, both_committed.clone());
+        let black_commit_hash = state_hash(
+            &initial_state,
+            0,
+            Some(Player::White),
+            both_committed.clone(),
+        );
 
         let black_commit_action = typed_action(
+            4,
             3,
-            2,
             white_commit_hash,
             black_commit_hash,
             GameActionPayload::CommitDice {
@@ -418,11 +450,16 @@ mod tests {
         let mut white_revealed = both_committed;
         white_revealed.white_reveal = Some(white_secret);
 
-        let white_reveal_hash = state_hash(&initial_state, 0, white_revealed.clone());
+        let white_reveal_hash = state_hash(
+            &initial_state,
+            0,
+            Some(Player::White),
+            white_revealed.clone(),
+        );
 
         let white_reveal_action = typed_action(
+            5,
             4,
-            3,
             black_commit_hash,
             white_reveal_hash,
             GameActionPayload::RevealDice {
@@ -435,11 +472,11 @@ mod tests {
         let mut both_revealed = white_revealed;
         both_revealed.black_reveal = Some(black_secret);
 
-        let roll_hash = state_hash(&rolled_state, 0, both_revealed);
+        let roll_hash = state_hash(&rolled_state, 0, Some(Player::White), both_revealed);
 
         let black_reveal_action = typed_action(
+            6,
             5,
-            4,
             white_reveal_hash,
             roll_hash,
             GameActionPayload::RevealDice {
@@ -455,12 +492,13 @@ mod tests {
         let completed_hash = state_hash(
             &completed_state,
             1,
+            None,
             backgammon_protocol::DiceRoundState::default(),
         );
 
         let play = typed_action(
+            7,
             6,
-            5,
             roll_hash,
             completed_hash,
             GameActionPayload::PlayTurn {
@@ -473,6 +511,7 @@ mod tests {
         (
             vec![
                 create,
+                request_roll_action,
                 white_commit_action,
                 black_commit_action,
                 white_reveal_action,
@@ -521,7 +560,7 @@ mod tests {
 
         assert_eq!(replayed.state, expected_state);
         assert_eq!(replayed.latest_state_hash, expected_hash);
-        assert_eq!(replayed.next_sequence, 6);
+        assert_eq!(replayed.next_sequence, 7);
         assert_eq!(replayed.next_turn, 1);
     }
 
@@ -548,7 +587,7 @@ mod tests {
         let p = params();
         let (actions, expected_state, expected_hash) = complete_opening_turn_actions();
 
-        assert_eq!(actions.len(), 6);
+        assert_eq!(actions.len(), 7);
 
         let grouping_a = apply_decoded_updates(
             &p,
@@ -560,6 +599,7 @@ mod tests {
                     actions[3].clone(),
                     actions[4].clone(),
                     actions[5].clone(),
+                    actions[6].clone(),
                 ]),
             ],
         )
@@ -571,7 +611,11 @@ mod tests {
             [
                 action_delta(vec![actions[0].clone(), actions[1].clone()]),
                 action_delta(vec![actions[2].clone(), actions[3].clone()]),
-                action_delta(vec![actions[4].clone(), actions[5].clone()]),
+                action_delta(vec![
+                    actions[4].clone(),
+                    actions[5].clone(),
+                    actions[6].clone(),
+                ]),
             ],
         )
         .unwrap();
@@ -597,7 +641,7 @@ mod tests {
 
         assert_eq!(replayed.state, expected_state);
         assert_eq!(replayed.latest_state_hash, expected_hash);
-        assert_eq!(replayed.next_sequence, 6);
+        assert_eq!(replayed.next_sequence, 7);
         assert_eq!(replayed.next_turn, 1);
     }
 
@@ -680,7 +724,7 @@ mod tests {
 
         assert_eq!(replayed.state, expected_state);
         assert_eq!(replayed.latest_state_hash, expected_hash);
-        assert_eq!(replayed.next_sequence, 6);
+        assert_eq!(replayed.next_sequence, 7);
         assert_eq!(replayed.next_turn, 1);
     }
 
@@ -702,7 +746,7 @@ mod tests {
         let summary = client.summarize(&client, &p);
         let delta = full
             .delta(&full, &p, &summary)
-            .expect("client is missing five actions");
+            .expect("client is missing six actions");
 
         let missing = delta
             .actions
@@ -945,7 +989,7 @@ mod tests {
 
         assert_eq!(replayed.state, expected_state);
         assert_eq!(replayed.latest_state_hash, expected_hash);
-        assert_eq!(replayed.next_sequence, 6);
+        assert_eq!(replayed.next_sequence, 7);
         assert_eq!(replayed.next_turn, 1);
         assert_eq!(replayed.state.active_player, Player::Black);
         assert_eq!(replayed.state.turn_phase, TurnPhase::AwaitingRoll);

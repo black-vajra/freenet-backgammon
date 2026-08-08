@@ -17,3 +17,13 @@ uses the domain `freenet-backgammon-replay-state-v2\0`.
 
 The v1 fixture files are retained permanently. They must not be regenerated or
 replaced. The v2 files freeze the new representation independently.
+
+## Protocol v3
+
+Protocol v3 adds the authenticated human `RequestRoll` transition and records
+`roll_requested_by` in canonical replay state when a roll request is pending.
+It uses the domain `freenet-backgammon-replay-state-v3\0`.
+
+The v1 and v2 fixture files remain permanent historical compatibility evidence.
+The v3 files freeze the new representation independently and must not replace
+or rewrite earlier fixtures.

@@ -1,7 +1,7 @@
 use backgammon_contract::{LedgerState, LedgerStateDelta};
 use backgammon_protocol::{
     build_next_game_action, replay_game, verify_typed_action_history, Action, ActionId,
-    GameActionPayload, GameActionRecord,
+    GameActionPayload, GameActionRecord, ReplayedGame,
 };
 use ciborium::{de::from_reader, ser::into_writer};
 
@@ -54,6 +54,15 @@ pub fn decode_verified_ledger(bytes: &[u8]) -> Result<VerifiedLedger, String> {
         storage_actions,
         typed_actions,
     })
+}
+
+/// Decodes and independently verifies the replicated ledger, then returns
+/// the canonical replay result that must drive the visible network game.
+pub fn decode_verified_replay(bytes: &[u8]) -> Result<ReplayedGame, String> {
+    let ledger = decode_verified_ledger(bytes)?;
+
+    replay_game(ledger.typed_actions())
+        .map_err(|error| format!("typed ledger replay failed: {error:?}"))
 }
 
 /// Constructs and canonically encodes a one-action contract delta.
@@ -109,6 +118,26 @@ mod tests {
         assert_eq!(ledger.action_count(), 1);
         assert_eq!(ledger.storage_actions()[0].sequence, 0);
         assert_eq!(ledger.typed_actions()[0].sequence, 0);
+    }
+
+    #[test]
+    fn pinned_network_state_returns_verified_authoritative_replay() {
+        let replay = decode_verified_replay(ONE_ACTION_STATE).unwrap();
+
+        assert_eq!(replay.next_sequence, 1);
+        assert_eq!(replay.next_turn, 0);
+        assert_eq!(replay.state, backgammon_core::GameState::standard_start());
+        assert_eq!(replay.state.active_player, backgammon_core::Player::White);
+        assert_eq!(
+            replay.state.turn_phase,
+            backgammon_core::TurnPhase::AwaitingRoll
+        );
+        assert_eq!(replay.state.dice, None);
+    }
+
+    #[test]
+    fn malformed_state_cannot_produce_authoritative_replay() {
+        assert!(decode_verified_replay(&[0xff, 0x00]).is_err());
     }
 
     #[test]

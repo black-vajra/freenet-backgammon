@@ -113,6 +113,14 @@ pub fn plan_commitment(input: CommitmentPlannerInput<'_>) -> Result<CommitmentPl
         return Ok(CommitmentPlan::NoAction);
     }
 
+    /*
+     * Commit-and-reveal is automatic only after the active human has
+     * explicitly requested this turn's roll through the replicated ledger.
+     */
+    if replay.roll_requested_by != Some(replay.state.active_player) {
+        return Ok(CommitmentPlan::NoAction);
+    }
+
     let white_present = replay.dice_round.white_commitment.is_some();
     let black_present = replay.dice_round.black_commitment.is_some();
 
@@ -200,6 +208,17 @@ mod tests {
         encoded
     }
 
+    fn requested_state() -> Vec<u8> {
+        append_action(
+            ONE_ACTION_STATE,
+            [19; 32],
+            GameActionPayload::RequestRoll {
+                turn: 0,
+                player: Player::White,
+            },
+        )
+    }
+
     fn created_plan(
         player: Player,
         state: &[u8],
@@ -244,13 +263,34 @@ mod tests {
     }
 
     #[test]
+    fn commitment_waits_for_authenticated_roll_request() {
+        let plan = plan_commitment(CommitmentPlannerInput {
+            contract_id: CONTRACT_ID,
+            local_player: Player::White,
+            authoritative_state: ONE_ACTION_STATE,
+            pending: None,
+            stored_secret: None,
+            new_secret: Some([11; 32]),
+            new_action_id: Some([21; 32]),
+        })
+        .unwrap();
+
+        assert_eq!(plan, CommitmentPlan::NoAction);
+    }
+
+    #[test]
     fn white_creates_first_commitment_from_verified_replay_state() {
-        let plan = created_plan(Player::White, ONE_ACTION_STATE, [11; 32], [21; 32]);
+        let plan = created_plan(
+            Player::White,
+            requested_state().as_slice(),
+            [11; 32],
+            [21; 32],
+        );
 
         let pending = pending_from(plan);
         let record = pending.verify().unwrap();
 
-        assert_eq!(record.sequence, 1);
+        assert_eq!(record.sequence, 2);
 
         assert!(matches!(
             record.payload,
@@ -267,7 +307,7 @@ mod tests {
         let plan = plan_commitment(CommitmentPlannerInput {
             contract_id: CONTRACT_ID,
             local_player: Player::Black,
-            authoritative_state: ONE_ACTION_STATE,
+            authoritative_state: requested_state().as_slice(),
             pending: None,
             stored_secret: None,
             new_secret: Some([22; 32]),
@@ -282,12 +322,12 @@ mod tests {
     fn black_creates_next_commitment_after_white_is_accepted() {
         let white_pending = pending_from(created_plan(
             Player::White,
-            ONE_ACTION_STATE,
+            requested_state().as_slice(),
             [11; 32],
             [21; 32],
         ));
 
-        let two_action_state = state_with_pending(ONE_ACTION_STATE, &white_pending);
+        let two_action_state = state_with_pending(requested_state().as_slice(), &white_pending);
 
         let black_pending = pending_from(created_plan(
             Player::Black,
@@ -298,7 +338,7 @@ mod tests {
 
         let record = black_pending.verify().unwrap();
 
-        assert_eq!(record.sequence, 2);
+        assert_eq!(record.sequence, 3);
 
         assert!(matches!(
             record.payload,
@@ -314,7 +354,7 @@ mod tests {
     fn exact_pending_action_is_retried_without_regeneration() {
         let pending = pending_from(created_plan(
             Player::White,
-            ONE_ACTION_STATE,
+            requested_state().as_slice(),
             [11; 32],
             [21; 32],
         ));
@@ -322,7 +362,7 @@ mod tests {
         let plan = plan_commitment(CommitmentPlannerInput {
             contract_id: CONTRACT_ID,
             local_player: Player::White,
-            authoritative_state: ONE_ACTION_STATE,
+            authoritative_state: requested_state().as_slice(),
             pending: Some(&pending),
             stored_secret: Some([11; 32]),
             new_secret: Some([99; 32]),
@@ -344,12 +384,12 @@ mod tests {
     fn accepted_commitment_recovers_and_verifies_secret() {
         let pending = pending_from(created_plan(
             Player::White,
-            ONE_ACTION_STATE,
+            requested_state().as_slice(),
             [11; 32],
             [21; 32],
         ));
 
-        let accepted_state = state_with_pending(ONE_ACTION_STATE, &pending);
+        let accepted_state = state_with_pending(requested_state().as_slice(), &pending);
 
         let plan = plan_commitment(CommitmentPlannerInput {
             contract_id: CONTRACT_ID,
@@ -372,12 +412,12 @@ mod tests {
 
         let white_pending = pending_from(created_plan(
             Player::White,
-            ONE_ACTION_STATE,
+            requested_state().as_slice(),
             white_secret,
             [21; 32],
         ));
 
-        let mut state = state_with_pending(ONE_ACTION_STATE, &white_pending);
+        let mut state = state_with_pending(requested_state().as_slice(), &white_pending);
         let ledger = decode_verified_ledger(&state).unwrap();
         let game_id = ledger.typed_actions()[0].game_id;
 
@@ -454,12 +494,12 @@ mod tests {
     fn accepted_commitment_without_pending_record_is_recovered() {
         let pending = pending_from(created_plan(
             Player::White,
-            ONE_ACTION_STATE,
+            requested_state().as_slice(),
             [11; 32],
             [21; 32],
         ));
 
-        let accepted_state = state_with_pending(ONE_ACTION_STATE, &pending);
+        let accepted_state = state_with_pending(requested_state().as_slice(), &pending);
 
         let plan = plan_commitment(CommitmentPlannerInput {
             contract_id: CONTRACT_ID,
@@ -479,7 +519,7 @@ mod tests {
     fn wrong_player_pending_action_is_rejected() {
         let pending = pending_from(created_plan(
             Player::White,
-            ONE_ACTION_STATE,
+            requested_state().as_slice(),
             [11; 32],
             [21; 32],
         ));
@@ -487,7 +527,7 @@ mod tests {
         let error = plan_commitment(CommitmentPlannerInput {
             contract_id: CONTRACT_ID,
             local_player: Player::Black,
-            authoritative_state: ONE_ACTION_STATE,
+            authoritative_state: requested_state().as_slice(),
             pending: Some(&pending),
             stored_secret: Some([11; 32]),
             new_secret: None,
@@ -502,7 +542,7 @@ mod tests {
     fn pending_commitment_without_secret_is_rejected() {
         let pending = pending_from(created_plan(
             Player::White,
-            ONE_ACTION_STATE,
+            requested_state().as_slice(),
             [11; 32],
             [21; 32],
         ));
@@ -510,7 +550,7 @@ mod tests {
         let error = plan_commitment(CommitmentPlannerInput {
             contract_id: CONTRACT_ID,
             local_player: Player::White,
-            authoritative_state: ONE_ACTION_STATE,
+            authoritative_state: requested_state().as_slice(),
             pending: Some(&pending),
             stored_secret: None,
             new_secret: None,
@@ -525,13 +565,13 @@ mod tests {
     fn stale_pending_sequence_fails_closed() {
         let pending = pending_from(created_plan(
             Player::White,
-            ONE_ACTION_STATE,
+            requested_state().as_slice(),
             [11; 32],
             [21; 32],
         ));
 
         let conflicting_state = append_action(
-            ONE_ACTION_STATE,
+            requested_state().as_slice(),
             [44; 32],
             GameActionPayload::Resign {
                 player: Player::White,
@@ -555,7 +595,7 @@ mod tests {
         let error = plan_commitment(CommitmentPlannerInput {
             contract_id: CONTRACT_ID,
             local_player: Player::White,
-            authoritative_state: ONE_ACTION_STATE,
+            authoritative_state: requested_state().as_slice(),
             pending: None,
             stored_secret: None,
             new_secret: None,

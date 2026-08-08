@@ -270,8 +270,17 @@ mod tests {
 
         let white = DiceCommit::new(&game_id, 0, Player::White, &[11; 32]);
 
-        let with_white = append_action(
+        let requested = append_action(
             ONE_ACTION_STATE,
+            [20; 32],
+            GameActionPayload::RequestRoll {
+                turn: 0,
+                player: Player::White,
+            },
+        );
+
+        let with_white = append_action(
+            &requested,
             [21; 32],
             GameActionPayload::CommitDice {
                 turn: 0,
@@ -362,7 +371,7 @@ mod tests {
 
         let record = pending.verify().unwrap();
 
-        assert_eq!(record.sequence, 3);
+        assert_eq!(record.sequence, 4);
 
         assert_eq!(
             record.payload,
@@ -400,7 +409,7 @@ mod tests {
 
         let record = black.verify().unwrap();
 
-        assert_eq!(record.sequence, 4);
+        assert_eq!(record.sequence, 5);
 
         assert_eq!(
             record.payload,
@@ -535,7 +544,7 @@ mod tests {
 
         let replay = replay_game(ledger.typed_actions()).unwrap();
 
-        assert_eq!(replay.next_sequence, 5);
+        assert_eq!(replay.next_sequence, 6);
         assert_eq!(replay.next_turn, 0);
         assert!(replay.state.dice.is_some());
         assert_eq!(replay.state.turn_phase, TurnPhase::Moving,);

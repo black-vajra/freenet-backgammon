@@ -24,6 +24,7 @@ pub struct ReplayedGame {
     pub state: GameState,
     pub next_sequence: u64,
     pub next_turn: u32,
+    pub roll_requested_by: Option<Player>,
     pub dice_round: DiceRoundState,
     pub status: ReplayStatus,
     pub latest_state_hash: StateHash,
@@ -64,6 +65,8 @@ pub enum ReplayError {
         sequence: u64,
     },
     RollAlreadyPending,
+    RollAlreadyRequested,
+    RollNotRequested,
     DiceCommitmentAlreadyPresent {
         player: Player,
     },
@@ -94,14 +97,17 @@ pub enum ReplayError {
 
 impl ReplayedGame {
     pub fn canonical_state(&self) -> CanonicalReplayState {
-        CanonicalReplayState::new(
+        let mut canonical = CanonicalReplayState::new(
             self.game_id,
             self.configuration.clone(),
             self.state.clone(),
             self.next_turn,
             self.dice_round.clone(),
             self.status.clone(),
-        )
+        );
+
+        canonical.roll_requested_by = self.roll_requested_by;
+        canonical
     }
 
     pub fn canonical_hash(&self) -> Result<StateHash, StateHashError> {
@@ -128,6 +134,34 @@ impl ReplayedGame {
         match &record.payload {
             GameActionPayload::CreateGame(_) => Err(ReplayError::DuplicateGameCreation),
 
+            GameActionPayload::RequestRoll { turn, player } => {
+                if *turn != self.next_turn {
+                    return Err(ReplayError::WrongTurnNumber {
+                        expected: self.next_turn,
+                        found: *turn,
+                    });
+                }
+
+                if *player != self.state.active_player {
+                    return Err(ReplayError::WrongPlayer {
+                        expected: self.state.active_player,
+                        found: *player,
+                    });
+                }
+
+                if self.state.turn_phase != TurnPhase::AwaitingRoll || self.state.dice.is_some() {
+                    return Err(ReplayError::RollAlreadyPending);
+                }
+
+                if self.roll_requested_by.is_some() || !self.dice_round.is_empty() {
+                    return Err(ReplayError::RollAlreadyRequested);
+                }
+
+                self.roll_requested_by = Some(*player);
+
+                Ok(())
+            }
+
             GameActionPayload::CommitDice {
                 turn,
                 player,
@@ -142,6 +176,10 @@ impl ReplayedGame {
 
                 if self.state.turn_phase != TurnPhase::AwaitingRoll || self.state.dice.is_some() {
                     return Err(ReplayError::RollAlreadyPending);
+                }
+
+                if self.roll_requested_by != Some(self.state.active_player) {
+                    return Err(ReplayError::RollNotRequested);
                 }
 
                 let slot = match player {
@@ -172,6 +210,10 @@ impl ReplayedGame {
 
                 if self.state.turn_phase != TurnPhase::AwaitingRoll || self.state.dice.is_some() {
                     return Err(ReplayError::RollAlreadyPending);
+                }
+
+                if self.roll_requested_by != Some(self.state.active_player) {
+                    return Err(ReplayError::RollNotRequested);
                 }
 
                 let (white_commitment, black_commitment) = match (
@@ -304,6 +346,7 @@ impl ReplayedGame {
                 })?;
 
                 self.dice_round.clear();
+                self.roll_requested_by = None;
 
                 self.next_turn = self
                     .next_turn
@@ -423,6 +466,7 @@ pub fn replay_game(records: &[GameActionRecord]) -> Result<ReplayedGame, ReplayE
         state: GameState::standard_start(),
         next_sequence: 1,
         next_turn: 0,
+        roll_requested_by: None,
         dice_round: DiceRoundState::default(),
         status: ReplayStatus::InProgress,
         latest_state_hash: first.resulting_state_hash,
@@ -549,6 +593,7 @@ mod tests {
             state: GameState::standard_start(),
             next_sequence: 1,
             next_turn: 0,
+            roll_requested_by: None,
             dice_round: DiceRoundState::default(),
             status: ReplayStatus::InProgress,
             latest_state_hash: GENESIS_STATE_HASH,
@@ -596,6 +641,16 @@ mod tests {
         let white_commit = DiceCommit::new(&game_id, turn, Player::White, &white_secret);
 
         let black_commit = DiceCommit::new(&game_id, turn, Player::Black, &black_secret);
+
+        let active_player = replay_game(records).unwrap().state.active_player;
+
+        append_valid(
+            records,
+            GameActionPayload::RequestRoll {
+                turn,
+                player: active_player,
+            },
+        );
 
         append_valid(
             records,
@@ -701,13 +756,102 @@ mod tests {
     }
 
     #[test]
+    fn active_player_can_request_roll() {
+        let create = create_record();
+
+        let request = build_next_game_action(
+            std::slice::from_ref(&create),
+            [44; 32],
+            GameActionPayload::RequestRoll {
+                turn: 0,
+                player: Player::White,
+            },
+        )
+        .unwrap();
+
+        let replay = replay_game(&[create, request]).unwrap();
+
+        assert_eq!(replay.roll_requested_by, Some(Player::White));
+        assert_eq!(replay.next_turn, 0);
+        assert_eq!(replay.state.turn_phase, TurnPhase::AwaitingRoll);
+        assert_eq!(replay.state.dice, None);
+    }
+
+    #[test]
+    fn inactive_player_cannot_request_roll() {
+        let create = create_record();
+
+        assert_eq!(
+            build_next_game_action(
+                std::slice::from_ref(&create),
+                [45; 32],
+                GameActionPayload::RequestRoll {
+                    turn: 0,
+                    player: Player::Black,
+                },
+            ),
+            Err(ReplayError::WrongPlayer {
+                expected: Player::White,
+                found: Player::Black,
+            })
+        );
+    }
+
+    #[test]
+    fn commitment_before_roll_request_is_rejected() {
+        let create = create_record();
+
+        let commitment = DiceCommit::new(&create.game_id, 0, Player::White, &[11; 32]);
+
+        assert_eq!(
+            build_next_game_action(
+                std::slice::from_ref(&create),
+                [46; 32],
+                GameActionPayload::CommitDice {
+                    turn: 0,
+                    player: Player::White,
+                    commitment: commitment.commitment,
+                },
+            ),
+            Err(ReplayError::RollNotRequested)
+        );
+    }
+
+    #[test]
+    fn duplicate_roll_request_is_rejected() {
+        let create = create_record();
+
+        let request = build_next_game_action(
+            std::slice::from_ref(&create),
+            [47; 32],
+            GameActionPayload::RequestRoll {
+                turn: 0,
+                player: Player::White,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            build_next_game_action(
+                &[create, request],
+                [48; 32],
+                GameActionPayload::RequestRoll {
+                    turn: 0,
+                    player: Player::White,
+                },
+            ),
+            Err(ReplayError::RollAlreadyRequested)
+        );
+    }
+
+    #[test]
     fn fair_dice_actions_derive_roll_deterministically() {
         let mut actions = vec![create_record()];
         let expected = append_fair_roll(&mut actions, 0);
 
         let replay = replay_game(&actions).unwrap();
 
-        assert_eq!(replay.next_sequence, 5);
+        assert_eq!(replay.next_sequence, 6);
         assert_eq!(replay.next_turn, 0);
         assert_eq!(replay.state.dice, Some(expected));
         assert_eq!(replay.state.turn_phase, TurnPhase::Moving);
@@ -721,6 +865,14 @@ mod tests {
         let secret = [11; 32];
 
         let commitment = DiceCommit::new(&game_id, 0, Player::White, &secret);
+
+        append_valid(
+            &mut actions,
+            GameActionPayload::RequestRoll {
+                turn: 0,
+                player: Player::White,
+            },
+        );
 
         append_valid(
             &mut actions,
@@ -762,6 +914,14 @@ mod tests {
 
         append_valid(
             &mut actions,
+            GameActionPayload::RequestRoll {
+                turn: 0,
+                player: Player::White,
+            },
+        );
+
+        append_valid(
+            &mut actions,
             GameActionPayload::CommitDice {
                 turn: 0,
                 player: Player::White,
@@ -795,7 +955,7 @@ mod tests {
         assert!(matches!(
             replay_game(&actions),
             Err(ReplayError::FairDice {
-                sequence: 3,
+                sequence: 4,
                 error: FairDiceError::CommitmentMismatch(Player::White),
             })
         ));
@@ -808,6 +968,14 @@ mod tests {
         let secret = [11; 32];
 
         let commitment = DiceCommit::new(&game_id, 0, Player::White, &secret);
+
+        append_valid(
+            &mut actions,
+            GameActionPayload::RequestRoll {
+                turn: 0,
+                player: Player::White,
+            },
+        );
 
         append_valid(
             &mut actions,
@@ -860,9 +1028,10 @@ mod tests {
 
         let replay = replay_game(&actions).unwrap();
 
-        assert_eq!(replay.next_sequence, 6);
+        assert_eq!(replay.next_sequence, 7);
         assert_eq!(replay.next_turn, 1);
         assert!(replay.dice_round.is_empty());
+        assert_eq!(replay.roll_requested_by, None);
         assert_eq!(replay.state.dice, None);
         assert_eq!(replay.state.turn_phase, TurnPhase::AwaitingRoll);
     }
@@ -876,6 +1045,7 @@ mod tests {
         assert_eq!(replay.next_sequence, 1);
         assert_eq!(replay.next_turn, 0);
         assert_eq!(replay.status, ReplayStatus::InProgress);
+        assert_eq!(replay.roll_requested_by, None);
         assert_eq!(replay.state, GameState::standard_start());
         assert_eq!(replay.latest_state_hash, create.resulting_state_hash);
     }
@@ -899,7 +1069,7 @@ mod tests {
         let second = replay_game(&actions).unwrap();
 
         assert_eq!(first, second);
-        assert_eq!(first.next_sequence, 6);
+        assert_eq!(first.next_sequence, 7);
         assert_eq!(first.next_turn, 1);
         assert_eq!(first.state.active_player, Player::Black);
         assert_eq!(first.state.turn_phase, TurnPhase::AwaitingRoll);

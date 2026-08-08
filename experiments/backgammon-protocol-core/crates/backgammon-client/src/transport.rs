@@ -136,7 +136,7 @@ pub const DEFAULT_NODE_URL: &str =
     "ws://127.0.0.1:7509/v1/contract/command?encodingProtocol=native";
 
 #[cfg(target_arch = "wasm32")]
-pub const TEST_CONTRACT_ID: &str = "5fyAKtPnwDEPdT3Ey9qryJTRZ7E6ztofRPxDHRtbL1S5";
+pub const TEST_CONTRACT_ID: &str = "CE2FnE1vkobR1LssLzX3FBB1EgwXEvtPgUtQ4QdZsA9S";
 
 #[cfg(target_arch = "wasm32")]
 pub fn connect(
@@ -270,25 +270,43 @@ pub fn classify_response(
                 return None;
             }
 
-            let status = match update {
-                UpdateData::State(state) => retrieved_status(state.as_ref()),
+            let (status, authoritative_state) = match update {
+                UpdateData::State(state) => {
+                    let bytes = state.as_ref();
+
+                    (retrieved_status(bytes), Some(bytes.to_vec()))
+                }
+
                 UpdateData::Delta(delta) => {
-                    if delta.as_ref().is_empty() {
+                    let status = if delta.as_ref().is_empty() {
                         ContractProbeStatus::Failed("Received an empty ledger delta.".to_owned())
                     } else {
                         ContractProbeStatus::VerifyingUpdate
-                    }
+                    };
+
+                    (status, None)
                 }
-                _ => ContractProbeStatus::Failed(
-                    "Received an unsupported contract update type.".to_owned(),
+
+                _ => (
+                    ContractProbeStatus::Failed(
+                        "Received an unsupported contract update type.".to_owned(),
+                    ),
+                    None,
                 ),
             };
+
+            /*
+             * A full state notification is authoritative input, not merely a
+             * display-status update. Preserve its key and bytes so the normal
+             * verification and action-planning path can process it.
+             */
+            let contract_key = authoritative_state.as_ref().map(|_| key);
 
             Some(ClassifiedResponse {
                 contract_status: Some(status),
                 subscription_status: Some(SubscriptionStatus::Active),
-                contract_key: None,
-                authoritative_state: None,
+                contract_key,
+                authoritative_state,
                 should_submit_first_delta: false,
             })
         }
@@ -391,8 +409,8 @@ mod tests {
     #[test]
     fn pinned_first_action_fixtures_match_expected_wire_bytes() {
         assert_eq!(EMPTY_LEDGER_CBOR.len(), 10);
-        assert_eq!(FIRST_CREATE_DELTA_CBOR.len(), 516);
-        assert_eq!(EXPECTED_ONE_ACTION_STATE_CBOR.len(), 516);
+        assert_eq!(FIRST_CREATE_DELTA_CBOR.len(), 514);
+        assert_eq!(EXPECTED_ONE_ACTION_STATE_CBOR.len(), 514);
         assert_eq!(FIRST_CREATE_DELTA_CBOR, EXPECTED_ONE_ACTION_STATE_CBOR);
     }
 }
