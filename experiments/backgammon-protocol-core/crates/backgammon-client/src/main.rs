@@ -1263,9 +1263,10 @@ mod browser {
          * checker movement. The protocol still independently validates the
          * completed sequence before any network submission.
          */
-        let controls_authoritative_turn = session_active
-            && no_pending_action
-            && selected_local_role == Some(controller.state().active_player);
+        let local_role_has_turn =
+            session_active && selected_local_role == Some(controller.state().active_player);
+
+        let controls_authoritative_turn = local_role_has_turn && no_pending_action;
 
         /*
          * Dice are produced by the commit-and-reveal action loop. The former
@@ -1289,7 +1290,8 @@ mod browser {
             && latest_contract_key.borrow().is_some()
             && authoritative_roll_ready;
 
-        let can_pass = controls_authoritative_turn && controller.must_pass();
+        let authoritative_must_pass = session_active && controller.must_pass();
+        let can_pass = controls_authoritative_turn && authoritative_must_pass;
 
         /*
          * Resignation is not networked yet. Disable the local-only mutation so
@@ -1303,7 +1305,7 @@ mod browser {
             "Table left".to_owned()
         } else if outcome.is_some() {
             "Game complete".to_owned()
-        } else if can_pass {
+        } else if authoritative_must_pass {
             format!("{active_name} must pass")
         } else {
             match board.turn_phase {
@@ -1312,6 +1314,56 @@ mod browser {
                 }
                 TurnPhase::Moving => {
                     format!("{active_name} is moving")
+                }
+            }
+        };
+
+        let game_state_text = if left_table {
+            "Table left".to_owned()
+        } else if outcome.is_some() {
+            "Game complete".to_owned()
+        } else if authoritative_must_pass {
+            format!("Awaiting {active_name} pass")
+        } else {
+            match board.turn_phase {
+                TurnPhase::AwaitingRoll => format!("Awaiting {active_name} roll"),
+                TurnPhase::Moving => format!("{active_name} moving"),
+            }
+        };
+
+        let control_note = if left_table {
+            "The local table session has ended.".to_owned()
+        } else if outcome.is_some() {
+            "Begin a new game to play again.".to_owned()
+        } else if authoritative_must_pass {
+            if can_pass {
+                "The roll has no legal move. Pass the turn when ready.".to_owned()
+            } else if local_role_has_turn && !no_pending_action {
+                "Waiting for Freenet to confirm the pending action.".to_owned()
+            } else {
+                format!("Waiting for {active_name} to pass the turn.")
+            }
+        } else {
+            match board.turn_phase {
+                TurnPhase::AwaitingRoll => {
+                    if can_roll {
+                        "Roll to begin the turn.".to_owned()
+                    } else if local_role_has_turn && !no_pending_action {
+                        "Waiting for Freenet to confirm the pending action.".to_owned()
+                    } else {
+                        format!("Waiting for {active_name} to roll.")
+                    }
+                }
+                TurnPhase::Moving => {
+                    if local_role_has_turn {
+                        if no_pending_action {
+                            "Complete the turn when ready.".to_owned()
+                        } else {
+                            "Waiting for Freenet to confirm the pending action.".to_owned()
+                        }
+                    } else {
+                        format!("Waiting for {active_name} to complete the turn.")
+                    }
                 }
             }
         };
@@ -2539,6 +2591,7 @@ mod browser {
                             can_resign={can_resign}
                             can_leave={!left_table}
                             can_reconnect={connection_status.can_reconnect()}
+                            status_note={control_note}
                             on_roll={on_roll}
                             on_pass={on_pass}
                             on_resign={on_resign}
@@ -2699,21 +2752,7 @@ mod browser {
 
                                 <div>
                                     <dt>{ "Game state" }</dt>
-                                    <dd>
-                                        {
-                                            if left_table {
-                                                "Table left"
-                                            } else if outcome.is_some() {
-                                                "Game complete"
-                                            } else if can_pass {
-                                                "Awaiting pass"
-                                            } else if can_roll {
-                                                "Ready to roll"
-                                            } else {
-                                                "Turn in progress"
-                                            }
-                                        }
-                                    </dd>
+                                    <dd>{ game_state_text }</dd>
                                 </div>
                             </dl>
                         </section>

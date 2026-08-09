@@ -7,6 +7,7 @@ pub struct GameControlsProps {
     pub can_resign: bool,
     pub can_leave: bool,
     pub can_reconnect: bool,
+    pub status_note: String,
     pub on_roll: Callback<MouseEvent>,
     pub on_pass: Callback<MouseEvent>,
     pub on_resign: Callback<MouseEvent>,
@@ -75,17 +76,7 @@ pub fn game_controls(props: &GameControlsProps) -> Html {
             </div>
 
             <p class="panel-note">
-                {
-                    if props.can_pass {
-                        "The roll has no legal move. Pass the turn when ready."
-                    } else if props.can_roll {
-                        "Roll to begin the turn."
-                    } else if props.can_resign {
-                        "Complete the turn, resign, or begin a new game."
-                    } else {
-                        "Begin a new game to play again."
-                    }
-                }
+                { props.status_note.clone() }
             </p>
 
             <p class="control-footnote">
