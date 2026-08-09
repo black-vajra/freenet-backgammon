@@ -1301,6 +1301,20 @@ mod browser {
 
         let active_name = player_name(board.active_player);
 
+        let white_player_name = match selected_local_role {
+            Some(Player::White) => "Player One (You)",
+            Some(Player::Black) => "Player One (Opponent)",
+            None => "Player One",
+        }
+        .to_owned();
+
+        let black_player_name = match selected_local_role {
+            Some(Player::Black) => "Player Two (You)",
+            Some(Player::White) => "Player Two (Opponent)",
+            None => "Player Two",
+        }
+        .to_owned();
+
         let turn_text = if left_table {
             "Table left".to_owned()
         } else if outcome.is_some() {
@@ -2541,7 +2555,7 @@ mod browser {
                     <aside class="left-rail">
                         <PlayerPanel
                             player={Player::Black}
-                            name={"Player Two".to_owned()}
+                            name={black_player_name}
                             score={0}
                             active={
                                 session_active
@@ -2553,7 +2567,7 @@ mod browser {
 
                         <PlayerPanel
                             player={Player::White}
-                            name={"Player One".to_owned()}
+                            name={white_player_name}
                             score={0}
                             active={
                                 session_active
