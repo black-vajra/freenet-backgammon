@@ -26,7 +26,7 @@ mod browser {
     use crate::components::dice::DiceDisplay;
     use crate::components::history::MoveHistory;
     use crate::components::player_panel::PlayerPanel;
-    use crate::controller::{LocalGameController, LocalGameOutcome};
+    use crate::controller::{LocalGameController, LocalGameOutcome, LocalTurnRecord};
     use crate::ledger_codec::{decode_verified_ledger, decode_verified_replay};
     use crate::local_role_store::{load_local_role, store_local_role};
     use crate::pending_action_store::{
@@ -683,7 +683,9 @@ mod browser {
         }
     }
 
-    fn authoritative_game_state(state_bytes: &[u8]) -> Result<Option<GameState>, String> {
+    fn authoritative_game_projection(
+        state_bytes: &[u8],
+    ) -> Result<Option<(GameState, Vec<LocalTurnRecord>)>, String> {
         let ledger = decode_verified_ledger(state_bytes)?;
 
         /*
@@ -696,7 +698,17 @@ mod browser {
 
         let replay = decode_verified_replay(state_bytes)?;
 
-        Ok(Some(replay.state))
+        let history = replay
+            .completed_turns
+            .into_iter()
+            .map(|turn| LocalTurnRecord {
+                player: turn.player,
+                dice: turn.dice,
+                moves: turn.sequence.moves,
+            })
+            .collect();
+
+        Ok(Some((replay.state, history)))
     }
 
     #[function_component(App)]
@@ -883,7 +895,7 @@ mod browser {
                                 (contract_key, authoritative_state)
                             {
                                 let authoritative_state =
-                                    match authoritative_game_state(&state_bytes) {
+                                    match authoritative_game_projection(&state_bytes) {
                                         Ok(state) => state,
 
                                         Err(error) => {
@@ -911,11 +923,16 @@ mod browser {
                                 *state_for_response.borrow_mut() = Some(state_bytes.clone());
 
                                 if state_changed {
-                                    if let Some(authoritative_state) = authoritative_state {
+                                    if let Some((authoritative_state, authoritative_history)) =
+                                        authoritative_state
+                                    {
                                         let mut next = (*controller_for_response).clone();
 
-                                        if let Err(error) =
-                                            next.sync_authoritative_state(authoritative_state)
+                                        if let Err(error) = next
+                                            .sync_authoritative_state_and_history(
+                                                authoritative_state,
+                                                authoritative_history,
+                                            )
                                         {
                                             contract_for_response.set(
                                                 ContractProbeStatus::Failed(
@@ -2017,7 +2034,7 @@ mod browser {
                                 (contract_key, authoritative_state)
                             {
                                 let authoritative_state =
-                                    match authoritative_game_state(&state_bytes) {
+                                    match authoritative_game_projection(&state_bytes) {
                                         Ok(state) => state,
 
                                         Err(error) => {
@@ -2045,11 +2062,16 @@ mod browser {
                                 *state_for_response.borrow_mut() = Some(state_bytes.clone());
 
                                 if state_changed {
-                                    if let Some(authoritative_state) = authoritative_state {
+                                    if let Some((authoritative_state, authoritative_history)) =
+                                        authoritative_state
+                                    {
                                         let mut next = (*controller_for_response).clone();
 
-                                        if let Err(error) =
-                                            next.sync_authoritative_state(authoritative_state)
+                                        if let Err(error) = next
+                                            .sync_authoritative_state_and_history(
+                                                authoritative_state,
+                                                authoritative_history,
+                                            )
                                         {
                                             contract_for_response.set(
                                                 ContractProbeStatus::Failed(

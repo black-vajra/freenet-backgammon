@@ -133,6 +133,20 @@ impl LocalGameController {
         Ok(())
     }
 
+    /// Replaces local committed state and move history with independently
+    /// verified authoritative projections.
+    ///
+    /// The caller must supply both values from the same verified protocol replay.
+    pub fn sync_authoritative_state_and_history(
+        &mut self,
+        state: GameState,
+        history: Vec<LocalTurnRecord>,
+    ) -> Result<(), ControllerError> {
+        self.sync_authoritative_state(state)?;
+        self.history = history;
+        Ok(())
+    }
+
     pub fn state(&self) -> &GameState {
         &self.state
     }
@@ -616,6 +630,38 @@ mod tests {
                 return sequence;
             }
         }
+    }
+
+    #[test]
+    fn authoritative_state_and_history_replaces_local_history() {
+        let mut controller = LocalGameController::new();
+
+        controller.history = vec![LocalTurnRecord {
+            player: Player::White,
+            dice: Dice {
+                first: 1,
+                second: 2,
+            },
+            moves: Vec::new(),
+        }];
+
+        let authoritative_history = vec![LocalTurnRecord {
+            player: Player::Black,
+            dice: Dice {
+                first: 6,
+                second: 6,
+            },
+            moves: Vec::new(),
+        }];
+
+        controller
+            .sync_authoritative_state_and_history(
+                GameState::standard_start(),
+                authoritative_history.clone(),
+            )
+            .unwrap();
+
+        assert_eq!(controller.history(), authoritative_history.as_slice());
     }
 
     #[test]
