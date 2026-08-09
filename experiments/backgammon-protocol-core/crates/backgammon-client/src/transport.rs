@@ -136,7 +136,7 @@ pub const DEFAULT_NODE_URL: &str =
     "ws://127.0.0.1:7509/v1/contract/command?encodingProtocol=native";
 
 #[cfg(target_arch = "wasm32")]
-pub const TEST_CONTRACT_ID: &str = "CE2FnE1vkobR1LssLzX3FBB1EgwXEvtPgUtQ4QdZsA9S";
+pub const TEST_CONTRACT_ID: &str = "2sE5TqGanJWxudkcbNDMnuAhyjD1voVFiy5Nj6Fm8WUA";
 
 #[cfg(target_arch = "wasm32")]
 pub fn connect(
