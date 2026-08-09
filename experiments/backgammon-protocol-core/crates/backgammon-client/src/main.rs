@@ -953,7 +953,10 @@ mod browser {
                                     };
 
                                 match plan {
-                                    BrowserNetworkActionPlan::NoAction => {}
+                                    BrowserNetworkActionPlan::NoAction => {
+                                        secret_status_for_response
+                                            .set("No dice-secret recovery needed".to_owned());
+                                    }
 
                                     BrowserNetworkActionPlan::Accepted { secret, kind } => {
                                         *secret_for_response.borrow_mut() = Some(secret);
@@ -2084,7 +2087,10 @@ mod browser {
                                     };
 
                                 match plan {
-                                    BrowserNetworkActionPlan::NoAction => {}
+                                    BrowserNetworkActionPlan::NoAction => {
+                                        secret_status_for_response
+                                            .set("No dice-secret recovery needed".to_owned());
+                                    }
 
                                     BrowserNetworkActionPlan::Accepted { secret, kind } => {
                                         *secret_for_response.borrow_mut() = Some(secret);
