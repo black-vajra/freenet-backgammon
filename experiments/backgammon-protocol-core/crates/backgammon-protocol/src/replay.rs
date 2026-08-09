@@ -18,12 +18,21 @@ pub enum ReplayStatus {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplayedTurn {
+    pub turn: u32,
+    pub player: Player,
+    pub dice: backgammon_core::Dice,
+    pub sequence: backgammon_core::TurnSequence,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReplayedGame {
     pub game_id: GameId,
     pub configuration: GameConfiguration,
     pub state: GameState,
     pub next_sequence: u64,
     pub next_turn: u32,
+    pub completed_turns: Vec<ReplayedTurn>,
     pub roll_requested_by: Option<Player>,
     pub dice_round: DiceRoundState,
     pub status: ReplayStatus,
@@ -338,12 +347,21 @@ impl ReplayedGame {
                     return Err(ReplayError::RollExpected);
                 }
 
+                let dice = self.state.dice.ok_or(ReplayError::RollExpected)?;
+
                 self.state.apply_turn_sequence(sequence).map_err(|error| {
                     ReplayError::InvalidTurn {
                         sequence: record.sequence,
                         error,
                     }
                 })?;
+
+                self.completed_turns.push(ReplayedTurn {
+                    turn: *turn,
+                    player: *player,
+                    dice,
+                    sequence: sequence.clone(),
+                });
 
                 self.dice_round.clear();
                 self.roll_requested_by = None;
@@ -466,6 +484,7 @@ pub fn replay_game(records: &[GameActionRecord]) -> Result<ReplayedGame, ReplayE
         state: GameState::standard_start(),
         next_sequence: 1,
         next_turn: 0,
+        completed_turns: Vec::new(),
         roll_requested_by: None,
         dice_round: DiceRoundState::default(),
         status: ReplayStatus::InProgress,
@@ -593,6 +612,7 @@ mod tests {
             state: GameState::standard_start(),
             next_sequence: 1,
             next_turn: 0,
+            completed_turns: Vec::new(),
             roll_requested_by: None,
             dice_round: DiceRoundState::default(),
             status: ReplayStatus::InProgress,
@@ -1034,6 +1054,56 @@ mod tests {
         assert_eq!(replay.roll_requested_by, None);
         assert_eq!(replay.state.dice, None);
         assert_eq!(replay.state.turn_phase, TurnPhase::AwaitingRoll);
+    }
+
+    #[test]
+    fn completed_turn_history_is_derived_from_verified_replay() {
+        let mut actions = vec![create_record()];
+        let dice = append_fair_roll(&mut actions, 0);
+        let current = replay_game(&actions).unwrap();
+        let sequence = current.state.legal_turn_sequences().unwrap()[0].clone();
+
+        append_valid(
+            &mut actions,
+            GameActionPayload::PlayTurn {
+                turn: 0,
+                player: Player::White,
+                sequence: sequence.clone(),
+            },
+        );
+
+        let replay = replay_game(&actions).unwrap();
+
+        assert_eq!(replay.completed_turns.len(), 1);
+        assert_eq!(replay.completed_turns[0].turn, 0);
+        assert_eq!(replay.completed_turns[0].player, Player::White);
+        assert_eq!(replay.completed_turns[0].dice, dice);
+        assert_eq!(replay.completed_turns[0].sequence, sequence);
+    }
+
+    #[test]
+    fn completed_turn_history_does_not_change_canonical_hash() {
+        let mut actions = vec![create_record()];
+        append_fair_roll(&mut actions, 0);
+        let current = replay_game(&actions).unwrap();
+        let sequence = current.state.legal_turn_sequences().unwrap()[0].clone();
+
+        append_valid(
+            &mut actions,
+            GameActionPayload::PlayTurn {
+                turn: 0,
+                player: Player::White,
+                sequence,
+            },
+        );
+
+        let replay = replay_game(&actions).unwrap();
+        let expected = replay.canonical_hash().unwrap();
+        let mut metadata_changed = replay.clone();
+
+        metadata_changed.completed_turns.clear();
+
+        assert_eq!(metadata_changed.canonical_hash().unwrap(), expected);
     }
 
     #[test]
