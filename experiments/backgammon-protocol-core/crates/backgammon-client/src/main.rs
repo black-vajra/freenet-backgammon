@@ -49,6 +49,14 @@ mod browser {
         SubscriptionStatus, TEST_CONTRACT_ID,
     };
 
+    fn format_player_id(player_id: &[u8; 32]) -> String {
+        player_id
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
     fn secure_random_32(purpose: &str) -> Result<[u8; 32], String> {
         let window =
             web_sys::window().ok_or_else(|| "Browser window is unavailable.".to_owned())?;
@@ -758,6 +766,11 @@ mod browser {
          * the participant IDs recorded in the verified authoritative game.
          * This does not yet control the temporary local role selector.
          */
+        let local_player_id_text = match *local_player_id {
+            Some(player_id) => format_player_id(&player_id),
+            None => "Identity unavailable".to_owned(),
+        };
+
         let authoritative_identity_role_text = if let Some(player_id) = *local_player_id {
             let state = latest_authoritative_state.borrow();
 
@@ -2791,6 +2804,12 @@ mod browser {
                                 <dt>{ "Identity role" }</dt>
                                 <dd>{ authoritative_identity_role_text }</dd>
                             </div>
+
+
+                                <div>
+                                    <dt>{ "Player ID" }</dt>
+                                    <dd>{ local_player_id_text }</dd>
+                                </div>
 
                                 <div>
                                     <dt>{ "Freenet" }</dt>
