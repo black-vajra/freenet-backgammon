@@ -29,7 +29,9 @@ mod browser {
     use crate::components::player_panel::PlayerPanel;
     use crate::controller::{LocalGameController, LocalGameOutcome, LocalTurnRecord};
     use crate::ledger_codec::{decode_verified_ledger, decode_verified_replay};
-    use crate::local_identity_store::{load_or_create_local_identity, player_id_for_signing_key};
+    use crate::local_identity_store::{
+        load_or_create_local_identity, player_id_for_signing_key, role_for_player_id,
+    };
     use crate::local_role_store::{load_local_role, store_local_role};
     use crate::pending_action_store::{
         load_pending_action, remove_pending_action, store_pending_action,
@@ -749,6 +751,29 @@ mod browser {
         let selected_local_role = match &*local_role {
             Ok(role) => *role,
             Err(_) => None,
+        };
+
+        /*
+         * Read-only comparison between this browser's persistent identity and
+         * the participant IDs recorded in the verified authoritative game.
+         * This does not yet control the temporary local role selector.
+         */
+        let authoritative_identity_role_text = if let Some(player_id) = *local_player_id {
+            let state = latest_authoritative_state.borrow();
+
+            match state.as_ref() {
+                None => "Waiting for game state".to_owned(),
+                Some(state_bytes) => match decode_verified_replay(state_bytes) {
+                    Ok(replay) => match role_for_player_id(&replay.configuration, &player_id) {
+                        Some(Player::White) => "White".to_owned(),
+                        Some(Player::Black) => "Black".to_owned(),
+                        None => "Not a participant".to_owned(),
+                    },
+                    Err(error) => format!("Identity-role check failed: {error}"),
+                },
+            }
+        } else {
+            "Identity unavailable".to_owned()
         };
 
         {
@@ -2761,6 +2786,11 @@ mod browser {
                                         }
                                     </dd>
                                 </div>
+
+                            <div>
+                                <dt>{ "Identity role" }</dt>
+                                <dd>{ authoritative_identity_role_text }</dd>
+                            </div>
 
                                 <div>
                                     <dt>{ "Freenet" }</dt>
