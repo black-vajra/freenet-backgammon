@@ -29,6 +29,7 @@ mod browser {
     use crate::components::player_panel::PlayerPanel;
     use crate::controller::{LocalGameController, LocalGameOutcome, LocalTurnRecord};
     use crate::ledger_codec::{decode_verified_ledger, decode_verified_replay};
+    use crate::local_identity_store::{load_or_create_local_identity, player_id_for_signing_key};
     use crate::local_role_store::{load_local_role, store_local_role};
     use crate::pending_action_store::{
         load_pending_action, remove_pending_action, store_pending_action,
@@ -726,6 +727,10 @@ mod browser {
         let local_dice_secret = use_mut_ref(|| None::<DiceSecret>);
         let dice_secret_status = use_state(|| "Checking browser storage".to_owned());
 
+        /* Passive cryptographic identity; not yet used for role selection. */
+        let local_identity_status = use_state(|| "Checking local identity".to_owned());
+        let local_player_id = use_state(|| None::<[u8; 32]>);
+
         /*
          * User-triggered PlayTurn submission needs the exact full ContractKey
          * and verified parent bytes from the latest GetResponse. Subscription
@@ -745,6 +750,28 @@ mod browser {
             Ok(role) => *role,
             Err(_) => None,
         };
+
+        {
+            let identity_status = local_identity_status.clone();
+            let player_id = local_player_id.clone();
+
+            use_effect_with((), move |_| {
+                match secure_random_32("local identity seed")
+                    .and_then(load_or_create_local_identity)
+                {
+                    Ok(identity) => {
+                        player_id.set(Some(player_id_for_signing_key(&identity)));
+                        identity_status.set("Local identity ready".to_owned());
+                    }
+                    Err(error) => {
+                        player_id.set(None);
+                        identity_status.set(format!("Local identity error: {error}"));
+                    }
+                }
+
+                || {}
+            });
+        }
 
         {
             let connection_status = connection_status.clone();
