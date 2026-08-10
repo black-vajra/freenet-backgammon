@@ -10,6 +10,7 @@ backgammon-contract = { path = "../backgammon-contract", default-features = fals
 backgammon-core = { path = "../backgammon-core" }
 backgammon-protocol = { path = "../backgammon-protocol" }
 ciborium.workspace = true
+ed25519-dalek = { version = "3.0.0", default-features = false, features = ["zeroize"] }
 serde.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
