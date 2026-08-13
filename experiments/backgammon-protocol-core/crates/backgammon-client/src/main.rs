@@ -787,6 +787,7 @@ mod browser {
                 Some(None) => "Not a participant".to_owned(),
             },
         };
+        let authoritative_player_role = (*authoritative_local_role).flatten();
 
         {
             let identity_status = local_identity_status.clone();
@@ -849,9 +850,7 @@ mod browser {
             let authoritative_local_role_for_effect = authoritative_local_role.clone();
             let controller_for_effect = controller.clone();
 
-            use_effect_with(selected_local_role, move |selected_role| {
-                let selected_role = *selected_role;
-
+            use_effect_with((), move |_| {
                 /*
                  * Replacing the role dependency replaces the active transport
                  * closure. Any durable pending action remains in storage.
@@ -861,6 +860,7 @@ mod browser {
                 *local_dice_secret.borrow_mut() = None;
                 latest_contract_key.borrow_mut().take();
                 latest_authoritative_state.borrow_mut().take();
+                authoritative_local_role_for_effect.set(None);
 
                 let status_for_callback = connection_status.clone();
                 let contract_for_response = contract_status.clone();
@@ -1024,6 +1024,7 @@ mod browser {
                                     }
                                 };
 
+                                let authoritative_player = resolved_role.flatten();
                                 authoritative_role_for_response.set(resolved_role);
 
                                 if state_changed {
@@ -1053,9 +1054,9 @@ mod browser {
                                     }
                                 }
 
-                                let Some(local_player) = selected_role else {
+                                let Some(local_player) = authoritative_player else {
                                     secret_status_for_response
-                                        .set("Select White or Black to join the game".to_owned());
+                                        .set("This browser identity is not an authoritative game participant".to_owned());
                                     return;
                                 };
 
@@ -1368,7 +1369,7 @@ mod browser {
          * completed sequence before any network submission.
          */
         let local_role_has_turn =
-            session_active && selected_local_role == Some(controller.state().active_player);
+            session_active && authoritative_player_role == Some(controller.state().active_player);
 
         let controls_authoritative_turn = local_role_has_turn && no_pending_action;
 
@@ -1381,7 +1382,7 @@ mod browser {
             .as_ref()
             .and_then(|state_bytes| decode_verified_replay(state_bytes).ok())
             .map(|replay| {
-                selected_local_role == Some(replay.state.active_player)
+                authoritative_player_role == Some(replay.state.active_player)
                     && replay.state.turn_phase == TurnPhase::AwaitingRoll
                     && replay.state.dice.is_none()
                     && replay.roll_requested_by.is_none()
@@ -1405,14 +1406,14 @@ mod browser {
 
         let active_name = player_name(board.active_player);
 
-        let white_player_name = match selected_local_role {
+        let white_player_name = match authoritative_player_role {
             Some(Player::White) => "Player One (You)",
             Some(Player::Black) => "Player One (Opponent)",
             None => "Player One",
         }
         .to_owned();
 
-        let black_player_name = match selected_local_role {
+        let black_player_name = match authoritative_player_role {
             Some(Player::Black) => "Player Two (You)",
             Some(Player::White) => "Player Two (Opponent)",
             None => "Player Two",
@@ -1635,7 +1636,7 @@ mod browser {
             let latest_contract_key = latest_contract_key.clone();
             let latest_authoritative_state = latest_authoritative_state.clone();
             let submit_pending_secretless_action = submit_pending_secretless_action.clone();
-            let selected_local_role = selected_local_role;
+            let authoritative_player_role = authoritative_player_role;
 
             Callback::from(move |_| {
                 let prepared = (|| -> Result<
@@ -1645,8 +1646,8 @@ mod browser {
                     ),
                     String,
                 > {
-                    let local_player = selected_local_role
-                        .ok_or_else(|| "Select the local player role before rolling.".to_owned())?;
+                    let local_player = authoritative_player_role
+                        .ok_or_else(|| "This browser identity does not have an authoritative player role.".to_owned())?;
 
                     let key = latest_contract_key
                         .borrow()
@@ -1702,7 +1703,7 @@ mod browser {
             let latest_contract_key = latest_contract_key.clone();
             let latest_authoritative_state = latest_authoritative_state.clone();
             let submit_pending_secretless_action = submit_pending_secretless_action.clone();
-            let selected_local_role = selected_local_role;
+            let authoritative_player_role = authoritative_player_role;
 
             Callback::from(move |_| {
                 let mut next = (*controller).clone();
@@ -1723,8 +1724,8 @@ mod browser {
                         })?;
 
                     let local_player =
-                        selected_local_role.ok_or_else(|| {
-                            "Select the local player role before passing."
+                        authoritative_player_role.ok_or_else(|| {
+                            "This browser identity does not have an authoritative player role."
                                 .to_owned()
                         })?;
 
@@ -1814,7 +1815,7 @@ mod browser {
             let latest_contract_key = latest_contract_key.clone();
             let latest_authoritative_state = latest_authoritative_state.clone();
             let submit_pending_secretless_action = submit_pending_secretless_action.clone();
-            let selected_local_role = selected_local_role;
+            let authoritative_player_role = authoritative_player_role;
 
             Callback::from(move |destination: MoveTarget| {
                 let mut next = (*controller).clone();
@@ -1838,8 +1839,8 @@ mod browser {
                             String,
                         > {
                             let local_player =
-                                selected_local_role.ok_or_else(|| {
-                                    "Select the local player role before moving."
+                                authoritative_player_role.ok_or_else(|| {
+                                    "This browser identity does not have an authoritative player role."
                                         .to_owned()
                                 })?;
 
@@ -2052,7 +2053,6 @@ mod browser {
         );
 
         let on_reconnect = {
-            let selected_local_role = selected_local_role;
             let connection_status = connection_status.clone();
             let contract_status = contract_status.clone();
             let subscription_status = subscription_status.clone();
@@ -2077,6 +2077,7 @@ mod browser {
                 *local_network_action_submitted.borrow_mut() = None;
                 latest_contract_key.borrow_mut().take();
                 latest_authoritative_state.borrow_mut().take();
+                authoritative_local_role_for_reconnect.set(None);
 
                 contract_status.set(ContractProbeStatus::WaitingForConnection);
                 subscription_status.set(SubscriptionStatus::Pending);
@@ -2245,6 +2246,7 @@ mod browser {
                                     }
                                 };
 
+                                let authoritative_player = resolved_role.flatten();
                                 authoritative_role_for_response.set(resolved_role);
 
                                 if state_changed {
@@ -2274,9 +2276,9 @@ mod browser {
                                     }
                                 }
 
-                                let Some(local_player) = selected_local_role else {
+                                let Some(local_player) = authoritative_player else {
                                     secret_status_for_response
-                                        .set("Select White or Black to join the game".to_owned());
+                                        .set("This browser identity is not an authoritative game participant".to_owned());
                                     return;
                                 };
 
