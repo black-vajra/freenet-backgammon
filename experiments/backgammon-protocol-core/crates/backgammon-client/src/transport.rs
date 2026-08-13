@@ -136,7 +136,7 @@ pub const DEFAULT_NODE_URL: &str =
     "ws://127.0.0.1:7509/v1/contract/command?encodingProtocol=native";
 
 #[cfg(target_arch = "wasm32")]
-pub const TEST_CONTRACT_ID: &str = "2sE5TqGanJWxudkcbNDMnuAhyjD1voVFiy5Nj6Fm8WUA";
+pub const TEST_CONTRACT_ID: &str = "5sKiBChkQRodbUiQLasQKQPEPynfTK9Ea49eZt3mm42U";
 
 #[cfg(target_arch = "wasm32")]
 pub fn connect(
@@ -409,8 +409,8 @@ mod tests {
     #[test]
     fn pinned_first_action_fixtures_match_expected_wire_bytes() {
         assert_eq!(EMPTY_LEDGER_CBOR.len(), 10);
-        assert_eq!(FIRST_CREATE_DELTA_CBOR.len(), 514);
-        assert_eq!(EXPECTED_ONE_ACTION_STATE_CBOR.len(), 514);
+        assert_eq!(FIRST_CREATE_DELTA_CBOR.len(), 754);
+        assert_eq!(EXPECTED_ONE_ACTION_STATE_CBOR.len(), 754);
         assert_eq!(FIRST_CREATE_DELTA_CBOR, EXPECTED_ONE_ACTION_STATE_CBOR);
     }
 }
