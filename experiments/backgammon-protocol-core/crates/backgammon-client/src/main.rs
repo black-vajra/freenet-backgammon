@@ -742,6 +742,13 @@ mod browser {
         let local_player_id = use_state(|| None::<[u8; 32]>);
 
         /*
+         * Role derived from this persistent PlayerId and a verified
+         * authoritative GameConfiguration. None means no verified role
+         * decision is available yet; Some(None) means not a participant.
+         */
+        let authoritative_local_role = use_state(|| None::<Option<Player>>);
+
+        /*
          * User-triggered PlayTurn submission needs the exact full ContractKey
          * and verified parent bytes from the latest GetResponse. Subscription
          * notifications alone do not provide both values.
@@ -771,22 +778,14 @@ mod browser {
             None => "Identity unavailable".to_owned(),
         };
 
-        let authoritative_identity_role_text = if let Some(player_id) = *local_player_id {
-            let state = latest_authoritative_state.borrow();
-
-            match state.as_ref() {
+        let authoritative_identity_role_text = match *local_player_id {
+            None => "Identity unavailable".to_owned(),
+            Some(_) => match *authoritative_local_role {
                 None => "Waiting for game state".to_owned(),
-                Some(state_bytes) => match decode_verified_replay(state_bytes) {
-                    Ok(replay) => match role_for_player_id(&replay.configuration, &player_id) {
-                        Some(Player::White) => "White".to_owned(),
-                        Some(Player::Black) => "Black".to_owned(),
-                        None => "Not a participant".to_owned(),
-                    },
-                    Err(error) => format!("Identity-role check failed: {error}"),
-                },
-            }
-        } else {
-            "Identity unavailable".to_owned()
+                Some(Some(Player::White)) => "White".to_owned(),
+                Some(Some(Player::Black)) => "Black".to_owned(),
+                Some(None) => "Not a participant".to_owned(),
+            },
         };
 
         {
@@ -812,6 +811,30 @@ mod browser {
         }
 
         {
+            let latest_authoritative_state = latest_authoritative_state.clone();
+            let authoritative_local_role = authoritative_local_role.clone();
+
+            use_effect_with(*local_player_id, move |player_id| {
+                let resolved_role = match *player_id {
+                    None => None,
+                    Some(player_id) => {
+                        let state = latest_authoritative_state.borrow();
+
+                        state.as_ref().and_then(|state_bytes| {
+                            decode_verified_replay(state_bytes)
+                                .ok()
+                                .map(|replay| role_for_player_id(&replay.configuration, &player_id))
+                        })
+                    }
+                };
+
+                authoritative_local_role.set(resolved_role);
+
+                || {}
+            });
+        }
+
+        {
             let connection_status = connection_status.clone();
             let contract_status = contract_status.clone();
             let subscription_status = subscription_status.clone();
@@ -822,6 +845,8 @@ mod browser {
             let dice_secret_status = dice_secret_status.clone();
             let latest_contract_key = latest_contract_key.clone();
             let latest_authoritative_state = latest_authoritative_state.clone();
+            let local_player_id_for_effect = local_player_id.clone();
+            let authoritative_local_role_for_effect = authoritative_local_role.clone();
             let controller_for_effect = controller.clone();
 
             use_effect_with(selected_local_role, move |selected_role| {
@@ -848,6 +873,8 @@ mod browser {
                 let secret_status_for_response = dice_secret_status.clone();
                 let key_for_response = latest_contract_key.clone();
                 let state_for_response = latest_authoritative_state.clone();
+                let player_id_for_response = local_player_id_for_effect.clone();
+                let authoritative_role_for_response = authoritative_local_role_for_effect.clone();
                 let controller_for_response = controller_for_effect.clone();
 
                 let api_for_open = freenet_api.clone();
@@ -987,6 +1014,17 @@ mod browser {
                                  */
                                 *key_for_response.borrow_mut() = Some(key.clone());
                                 *state_for_response.borrow_mut() = Some(state_bytes.clone());
+
+                                let resolved_role = match *player_id_for_response {
+                                    None => None,
+                                    Some(player_id) => {
+                                        decode_verified_replay(&state_bytes).ok().map(|replay| {
+                                            role_for_player_id(&replay.configuration, &player_id)
+                                        })
+                                    }
+                                };
+
+                                authoritative_role_for_response.set(resolved_role);
 
                                 if state_changed {
                                     if let Some((authoritative_state, authoritative_history)) =
@@ -2025,6 +2063,8 @@ mod browser {
             let dice_secret_status = dice_secret_status.clone();
             let latest_contract_key = latest_contract_key.clone();
             let latest_authoritative_state = latest_authoritative_state.clone();
+            let local_player_id_for_reconnect = local_player_id.clone();
+            let authoritative_local_role_for_reconnect = authoritative_local_role.clone();
             let controller_for_reconnect = controller.clone();
 
             Callback::from(move |_| {
@@ -2053,6 +2093,9 @@ mod browser {
                 let secret_status_for_response = dice_secret_status.clone();
                 let key_for_response = latest_contract_key.clone();
                 let state_for_response = latest_authoritative_state.clone();
+                let player_id_for_response = local_player_id_for_reconnect.clone();
+                let authoritative_role_for_response =
+                    authoritative_local_role_for_reconnect.clone();
                 let controller_for_response = controller_for_reconnect.clone();
 
                 let api_for_open = freenet_api.clone();
@@ -2192,6 +2235,17 @@ mod browser {
                                  */
                                 *key_for_response.borrow_mut() = Some(key.clone());
                                 *state_for_response.borrow_mut() = Some(state_bytes.clone());
+
+                                let resolved_role = match *player_id_for_response {
+                                    None => None,
+                                    Some(player_id) => {
+                                        decode_verified_replay(&state_bytes).ok().map(|replay| {
+                                            role_for_player_id(&replay.configuration, &player_id)
+                                        })
+                                    }
+                                };
+
+                                authoritative_role_for_response.set(resolved_role);
 
                                 if state_changed {
                                     if let Some((authoritative_state, authoritative_history)) =
