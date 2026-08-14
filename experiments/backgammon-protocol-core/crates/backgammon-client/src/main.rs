@@ -864,6 +864,7 @@ mod browser {
 
                 let status_for_callback = connection_status.clone();
                 let contract_for_response = contract_status.clone();
+                let contract_for_host_error = contract_status.clone();
                 let subscription_for_response = subscription_status.clone();
                 let subscription_for_status = subscription_status.clone();
                 let api_for_response = freenet_api.clone();
@@ -1306,6 +1307,10 @@ mod browser {
                                 }
                             }
                         }
+                    },
+                    move |error| {
+                        contract_for_host_error
+                            .set(crate::transport::host_result_error_status(&error));
                     },
                     move || {
                         let api_for_request = api_for_open.clone();
@@ -2085,6 +2090,7 @@ mod browser {
 
                 let status_for_callback = connection_status.clone();
                 let contract_for_response = contract_status.clone();
+                let contract_for_host_error = contract_status.clone();
                 let subscription_for_response = subscription_status.clone();
                 let subscription_for_status = subscription_status.clone();
                 let api_for_response = freenet_api.clone();
@@ -2527,6 +2533,10 @@ mod browser {
                                 }
                             }
                         }
+                    },
+                    move |error| {
+                        contract_for_host_error
+                            .set(crate::transport::host_result_error_status(&error));
                     },
                     move || {
                         let api_for_request = api_for_open.clone();

@@ -122,6 +122,10 @@ fn retrieved_status(bytes: &[u8]) -> ContractProbeStatus {
     }
 }
 
+pub fn host_result_error_status(error: impl std::fmt::Display) -> ContractProbeStatus {
+    ContractProbeStatus::Failed(format!("Freenet operation failed: {error}"))
+}
+
 #[cfg(target_arch = "wasm32")]
 pub struct ClassifiedResponse {
     pub contract_status: Option<ContractProbeStatus>,
@@ -142,6 +146,7 @@ pub const TEST_CONTRACT_ID: &str = "DXLWMDteEwcwhSij6XzXcJX5pEb6jidWtPXH5qCgJMzb
 pub fn connect(
     status_handler: impl Fn(ConnectionStatus) + Clone + 'static,
     response_handler: impl Fn(freenet_stdlib::client_api::HostResponse) + 'static,
+    operation_error_handler: impl Fn(freenet_stdlib::client_api::ClientError) + 'static,
     open_handler: impl Fn() + 'static,
 ) -> Result<freenet_stdlib::client_api::WebApi, String> {
     use freenet_stdlib::client_api::WebApi;
@@ -159,9 +164,7 @@ pub fn connect(
         websocket,
         move |result| match result {
             Ok(response) => response_handler(response),
-            Err(error) => status_handler(ConnectionStatus::Failed(format!(
-                "The Freenet node returned an error: {error:?}"
-            ))),
+            Err(error) => operation_error_handler(error),
         },
         move |error| {
             error_status(ConnectionStatus::Failed(format!(
@@ -353,6 +356,18 @@ mod tests {
         ConnectionStatus, ContractProbeStatus, SubscriptionStatus, EMPTY_LEDGER_CBOR,
         EXPECTED_ONE_ACTION_STATE_CBOR, FIRST_CREATE_DELTA_CBOR,
     };
+
+    #[test]
+    fn host_result_error_is_reported_as_contract_failure() {
+        let error = "client error: UPDATE failed: invalid contract update";
+
+        let status = super::host_result_error_status(error);
+
+        assert!(matches!(status, ContractProbeStatus::Failed(_)));
+        assert!(status
+            .state_label()
+            .contains("UPDATE failed: invalid contract update"));
+    }
 
     #[test]
     fn only_closed_or_failed_connections_can_reconnect() {
