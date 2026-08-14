@@ -4,7 +4,9 @@ use freenet_scaffold_macro::composable;
 use freenet_stdlib::prelude::*;
 use serde::{Deserialize, Serialize};
 
-const MAX_ACTIONS: usize = 256;
+// Temporary alpha bound for the monolithic ledger.
+// The production design will use bounded, hash-chained ledger segments.
+const MAX_ACTIONS: usize = 2048;
 const MAX_PAYLOAD_BYTES: usize = 1024;
 
 #[derive(Serialize, Deserialize, Clone, Default, PartialEq, Eq, Debug)]
@@ -906,6 +908,26 @@ mod tests {
             state.verify(&state, &params()),
             Err("action payload limit exceeded".into())
         );
+    }
+
+    #[test]
+    fn ledger_can_cross_the_old_256_action_boundary() {
+        let mut state = LedgerState::default();
+        for n in 0..300 {
+            let mut id = [0_u8; 32];
+            id[28..].copy_from_slice(&(n as u32).to_be_bytes());
+            state.actions.0.push(Action {
+                game_id: [7; 32],
+                id,
+                sequence: n as u32,
+                previous_state_hash: GENESIS_STATE_HASH,
+                resulting_state_hash: [0; 32],
+                payload: vec![],
+            });
+        }
+
+        assert_eq!(state.actions.0.len(), 300);
+        assert!(state.actions.verify_inner().is_ok());
     }
 
     #[test]
