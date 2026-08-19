@@ -1,7 +1,8 @@
 use backgammon_core::{Player, TurnPhase};
 use backgammon_protocol::{replay_game, ActionId, GameActionPayload};
+use ed25519_dalek::SigningKey;
 
-use crate::ledger_codec::{build_encoded_action_delta, decode_verified_ledger};
+use crate::ledger_codec::{build_encoded_signed_action_delta, decode_verified_ledger};
 use crate::pending_action::{PendingAction, PendingActionResolution};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -18,6 +19,7 @@ pub enum RequestRollPlan {
 pub struct RequestRollPlannerInput<'a> {
     pub contract_id: &'a str,
     pub local_player: Player,
+    pub signing_key: &'a SigningKey,
     pub authoritative_state: &'a [u8],
     pub pending: Option<&'a PendingAction>,
 
@@ -140,13 +142,14 @@ pub fn plan_request_roll(input: RequestRollPlannerInput<'_>) -> Result<RequestRo
         .new_action_id
         .ok_or_else(|| "Roll request requires a fresh random action ID.".to_owned())?;
 
-    let (record, delta) = build_encoded_action_delta(
+    let (record, delta) = build_encoded_signed_action_delta(
         input.authoritative_state,
         action_id,
         GameActionPayload::RequestRoll {
             turn: replay.next_turn,
             player: input.local_player,
         },
+        input.signing_key,
     )?;
 
     if record.sequence != replay.next_sequence {
@@ -167,13 +170,16 @@ pub fn plan_request_roll(input: RequestRollPlannerInput<'_>) -> Result<RequestRo
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::build_encoded_action_delta;
 
     use backgammon_contract::{LedgerState, LedgerStateDelta};
     use ciborium::{de::from_reader, ser::into_writer};
 
     const CONTRACT_ID: &str = "test-contract";
 
-    const ONE_ACTION_STATE: &[u8] = include_bytes!("../fixtures/expected-one-action-state.cbor");
+    fn one_action_state() -> &'static [u8] {
+        crate::test_support::one_action_state()
+    }
 
     fn append_pending(state_bytes: &[u8], pending: &PendingAction) -> Vec<u8> {
         let mut state: LedgerState = from_reader(state_bytes).unwrap();
@@ -194,7 +200,8 @@ mod tests {
         plan_request_roll(RequestRollPlannerInput {
             contract_id: CONTRACT_ID,
             local_player: player,
-            authoritative_state: ONE_ACTION_STATE,
+            signing_key: crate::test_support::signing_key_for_player(player),
+            authoritative_state: one_action_state(),
             pending: None,
             requested,
             new_action_id: action_id,
@@ -242,7 +249,8 @@ mod tests {
         let error = plan_request_roll(RequestRollPlannerInput {
             contract_id: CONTRACT_ID,
             local_player: Player::Black,
-            authoritative_state: ONE_ACTION_STATE,
+            signing_key: crate::test_support::signing_key_for_player(Player::Black),
+            authoritative_state: one_action_state(),
             pending: None,
             requested: true,
             new_action_id: Some([22; 32]),
@@ -257,7 +265,8 @@ mod tests {
         let error = plan_request_roll(RequestRollPlannerInput {
             contract_id: CONTRACT_ID,
             local_player: Player::White,
-            authoritative_state: ONE_ACTION_STATE,
+            signing_key: crate::test_support::signing_key_for_player(Player::White),
+            authoritative_state: one_action_state(),
             pending: None,
             requested: true,
             new_action_id: None,
@@ -274,7 +283,8 @@ mod tests {
         let plan = plan_request_roll(RequestRollPlannerInput {
             contract_id: CONTRACT_ID,
             local_player: Player::White,
-            authoritative_state: ONE_ACTION_STATE,
+            signing_key: crate::test_support::signing_key_for_player(Player::White),
+            authoritative_state: one_action_state(),
             pending: Some(&pending),
             requested: false,
             new_action_id: Some([99; 32]),
@@ -293,11 +303,12 @@ mod tests {
     #[test]
     fn accepted_pending_request_is_reconciled() {
         let pending = new_pending();
-        let accepted = append_pending(ONE_ACTION_STATE, &pending);
+        let accepted = append_pending(one_action_state(), &pending);
 
         let plan = plan_request_roll(RequestRollPlannerInput {
             contract_id: CONTRACT_ID,
             local_player: Player::White,
+            signing_key: crate::test_support::signing_key_for_player(Player::White),
             authoritative_state: &accepted,
             pending: Some(&pending),
             requested: false,
@@ -311,11 +322,12 @@ mod tests {
     #[test]
     fn accepted_request_without_pending_is_recovered() {
         let pending = new_pending();
-        let accepted = append_pending(ONE_ACTION_STATE, &pending);
+        let accepted = append_pending(one_action_state(), &pending);
 
         let plan = plan_request_roll(RequestRollPlannerInput {
             contract_id: CONTRACT_ID,
             local_player: Player::White,
+            signing_key: crate::test_support::signing_key_for_player(Player::White),
             authoritative_state: &accepted,
             pending: None,
             requested: false,
@@ -333,7 +345,8 @@ mod tests {
         let error = plan_request_roll(RequestRollPlannerInput {
             contract_id: CONTRACT_ID,
             local_player: Player::Black,
-            authoritative_state: ONE_ACTION_STATE,
+            signing_key: crate::test_support::signing_key_for_player(Player::Black),
+            authoritative_state: one_action_state(),
             pending: Some(&pending),
             requested: false,
             new_action_id: None,
@@ -348,7 +361,7 @@ mod tests {
         let pending = new_pending();
 
         let (_, competing_delta) = build_encoded_action_delta(
-            ONE_ACTION_STATE,
+            one_action_state(),
             [88; 32],
             GameActionPayload::Resign {
                 player: Player::White,
@@ -356,7 +369,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut state: LedgerState = from_reader(ONE_ACTION_STATE).unwrap();
+        let mut state: LedgerState = from_reader(one_action_state()).unwrap();
 
         let delta: LedgerStateDelta = from_reader(competing_delta.as_slice()).unwrap();
 
@@ -371,6 +384,7 @@ mod tests {
         assert!(plan_request_roll(RequestRollPlannerInput {
             contract_id: CONTRACT_ID,
             local_player: Player::White,
+            signing_key: crate::test_support::signing_key_for_player(Player::White),
             authoritative_state: &encoded,
             pending: Some(&pending),
             requested: false,

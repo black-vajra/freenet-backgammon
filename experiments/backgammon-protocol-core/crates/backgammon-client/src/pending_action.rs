@@ -241,13 +241,15 @@ mod tests {
     use backgammon_protocol::GameActionPayload;
     use ciborium::{de::from_reader, ser::into_writer};
 
-    use crate::ledger_codec::build_encoded_action_delta;
+    use crate::test_support::build_encoded_action_delta;
 
-    const ONE_ACTION_STATE: &[u8] = include_bytes!("../fixtures/expected-one-action-state.cbor");
+    fn one_action_state() -> &'static [u8] {
+        crate::test_support::one_action_state()
+    }
 
     fn pending_resignation(action_id: ActionId) -> PendingAction {
         let (record, delta) = build_encoded_action_delta(
-            ONE_ACTION_STATE,
+            one_action_state(),
             action_id,
             GameActionPayload::Resign {
                 player: Player::White,
@@ -303,7 +305,7 @@ mod tests {
         let pending = pending_resignation([42_u8; 32]);
 
         assert_eq!(
-            pending.reconcile(ONE_ACTION_STATE),
+            pending.reconcile(one_action_state()),
             Ok(PendingActionResolution::Pending),
         );
     }
@@ -311,7 +313,7 @@ mod tests {
     #[test]
     fn exact_authoritative_action_resolves_as_accepted() {
         let pending = pending_resignation([42_u8; 32]);
-        let accepted_state = state_with_delta(ONE_ACTION_STATE, &pending.delta);
+        let accepted_state = state_with_delta(one_action_state(), &pending.delta);
 
         assert_eq!(
             pending.reconcile(&accepted_state),
@@ -324,7 +326,7 @@ mod tests {
         let pending = pending_resignation([42_u8; 32]);
         let competing = pending_resignation([43_u8; 32]);
 
-        let competing_state = state_with_delta(ONE_ACTION_STATE, &competing.delta);
+        let competing_state = state_with_delta(one_action_state(), &competing.delta);
 
         assert!(pending.reconcile(&competing_state).is_err());
     }

@@ -62,6 +62,7 @@ dependencies = [
  "backgammon-core",
  "backgammon-protocol",
  "ciborium",
+ "ed25519-dalek",
  "freenet-scaffold",
  "freenet-scaffold-macro",
  "freenet-stdlib",

@@ -243,10 +243,12 @@ mod tests {
     use super::*;
     use backgammon_core::{GameState, Player, TurnPhase, TurnSequence};
     use backgammon_protocol::{
-        derive_dice, replay_game, CanonicalReplayState, DiceCommit, GameActionPayload,
+        derive_dice, encode_action_signing_message_v4, replay_game, ActionAuthentication,
+        ActionSignature, ActionSigningBody, CanonicalReplayState, DiceCommit, GameActionPayload,
         GameActionRecord, GameConfiguration, PlayerDescriptor, ReplayStatus, StateHash,
         GENESIS_STATE_HASH, PROTOCOL_VERSION,
     };
+    use ed25519_dalek::{Signer, SigningKey};
 
     fn params() -> LedgerParameters {
         LedgerParameters::current()
@@ -256,14 +258,22 @@ mod tests {
         [id; 32]
     }
 
+    fn white_signing_key() -> SigningKey {
+        SigningKey::from_bytes(&[41; 32])
+    }
+
+    fn black_signing_key() -> SigningKey {
+        SigningKey::from_bytes(&[42; 32])
+    }
+
     fn configuration() -> GameConfiguration {
         GameConfiguration {
             white: PlayerDescriptor {
-                id: [1; 32],
+                id: white_signing_key().verifying_key().to_bytes(),
                 display_name: "White".to_owned(),
             },
             black: PlayerDescriptor {
-                id: [2; 32],
+                id: black_signing_key().verifying_key().to_bytes(),
                 display_name: "Black".to_owned(),
             },
             match_length: 1,
@@ -306,7 +316,7 @@ mod tests {
         resulting_state_hash: StateHash,
         payload: GameActionPayload,
     ) -> Action {
-        Action::from_game_action_record(&GameActionRecord {
+        let record = GameActionRecord {
             protocol_version: PROTOCOL_VERSION,
             game_id: [7; 32],
             action_id: [id; 32],
@@ -314,8 +324,50 @@ mod tests {
             previous_state_hash,
             resulting_state_hash,
             payload,
-        })
-        .unwrap()
+        };
+
+        let body = ActionSigningBody {
+            protocol_version: record.protocol_version,
+            game_id: record.game_id,
+            action_id: record.action_id,
+            sequence: record.sequence,
+            previous_state_hash: record.previous_state_hash,
+            resulting_state_hash: record.resulting_state_hash,
+            payload: record.payload.clone(),
+        };
+
+        let message = encode_action_signing_message_v4(&body).unwrap();
+
+        let authentication = match &record.payload {
+            GameActionPayload::CreateGame(_) => {
+                let white = white_signing_key();
+                let black = black_signing_key();
+
+                ActionAuthentication::Genesis {
+                    white_signature: ActionSignature::from_bytes(white.sign(&message).to_bytes()),
+                    black_signature: ActionSignature::from_bytes(black.sign(&message).to_bytes()),
+                }
+            }
+
+            GameActionPayload::RequestRoll { player, .. }
+            | GameActionPayload::CommitDice { player, .. }
+            | GameActionPayload::RevealDice { player, .. }
+            | GameActionPayload::PlayTurn { player, .. }
+            | GameActionPayload::Resign { player } => {
+                let signing_key = match player {
+                    Player::White => white_signing_key(),
+                    Player::Black => black_signing_key(),
+                };
+
+                ActionAuthentication::Player {
+                    signature: ActionSignature::from_bytes(signing_key.sign(&message).to_bytes()),
+                }
+            }
+
+            _ => panic!("test helper cannot authenticate unsupported v4 payload"),
+        };
+
+        Action::from_authenticated_game_action_record(&record, authentication).unwrap()
     }
 
     fn action(id: u8, sequence: u32) -> Action {
@@ -343,6 +395,7 @@ mod tests {
                 previous_state_hash: state_hash(sequence as u8),
                 resulting_state_hash: state_hash((sequence + 1) as u8),
                 payload: vec![id],
+                authentication: None,
             },
         }
     }
@@ -923,6 +976,7 @@ mod tests {
                 previous_state_hash: GENESIS_STATE_HASH,
                 resulting_state_hash: [0; 32],
                 payload: vec![],
+                authentication: None,
             });
         }
 
@@ -943,6 +997,7 @@ mod tests {
                 previous_state_hash: GENESIS_STATE_HASH,
                 resulting_state_hash: [0; 32],
                 payload: Vec::new(),
+                authentication: None,
             });
         }
         assert_eq!(
@@ -1032,8 +1087,17 @@ mod tests {
 
     #[test]
     fn forged_canonical_state_hash_is_rejected_by_contract_state() {
-        let mut forged = action(1, 0);
-        forged.resulting_state_hash = [99; 32];
+        /*
+         * Sign the forged finalized body itself. Authentication therefore
+         * succeeds before deterministic replay detects the false state hash.
+         */
+        let forged = typed_action(
+            1,
+            0,
+            GENESIS_STATE_HASH,
+            [99; 32],
+            GameActionPayload::CreateGame(configuration()),
+        );
 
         let state = LedgerState {
             actions: Actions(vec![forged]),

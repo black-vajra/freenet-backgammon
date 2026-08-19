@@ -198,13 +198,15 @@ mod tests {
     use backgammon_core::Player;
     use backgammon_protocol::{ActionId, GameActionPayload};
 
-    use crate::ledger_codec::build_encoded_action_delta;
+    use crate::test_support::build_encoded_action_delta;
 
-    const ONE_ACTION_STATE: &[u8] = include_bytes!("../fixtures/expected-one-action-state.cbor");
+    fn one_action_state() -> &'static [u8] {
+        crate::test_support::one_action_state()
+    }
 
     fn pending_action(action_id: ActionId) -> PendingAction {
         let (record, delta) = build_encoded_action_delta(
-            ONE_ACTION_STATE,
+            one_action_state(),
             action_id,
             GameActionPayload::Resign {
                 player: Player::White,

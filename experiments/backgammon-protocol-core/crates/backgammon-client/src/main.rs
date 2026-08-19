@@ -15,6 +15,9 @@ pub mod reveal_planner;
 pub mod secret_store;
 pub mod transport;
 
+#[cfg(test)]
+mod test_support;
+
 #[cfg(target_arch = "wasm32")]
 mod browser {
     use backgammon_core::{GameState, MoveSource, MoveTarget, Player, TurnPhase, TurnSequence};
@@ -30,7 +33,8 @@ mod browser {
     use crate::controller::{LocalGameController, LocalGameOutcome, LocalTurnRecord};
     use crate::ledger_codec::{decode_verified_ledger, decode_verified_replay};
     use crate::local_identity_store::{
-        load_or_create_local_identity, player_id_for_signing_key, role_for_player_id,
+        load_local_identity, load_or_create_local_identity, player_id_for_signing_key,
+        role_for_player_id,
     };
     use crate::local_role_store::{load_local_role, store_local_role};
     use crate::pending_action_store::{
@@ -44,9 +48,8 @@ mod browser {
     use crate::reveal_planner::{plan_reveal, RevealPlan, RevealPlannerInput};
     use crate::secret_store::{load_dice_secret, store_dice_secret};
     use crate::transport::{
-        classify_response, connect, request_test_contract, submit_action_delta,
-        submit_first_create_delta, ClassifiedResponse, ConnectionStatus, ContractProbeStatus,
-        SubscriptionStatus, TEST_CONTRACT_ID,
+        classify_response, connect, request_test_contract, submit_action_delta, ClassifiedResponse,
+        ConnectionStatus, ContractProbeStatus, SubscriptionStatus, TEST_CONTRACT_ID,
     };
 
     fn format_player_id(player_id: &[u8; 32]) -> String {
@@ -100,6 +103,9 @@ mod browser {
         authoritative_state: &[u8],
         local_player: Player,
     ) -> Result<CommitmentPlan, String> {
+        let signing_key = load_local_identity()?
+            .ok_or_else(|| "Local signing identity is unavailable.".to_owned())?;
+
         let pending = load_pending_action(TEST_CONTRACT_ID)?;
 
         let stored_secret = if let Some(pending) = pending.as_ref() {
@@ -145,6 +151,7 @@ mod browser {
         let plan = plan_commitment(CommitmentPlannerInput {
             contract_id: TEST_CONTRACT_ID,
             local_player,
+            signing_key: &signing_key,
             authoritative_state,
             pending: pending.as_ref(),
             stored_secret,
@@ -242,6 +249,9 @@ mod browser {
         authoritative_state: &[u8],
         local_player: Player,
     ) -> Result<RevealPlan, String> {
+        let signing_key = load_local_identity()?
+            .ok_or_else(|| "Local signing identity is unavailable.".to_owned())?;
+
         let pending = load_pending_action(TEST_CONTRACT_ID)?;
 
         let stored_secret = if let Some(pending) = pending.as_ref() {
@@ -277,6 +287,7 @@ mod browser {
         let plan = plan_reveal(RevealPlannerInput {
             contract_id: TEST_CONTRACT_ID,
             local_player,
+            signing_key: &signing_key,
             authoritative_state,
             pending: pending.as_ref(),
             stored_secret,
@@ -349,6 +360,9 @@ mod browser {
         local_player: Player,
         sequence: Option<&TurnSequence>,
     ) -> Result<PlayTurnPlan, String> {
+        let signing_key = load_local_identity()?
+            .ok_or_else(|| "Local signing identity is unavailable.".to_owned())?;
+
         let pending = load_pending_action(TEST_CONTRACT_ID)?;
 
         if let Some(pending) = pending.as_ref() {
@@ -376,6 +390,7 @@ mod browser {
         let plan = plan_play_turn(PlayTurnPlannerInput {
             contract_id: TEST_CONTRACT_ID,
             local_player,
+            signing_key: &signing_key,
             authoritative_state,
             pending: pending.as_ref(),
             sequence,
@@ -445,6 +460,9 @@ mod browser {
         local_player: Player,
         requested: bool,
     ) -> Result<RequestRollPlan, String> {
+        let signing_key = load_local_identity()?
+            .ok_or_else(|| "Local signing identity is unavailable.".to_owned())?;
+
         let pending = load_pending_action(TEST_CONTRACT_ID)?;
 
         if let Some(pending) = pending.as_ref() {
@@ -474,6 +492,7 @@ mod browser {
         let plan = plan_request_roll(RequestRollPlannerInput {
             contract_id: TEST_CONTRACT_ID,
             local_player,
+            signing_key: &signing_key,
             authoritative_state,
             pending: pending.as_ref(),
             requested,
@@ -732,7 +751,6 @@ mod browser {
         let contract_status = use_state(|| ContractProbeStatus::WaitingForConnection);
         let subscription_status = use_state(|| SubscriptionStatus::Pending);
         let freenet_api = use_mut_ref(|| None::<freenet_stdlib::client_api::WebApi>);
-        let first_delta_submitted = use_mut_ref(|| false);
         let local_network_action_submitted = use_mut_ref(|| None::<[u8; 32]>);
         let local_dice_secret = use_mut_ref(|| None::<DiceSecret>);
         let dice_secret_status = use_state(|| "Checking browser storage".to_owned());
@@ -840,7 +858,6 @@ mod browser {
             let contract_status = contract_status.clone();
             let subscription_status = subscription_status.clone();
             let freenet_api = freenet_api.clone();
-            let first_delta_submitted = first_delta_submitted.clone();
             let local_network_action_submitted = local_network_action_submitted.clone();
             let local_dice_secret = local_dice_secret.clone();
             let dice_secret_status = dice_secret_status.clone();
@@ -868,7 +885,6 @@ mod browser {
                 let subscription_for_response = subscription_status.clone();
                 let subscription_for_status = subscription_status.clone();
                 let api_for_response = freenet_api.clone();
-                let submitted_for_response = first_delta_submitted.clone();
                 let network_action_for_response = local_network_action_submitted.clone();
                 let secret_for_response = local_dice_secret.clone();
                 let secret_status_for_response = dice_secret_status.clone();
@@ -904,7 +920,6 @@ mod browser {
                                 subscription_status,
                                 contract_key,
                                 authoritative_state,
-                                should_submit_first_delta,
                             } = classified;
 
                             if let Some(contract) = contract_status {
@@ -915,76 +930,6 @@ mod browser {
                                 subscription_for_response.set(subscription);
                             }
 
-                            if should_submit_first_delta {
-                                let Some(key) = contract_key else {
-                                    contract_for_response.set(ContractProbeStatus::Failed(
-                                        "The empty ledger response did not include a full contract key."
-                                            .to_owned(),
-                                    ));
-                                    return;
-                                };
-
-                                {
-                                    let mut submitted = submitted_for_response.borrow_mut();
-
-                                    if *submitted {
-                                        return;
-                                    }
-
-                                    *submitted = true;
-                                }
-
-                                contract_for_response.set(ContractProbeStatus::Updating);
-
-                                let api_for_update = api_for_response.clone();
-                                let contract_for_update = contract_for_response.clone();
-                                let submitted_for_update = submitted_for_response.clone();
-
-                                wasm_bindgen_futures::spawn_local(async move {
-                                    let submit_result = {
-                                        let mut api = api_for_update.borrow_mut();
-
-                                        match api.as_mut() {
-                                            Some(api) => submit_first_create_delta(api, key).await,
-                                            None => {
-                                                Err("Freenet connection closed before the update."
-                                                    .to_owned())
-                                            }
-                                        }
-                                    };
-
-                                    match submit_result {
-                                        Ok(()) => {
-                                            contract_for_update
-                                                .set(ContractProbeStatus::VerifyingUpdate);
-
-                                            gloo_timers::future::TimeoutFuture::new(750).await;
-
-                                            let refresh_result = {
-                                                let mut api = api_for_update.borrow_mut();
-
-                                                match api.as_mut() {
-                                                    Some(api) => request_test_contract(api).await,
-                                                    None => Err(
-                                                        "Freenet connection closed before update verification."
-                                                            .to_owned(),
-                                                    ),
-                                                }
-                                            };
-
-                                            if let Err(error) = refresh_result {
-                                                contract_for_update
-                                                    .set(ContractProbeStatus::Failed(error));
-                                            }
-                                        }
-                                        Err(error) => {
-                                            *submitted_for_update.borrow_mut() = false;
-                                            contract_for_update
-                                                .set(ContractProbeStatus::Failed(error));
-                                        }
-                                    }
-                                });
-                            }
                             if let (Some(key), Some(state_bytes)) =
                                 (contract_key, authoritative_state)
                             {
@@ -2062,7 +2007,6 @@ mod browser {
             let contract_status = contract_status.clone();
             let subscription_status = subscription_status.clone();
             let freenet_api = freenet_api.clone();
-            let first_delta_submitted = first_delta_submitted.clone();
             let local_network_action_submitted = local_network_action_submitted.clone();
             let local_dice_secret = local_dice_secret.clone();
             let dice_secret_status = dice_secret_status.clone();
@@ -2094,7 +2038,6 @@ mod browser {
                 let subscription_for_response = subscription_status.clone();
                 let subscription_for_status = subscription_status.clone();
                 let api_for_response = freenet_api.clone();
-                let submitted_for_response = first_delta_submitted.clone();
                 let network_action_for_response = local_network_action_submitted.clone();
                 let secret_for_response = local_dice_secret.clone();
                 let secret_status_for_response = dice_secret_status.clone();
@@ -2131,7 +2074,6 @@ mod browser {
                                 subscription_status,
                                 contract_key,
                                 authoritative_state,
-                                should_submit_first_delta,
                             } = classified;
 
                             if let Some(contract) = contract_status {
@@ -2142,76 +2084,6 @@ mod browser {
                                 subscription_for_response.set(subscription);
                             }
 
-                            if should_submit_first_delta {
-                                let Some(key) = contract_key else {
-                                    contract_for_response.set(ContractProbeStatus::Failed(
-                                        "The empty ledger response did not include a full contract key."
-                                            .to_owned(),
-                                    ));
-                                    return;
-                                };
-
-                                {
-                                    let mut submitted = submitted_for_response.borrow_mut();
-
-                                    if *submitted {
-                                        return;
-                                    }
-
-                                    *submitted = true;
-                                }
-
-                                contract_for_response.set(ContractProbeStatus::Updating);
-
-                                let api_for_update = api_for_response.clone();
-                                let contract_for_update = contract_for_response.clone();
-                                let submitted_for_update = submitted_for_response.clone();
-
-                                wasm_bindgen_futures::spawn_local(async move {
-                                    let submit_result = {
-                                        let mut api = api_for_update.borrow_mut();
-
-                                        match api.as_mut() {
-                                            Some(api) => submit_first_create_delta(api, key).await,
-                                            None => {
-                                                Err("Freenet connection closed before the update."
-                                                    .to_owned())
-                                            }
-                                        }
-                                    };
-
-                                    match submit_result {
-                                        Ok(()) => {
-                                            contract_for_update
-                                                .set(ContractProbeStatus::VerifyingUpdate);
-
-                                            gloo_timers::future::TimeoutFuture::new(750).await;
-
-                                            let refresh_result = {
-                                                let mut api = api_for_update.borrow_mut();
-
-                                                match api.as_mut() {
-                                                    Some(api) => request_test_contract(api).await,
-                                                    None => Err(
-                                                        "Freenet connection closed before update verification."
-                                                            .to_owned(),
-                                                    ),
-                                                }
-                                            };
-
-                                            if let Err(error) = refresh_result {
-                                                contract_for_update
-                                                    .set(ContractProbeStatus::Failed(error));
-                                            }
-                                        }
-                                        Err(error) => {
-                                            *submitted_for_update.borrow_mut() = false;
-                                            contract_for_update
-                                                .set(ContractProbeStatus::Failed(error));
-                                        }
-                                    }
-                                });
-                            }
                             if let (Some(key), Some(state_bytes)) =
                                 (contract_key, authoritative_state)
                             {

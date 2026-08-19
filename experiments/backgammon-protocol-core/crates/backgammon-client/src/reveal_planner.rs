@@ -1,7 +1,8 @@
 use backgammon_core::{Player, TurnPhase};
 use backgammon_protocol::{replay_game, ActionId, DiceSecret, GameActionPayload};
+use ed25519_dalek::SigningKey;
 
-use crate::ledger_codec::{build_encoded_action_delta, decode_verified_ledger};
+use crate::ledger_codec::{build_encoded_signed_action_delta, decode_verified_ledger};
 use crate::pending_action::{PendingAction, PendingActionResolution};
 use crate::secret_store::verify_dice_secret_commitment;
 
@@ -23,6 +24,7 @@ pub enum RevealPlan {
 pub struct RevealPlannerInput<'a> {
     pub contract_id: &'a str,
     pub local_player: Player,
+    pub signing_key: &'a SigningKey,
     pub authoritative_state: &'a [u8],
     pub pending: Option<&'a PendingAction>,
     pub stored_secret: Option<DiceSecret>,
@@ -178,7 +180,7 @@ pub fn plan_reveal(input: RevealPlannerInput<'_>) -> Result<RevealPlan, String> 
         .new_action_id
         .ok_or_else(|| "Reveal creation requires a fresh random action ID.".to_owned())?;
 
-    let (record, delta) = build_encoded_action_delta(
+    let (record, delta) = build_encoded_signed_action_delta(
         input.authoritative_state,
         action_id,
         GameActionPayload::RevealDice {
@@ -186,6 +188,7 @@ pub fn plan_reveal(input: RevealPlannerInput<'_>) -> Result<RevealPlan, String> 
             player: input.local_player,
             secret,
         },
+        input.signing_key,
     )?;
 
     if record.sequence != replay.next_sequence {
@@ -234,13 +237,16 @@ fn verify_local_commitment(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::build_encoded_action_delta;
 
     use backgammon_contract::{LedgerState, LedgerStateDelta};
     use backgammon_protocol::DiceCommit;
     use ciborium::{de::from_reader, ser::into_writer};
 
     const CONTRACT_ID: &str = "test-contract";
-    const ONE_ACTION_STATE: &[u8] = include_bytes!("../fixtures/expected-one-action-state.cbor");
+    fn one_action_state() -> &'static [u8] {
+        crate::test_support::one_action_state()
+    }
 
     fn append_action(
         state_bytes: &[u8],
@@ -264,14 +270,14 @@ mod tests {
     }
 
     fn committed_state() -> Vec<u8> {
-        let ledger = decode_verified_ledger(ONE_ACTION_STATE).unwrap();
+        let ledger = decode_verified_ledger(one_action_state()).unwrap();
 
         let game_id = ledger.typed_actions()[0].game_id;
 
         let white = DiceCommit::new(&game_id, 0, Player::White, &[11; 32]);
 
         let requested = append_action(
-            ONE_ACTION_STATE,
+            one_action_state(),
             [20; 32],
             GameActionPayload::RequestRoll {
                 turn: 0,
@@ -311,6 +317,7 @@ mod tests {
         plan_reveal(RevealPlannerInput {
             contract_id: CONTRACT_ID,
             local_player: player,
+            signing_key: crate::test_support::signing_key_for_player(player),
             authoritative_state: state,
             pending: None,
             stored_secret: Some(secret),
@@ -353,7 +360,8 @@ mod tests {
         let plan = plan_reveal(RevealPlannerInput {
             contract_id: CONTRACT_ID,
             local_player: Player::White,
-            authoritative_state: ONE_ACTION_STATE,
+            signing_key: crate::test_support::signing_key_for_player(Player::White),
+            authoritative_state: one_action_state(),
             pending: None,
             stored_secret: Some([11; 32]),
             new_action_id: Some([31; 32]),
@@ -430,6 +438,7 @@ mod tests {
         let plan = plan_reveal(RevealPlannerInput {
             contract_id: CONTRACT_ID,
             local_player: Player::White,
+            signing_key: crate::test_support::signing_key_for_player(Player::White),
             authoritative_state: &state,
             pending: Some(&pending),
             stored_secret: Some([11; 32]),
@@ -458,6 +467,7 @@ mod tests {
         let plan = plan_reveal(RevealPlannerInput {
             contract_id: CONTRACT_ID,
             local_player: Player::White,
+            signing_key: crate::test_support::signing_key_for_player(Player::White),
             authoritative_state: &accepted,
             pending: Some(&pending),
             stored_secret: Some([11; 32]),
@@ -479,6 +489,7 @@ mod tests {
         let plan = plan_reveal(RevealPlannerInput {
             contract_id: CONTRACT_ID,
             local_player: Player::White,
+            signing_key: crate::test_support::signing_key_for_player(Player::White),
             authoritative_state: &accepted,
             pending: None,
             stored_secret: Some([11; 32]),
@@ -496,6 +507,7 @@ mod tests {
         let error = plan_reveal(RevealPlannerInput {
             contract_id: CONTRACT_ID,
             local_player: Player::White,
+            signing_key: crate::test_support::signing_key_for_player(Player::White),
             authoritative_state: &state,
             pending: None,
             stored_secret: Some([99; 32]),
@@ -515,6 +527,7 @@ mod tests {
         assert!(plan_reveal(RevealPlannerInput {
             contract_id: CONTRACT_ID,
             local_player: Player::Black,
+            signing_key: crate::test_support::signing_key_for_player(Player::Black),
             authoritative_state: &state,
             pending: Some(&pending),
             stored_secret: Some([22; 32]),
@@ -557,6 +570,7 @@ mod tests {
         let error = plan_reveal(RevealPlannerInput {
             contract_id: CONTRACT_ID,
             local_player: Player::White,
+            signing_key: crate::test_support::signing_key_for_player(Player::White),
             authoritative_state: &state,
             pending: None,
             stored_secret: Some([11; 32]),

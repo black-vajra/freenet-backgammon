@@ -67,7 +67,7 @@ impl ContractProbeStatus {
         match self {
             Self::Retrieved {
                 action_count: 0, ..
-            } => "Empty ledger verified".to_owned(),
+            } => "Empty ledger verified — waiting for authenticated game creation".to_owned(),
             Self::Retrieved {
                 action_count: 1, ..
             } => "One network action verified".to_owned(),
@@ -102,11 +102,14 @@ impl SubscriptionStatus {
     }
 }
 
+#[cfg(test)]
 const EMPTY_LEDGER_CBOR: &[u8] = &[0xa1, 0x67, b'a', b'c', b't', b'i', b'o', b'n', b's', 0x80];
 
+#[cfg(test)]
 const FIRST_CREATE_DELTA_CBOR: &[u8] =
     include_bytes!("../fixtures/create-game-sequence-0.delta.cbor");
 
+#[cfg(test)]
 const EXPECTED_ONE_ACTION_STATE_CBOR: &[u8] =
     include_bytes!("../fixtures/expected-one-action-state.cbor");
 
@@ -132,7 +135,6 @@ pub struct ClassifiedResponse {
     pub subscription_status: Option<SubscriptionStatus>,
     pub contract_key: Option<freenet_stdlib::prelude::ContractKey>,
     pub authoritative_state: Option<Vec<u8>>,
-    pub should_submit_first_delta: bool,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -228,18 +230,6 @@ pub async fn submit_action_delta(
 }
 
 #[cfg(target_arch = "wasm32")]
-pub async fn submit_first_create_delta(
-    api: &mut freenet_stdlib::client_api::WebApi,
-    key: freenet_stdlib::prelude::ContractKey,
-) -> Result<(), String> {
-    if FIRST_CREATE_DELTA_CBOR != EXPECTED_ONE_ACTION_STATE_CBOR {
-        return Err("The pinned delta and expected state fixtures differ.".to_owned());
-    }
-
-    submit_action_delta(api, key, FIRST_CREATE_DELTA_CBOR.to_vec()).await
-}
-
-#[cfg(target_arch = "wasm32")]
 pub fn classify_response(
     response: freenet_stdlib::client_api::HostResponse,
 ) -> Option<ClassifiedResponse> {
@@ -257,14 +247,12 @@ pub fn classify_response(
             }
 
             let bytes = state.as_ref();
-            let should_submit_first_delta = bytes == EMPTY_LEDGER_CBOR;
 
             Some(ClassifiedResponse {
                 contract_status: Some(retrieved_status(bytes)),
                 subscription_status: Some(SubscriptionStatus::Active),
                 contract_key: Some(key),
                 authoritative_state: Some(bytes.to_vec()),
-                should_submit_first_delta,
             })
         }
 
@@ -310,7 +298,6 @@ pub fn classify_response(
                 subscription_status: Some(SubscriptionStatus::Active),
                 contract_key,
                 authoritative_state,
-                should_submit_first_delta: false,
             })
         }
 
@@ -328,7 +315,6 @@ pub fn classify_response(
                 }),
                 contract_key: None,
                 authoritative_state: None,
-                should_submit_first_delta: false,
             })
         }
 
@@ -342,7 +328,6 @@ pub fn classify_response(
                 subscription_status: Some(SubscriptionStatus::Inactive),
                 contract_key: None,
                 authoritative_state: None,
-                should_submit_first_delta: false,
             })
         }
 
@@ -408,7 +393,10 @@ mod tests {
         };
 
         assert_eq!(empty.contract_label(), "Retrieved — 10 bytes");
-        assert_eq!(empty.state_label(), "Empty ledger verified");
+        assert_eq!(
+            empty.state_label(),
+            "Empty ledger verified — waiting for authenticated game creation"
+        );
         assert_eq!(one.contract_label(), "Retrieved — 516 bytes");
         assert_eq!(one.state_label(), "One network action verified");
         assert_eq!(several.state_label(), "3 network actions verified");
@@ -422,7 +410,7 @@ mod tests {
     }
 
     #[test]
-    fn pinned_first_action_fixtures_match_expected_wire_bytes() {
+    fn historical_unsigned_first_action_fixtures_remain_byte_identical() {
         assert_eq!(EMPTY_LEDGER_CBOR.len(), 10);
         assert_eq!(FIRST_CREATE_DELTA_CBOR.len(), 732);
         assert_eq!(EXPECTED_ONE_ACTION_STATE_CBOR.len(), 732);

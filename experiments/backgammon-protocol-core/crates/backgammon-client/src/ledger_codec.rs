@@ -1,9 +1,12 @@
 use backgammon_contract::{LedgerState, LedgerStateDelta};
 use backgammon_protocol::{
-    build_next_game_action, replay_game, verify_typed_action_history, Action, ActionId,
-    GameActionPayload, GameActionRecord, ReplayedGame,
+    build_next_game_action, encode_action_signing_message_v4, replay_game,
+    verify_action_authentication_v4, verify_typed_action_history, Action, ActionAuthentication,
+    ActionId, ActionSignature, ActionSigningBody, GameActionPayload, GameActionRecord,
+    GameConfiguration, ReplayedGame,
 };
 use ciborium::{de::from_reader, ser::into_writer};
+use ed25519_dalek::{Signer, SigningKey};
 
 /// A decoded and independently verified replicated ledger.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -65,10 +68,118 @@ pub fn decode_verified_replay(bytes: &[u8]) -> Result<ReplayedGame, String> {
         .map_err(|error| format!("typed ledger replay failed: {error:?}"))
 }
 
-/// Constructs and canonically encodes a one-action contract delta.
+fn authenticate_player_action_v4(
+    record: &GameActionRecord,
+    configuration: &GameConfiguration,
+    signing_key: &SigningKey,
+) -> Result<Action, String> {
+    let player = match &record.payload {
+        GameActionPayload::RequestRoll { player, .. }
+        | GameActionPayload::CommitDice { player, .. }
+        | GameActionPayload::RevealDice { player, .. }
+        | GameActionPayload::PlayTurn { player, .. }
+        | GameActionPayload::Resign { player } => *player,
+
+        _ => {
+            return Err(
+                "Only post-genesis player actions may use the single-player v4 signer.".to_owned(),
+            );
+        }
+    };
+
+    let expected_player_id = match player {
+        backgammon_core::Player::White => configuration.white.id,
+        backgammon_core::Player::Black => configuration.black.id,
+    };
+
+    let actual_player_id = signing_key.verifying_key().to_bytes();
+
+    if actual_player_id != expected_player_id {
+        return Err(format!(
+            "Local signing identity does not match the authoritative {player:?} PlayerId."
+        ));
+    }
+
+    let body = ActionSigningBody {
+        protocol_version: record.protocol_version,
+        game_id: record.game_id,
+        action_id: record.action_id,
+        sequence: record.sequence,
+        previous_state_hash: record.previous_state_hash,
+        resulting_state_hash: record.resulting_state_hash,
+        payload: record.payload.clone(),
+    };
+
+    let message = encode_action_signing_message_v4(&body)?;
+
+    let authentication = ActionAuthentication::Player {
+        signature: ActionSignature::from_bytes(signing_key.sign(&message).to_bytes()),
+    };
+
+    /*
+     * Verify locally through the same protocol policy used for hostile
+     * replicated input before allowing the action onto the wire.
+     */
+    verify_action_authentication_v4(&body, &authentication, configuration)?;
+
+    Action::from_authenticated_game_action_record(record, authentication)
+}
+
+/// Constructs and canonically encodes a signed protocol-v4 post-genesis
+/// one-action contract delta.
 ///
-/// The sequence number, previous-state hash, and resulting-state hash are
-/// derived from the verified ledger and cannot be supplied by the caller.
+/// The authoritative ledger derives sequence number and both state hashes.
+/// The supplied signing key must match the PlayerId assigned to the player
+/// named by the action payload.
+pub fn build_encoded_signed_action_delta(
+    state_bytes: &[u8],
+    action_id: ActionId,
+    payload: GameActionPayload,
+    signing_key: &SigningKey,
+) -> Result<(GameActionRecord, Vec<u8>), String> {
+    let ledger = decode_verified_ledger(state_bytes)?;
+
+    let configuration = ledger
+        .typed_actions()
+        .first()
+        .and_then(|record| match &record.payload {
+            GameActionPayload::CreateGame(configuration) => Some(configuration),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            "Verified ledger does not contain an authoritative genesis configuration.".to_owned()
+        })?;
+
+    let record = build_next_game_action(ledger.typed_actions(), action_id, payload)
+        .map_err(|error| format!("could not build next action: {error:?}"))?;
+
+    let action = authenticate_player_action_v4(&record, configuration, signing_key)?;
+
+    let delta = LedgerStateDelta {
+        actions: Some(vec![action]),
+    };
+
+    let mut encoded = Vec::new();
+
+    into_writer(&delta, &mut encoded)
+        .map_err(|error| format!("failed to encode signed ledger delta: {error}"))?;
+
+    let decoded: LedgerStateDelta = from_reader(encoded.as_slice())
+        .map_err(|error| format!("encoded signed ledger delta did not decode: {error}"))?;
+
+    if decoded != delta {
+        return Err("Encoded signed ledger delta did not round-trip exactly.".to_owned());
+    }
+
+    Ok((record, encoded))
+}
+
+/// Constructs and canonically encodes an unsigned one-action contract delta.
+///
+/// Test-only helper for historical and malformed-wire regression cases.
+/// Protocol-v4 production submission must use
+/// `build_encoded_signed_action_delta`.
+#[cfg(test)]
 pub fn build_encoded_action_delta(
     state_bytes: &[u8],
     action_id: ActionId,
@@ -109,11 +220,79 @@ mod tests {
     use super::*;
     use backgammon_core::Player;
 
-    const ONE_ACTION_STATE: &[u8] = include_bytes!("../fixtures/expected-one-action-state.cbor");
+    fn one_action_state() -> &'static [u8] {
+        crate::test_support::one_action_state()
+    }
+
+    fn test_signing_configuration() -> (GameConfiguration, SigningKey, SigningKey) {
+        let white = SigningKey::from_bytes(&[41; 32]);
+        let black = SigningKey::from_bytes(&[42; 32]);
+
+        let configuration = GameConfiguration {
+            white: backgammon_protocol::PlayerDescriptor {
+                id: white.verifying_key().to_bytes(),
+                display_name: "White".to_owned(),
+            },
+            black: backgammon_protocol::PlayerDescriptor {
+                id: black.verifying_key().to_bytes(),
+                display_name: "Black".to_owned(),
+            },
+            match_length: 1,
+        };
+
+        (configuration, white, black)
+    }
+
+    #[test]
+    fn v4_player_action_is_signed_by_declared_identity() {
+        let (configuration, white, _) = test_signing_configuration();
+
+        let record = GameActionRecord {
+            protocol_version: backgammon_protocol::PROTOCOL_VERSION,
+            game_id: [7; 32],
+            action_id: [8; 32],
+            sequence: 1,
+            previous_state_hash: [9; 32],
+            resulting_state_hash: [10; 32],
+            payload: GameActionPayload::Resign {
+                player: Player::White,
+            },
+        };
+
+        let action = authenticate_player_action_v4(&record, &configuration, &white).unwrap();
+
+        assert!(matches!(
+            action.authentication,
+            Some(ActionAuthentication::Player { .. })
+        ));
+
+        assert_eq!(action.to_game_action_record().unwrap(), record);
+    }
+
+    #[test]
+    fn v4_player_action_rejects_opponent_signing_key() {
+        let (configuration, _, black) = test_signing_configuration();
+
+        let record = GameActionRecord {
+            protocol_version: backgammon_protocol::PROTOCOL_VERSION,
+            game_id: [7; 32],
+            action_id: [8; 32],
+            sequence: 1,
+            previous_state_hash: [9; 32],
+            resulting_state_hash: [10; 32],
+            payload: GameActionPayload::Resign {
+                player: Player::White,
+            },
+        };
+
+        let error = authenticate_player_action_v4(&record, &configuration, &black).unwrap_err();
+
+        assert!(error.contains("does not match the authoritative White PlayerId"));
+    }
 
     #[test]
     fn pinned_network_state_decodes_as_one_verified_action() {
-        let ledger = decode_verified_ledger(ONE_ACTION_STATE).unwrap();
+        let ledger = decode_verified_ledger(one_action_state()).unwrap();
 
         assert_eq!(ledger.action_count(), 1);
         assert_eq!(ledger.storage_actions()[0].sequence, 0);
@@ -122,7 +301,7 @@ mod tests {
 
     #[test]
     fn pinned_network_state_returns_verified_authoritative_replay() {
-        let replay = decode_verified_replay(ONE_ACTION_STATE).unwrap();
+        let replay = decode_verified_replay(one_action_state()).unwrap();
 
         assert_eq!(replay.next_sequence, 1);
         assert_eq!(replay.next_turn, 0);
@@ -143,7 +322,7 @@ mod tests {
     #[test]
     fn dynamic_sequence_one_delta_round_trips() {
         let (record, encoded) = build_encoded_action_delta(
-            ONE_ACTION_STATE,
+            one_action_state(),
             [42; 32],
             GameActionPayload::Resign {
                 player: Player::White,
@@ -181,11 +360,11 @@ mod tests {
 
     #[test]
     fn duplicate_action_id_is_rejected() {
-        let ledger = decode_verified_ledger(ONE_ACTION_STATE).unwrap();
+        let ledger = decode_verified_ledger(one_action_state()).unwrap();
         let duplicate = ledger.typed_actions()[0].action_id;
 
         assert!(build_encoded_action_delta(
-            ONE_ACTION_STATE,
+            one_action_state(),
             duplicate,
             GameActionPayload::Resign {
                 player: Player::White,

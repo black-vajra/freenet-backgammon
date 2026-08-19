@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{DiceRoundState, GameConfiguration, GameId, ReplayStatus, StateHash, PROTOCOL_VERSION};
 
-const STATE_HASH_DOMAIN: &[u8] = b"freenet-backgammon-replay-state-v3\0";
+const STATE_HASH_DOMAIN: &[u8] = b"freenet-backgammon-replay-state-v4\0";
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct CanonicalReplayState {
@@ -109,8 +109,8 @@ mod tests {
     }
 
     #[test]
-    fn canonical_encoding_matches_v3_golden_fixture() {
-        let expected = include_bytes!("../tests/fixtures/canonical-replay-state-v3.cbor");
+    fn canonical_encoding_matches_v4_golden_fixture() {
+        let expected = include_bytes!("../tests/fixtures/canonical-replay-state-v4.cbor");
 
         let encoded = snapshot().encode_canonical().unwrap();
 
@@ -118,8 +118,8 @@ mod tests {
     }
 
     #[test]
-    fn canonical_hash_matches_v3_golden_fixture() {
-        let expected = include_bytes!("../tests/fixtures/canonical-replay-state-v3.blake3");
+    fn canonical_hash_matches_v4_golden_fixture() {
+        let expected = include_bytes!("../tests/fixtures/canonical-replay-state-v4.blake3");
 
         assert_eq!(expected.len(), 32);
         assert_eq!(snapshot().hash().unwrap().as_slice(), expected);

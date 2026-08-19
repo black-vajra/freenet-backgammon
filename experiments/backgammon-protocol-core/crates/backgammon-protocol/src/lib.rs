@@ -15,7 +15,7 @@ pub use state_hash::*;
 use ciborium::{de::from_reader, ser::into_writer};
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 pub const GENESIS_STATE_HASH: StateHash = [0_u8; 32];
 
 pub type GameId = [u8; 32];
@@ -47,6 +47,16 @@ pub struct Action {
     pub previous_state_hash: StateHash,
     pub resulting_state_hash: StateHash,
     pub payload: Vec<u8>,
+
+    /*
+     * Protocol-v4 actions require authentication.
+     *
+     * The default exists only so historical unsigned wire data can still be
+     * decoded far enough to fail closed with an explicit missing-
+     * authentication error. Verified v4 history never accepts None.
+     */
+    #[serde(default)]
+    pub authentication: Option<ActionAuthentication>,
 }
 
 pub fn encode_game_action_payload(payload: &GameActionPayload) -> Result<Vec<u8>, String> {
@@ -99,7 +109,20 @@ impl Action {
             previous_state_hash: record.previous_state_hash,
             resulting_state_hash: record.resulting_state_hash,
             payload: encode_game_action_payload(&record.payload)?,
+            authentication: None,
         })
+    }
+
+    /// Converts a finalized game-action body into a replicated v4 action with
+    /// explicit authentication attached.
+    pub fn from_authenticated_game_action_record(
+        record: &GameActionRecord,
+        authentication: ActionAuthentication,
+    ) -> Result<Self, String> {
+        let mut action = Self::from_game_action_record(record)?;
+        authentication.verify_structure()?;
+        action.authentication = Some(authentication);
+        Ok(action)
     }
 
     pub fn to_game_action_record(&self) -> Result<GameActionRecord, String> {
@@ -131,12 +154,45 @@ pub fn verify_typed_action_history(actions: &[Action]) -> Result<(), String> {
     let mut ordered: Vec<&Action> = actions.iter().collect();
     ordered.sort_unstable_by_key(|action| action.sequence);
 
-    let records: Result<Vec<_>, _> = ordered
-        .into_iter()
-        .map(Action::to_game_action_record)
-        .collect();
+    let records: Vec<GameActionRecord> = ordered
+        .iter()
+        .map(|action| action.to_game_action_record())
+        .collect::<Result<_, _>>()?;
 
-    replay_game(&records?)
+    let configuration = match &records[0].payload {
+        GameActionPayload::CreateGame(configuration) => configuration.clone(),
+        _ => return Err("first authenticated action must create the game".into()),
+    };
+
+    for (action, record) in ordered.iter().zip(records.iter()) {
+        let authentication = action.authentication.as_ref().ok_or_else(|| {
+            format!(
+                "protocol-v4 action {} is missing authentication",
+                action.sequence
+            )
+        })?;
+
+        let signing_body = ActionSigningBody {
+            protocol_version: record.protocol_version,
+            game_id: record.game_id,
+            action_id: record.action_id,
+            sequence: record.sequence,
+            previous_state_hash: record.previous_state_hash,
+            resulting_state_hash: record.resulting_state_hash,
+            payload: record.payload.clone(),
+        };
+
+        verify_action_authentication_v4(&signing_body, authentication, &configuration).map_err(
+            |error| {
+                format!(
+                    "protocol-v4 action {} failed authentication: {error}",
+                    action.sequence
+                )
+            },
+        )?;
+    }
+
+    replay_game(&records)
         .map(|_| ())
         .map_err(|error| format!("typed game replay failed: {error:?}"))
 }
@@ -220,6 +276,7 @@ pub fn verify_action_history(actions: &[Action]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
 
     fn game(id: u8) -> GameId {
         [id; 32]
@@ -243,6 +300,7 @@ mod tests {
             previous_state_hash,
             resulting_state_hash,
             payload: vec![id],
+            authentication: None,
         }
     }
 
@@ -261,10 +319,12 @@ mod tests {
         }
     }
 
-    fn typed_create_record() -> GameActionRecord {
+    fn typed_create_record_with_configuration(
+        configuration: GameConfiguration,
+    ) -> GameActionRecord {
         let snapshot = CanonicalReplayState::new(
             [7; 32],
-            configuration(),
+            configuration.clone(),
             backgammon_core::GameState::standard_start(),
             0,
             DiceRoundState::default(),
@@ -278,8 +338,60 @@ mod tests {
             sequence: 0,
             previous_state_hash: GENESIS_STATE_HASH,
             resulting_state_hash: snapshot.hash().unwrap(),
-            payload: GameActionPayload::CreateGame(configuration()),
+            payload: GameActionPayload::CreateGame(configuration),
         }
+    }
+
+    fn typed_create_record() -> GameActionRecord {
+        typed_create_record_with_configuration(configuration())
+    }
+
+    fn deterministic_signing_key(seed_byte: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed_byte; 32])
+    }
+
+    fn signed_configuration() -> (GameConfiguration, SigningKey, SigningKey) {
+        let white = deterministic_signing_key(41);
+        let black = deterministic_signing_key(42);
+
+        let configuration = GameConfiguration {
+            white: PlayerDescriptor {
+                id: white.verifying_key().to_bytes(),
+                display_name: "White".to_owned(),
+            },
+            black: PlayerDescriptor {
+                id: black.verifying_key().to_bytes(),
+                display_name: "Black".to_owned(),
+            },
+            match_length: 1,
+        };
+
+        (configuration, white, black)
+    }
+
+    fn dual_signed_create_action(
+        record: &GameActionRecord,
+        white: &SigningKey,
+        black: &SigningKey,
+    ) -> Action {
+        let body = ActionSigningBody {
+            protocol_version: record.protocol_version,
+            game_id: record.game_id,
+            action_id: record.action_id,
+            sequence: record.sequence,
+            previous_state_hash: record.previous_state_hash,
+            resulting_state_hash: record.resulting_state_hash,
+            payload: record.payload.clone(),
+        };
+
+        let message = encode_action_signing_message_v4(&body).unwrap();
+
+        let authentication = ActionAuthentication::Genesis {
+            white_signature: ActionSignature::from_bytes(white.sign(&message).to_bytes()),
+            black_signature: ActionSignature::from_bytes(black.sign(&message).to_bytes()),
+        };
+
+        Action::from_authenticated_game_action_record(record, authentication).unwrap()
     }
 
     #[test]
@@ -302,16 +414,26 @@ mod tests {
 
     #[test]
     fn typed_create_history_replays_successfully() {
-        let action = Action::from_game_action_record(&typed_create_record()).unwrap();
+        let (configuration, white, black) = signed_configuration();
+        let record = typed_create_record_with_configuration(configuration);
+        let action = dual_signed_create_action(&record, &white, &black);
 
         assert_eq!(verify_typed_action_history(&[action]), Ok(()));
     }
 
     #[test]
     fn forged_typed_resulting_hash_is_rejected() {
-        let mut action = Action::from_game_action_record(&typed_create_record()).unwrap();
+        let (configuration, white, black) = signed_configuration();
+        let mut record = typed_create_record_with_configuration(configuration);
 
-        action.resulting_state_hash = [99; 32];
+        /*
+         * Sign the forged finalized body itself. Authentication must therefore
+         * succeed before deterministic replay rejects the false resulting
+         * state hash.
+         */
+        record.resulting_state_hash = [99; 32];
+
+        let action = dual_signed_create_action(&record, &white, &black);
 
         assert!(verify_typed_action_history(&[action])
             .unwrap_err()
