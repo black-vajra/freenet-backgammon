@@ -4,6 +4,7 @@ mod components;
 pub mod commitment_planner;
 pub mod controller;
 pub mod genesis_handshake;
+pub mod genesis_handshake_store;
 pub mod ledger_codec;
 pub mod local_identity_store;
 pub mod local_role_store;
