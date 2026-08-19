@@ -62,6 +62,69 @@ pub fn encode_action_signing_message_v4(body: &ActionSigningBody) -> Result<Vec<
 /// Raw byte length of an Ed25519 signature.
 pub const ED25519_SIGNATURE_BYTES: usize = 64;
 
+/// Serialized Ed25519 signature carried by a protocol-v4 action.
+///
+/// The byte vector is intentionally verified explicitly so malformed network
+/// input can be rejected cleanly rather than being assumed to have a valid
+/// length.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct ActionSignature(pub Vec<u8>);
+
+impl ActionSignature {
+    pub fn from_bytes(bytes: [u8; ED25519_SIGNATURE_BYTES]) -> Self {
+        Self(bytes.to_vec())
+    }
+
+    pub fn verify(&self) -> Result<(), String> {
+        if self.0.len() != ED25519_SIGNATURE_BYTES {
+            return Err(format!(
+                "invalid Ed25519 signature length: expected {ED25519_SIGNATURE_BYTES} bytes, got {}",
+                self.0.len()
+            ));
+        }
+
+        Ok(())
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// Authentication material attached to a finalized protocol-v4 game action.
+///
+/// Genesis is jointly authorized by both configured players. Every supported
+/// post-genesis action carries exactly one player signature.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub enum ActionAuthentication {
+    Genesis {
+        white_signature: ActionSignature,
+        black_signature: ActionSignature,
+    },
+    Player {
+        signature: ActionSignature,
+    },
+}
+
+impl ActionAuthentication {
+    pub fn verify_structure(&self) -> Result<(), String> {
+        match self {
+            Self::Genesis {
+                white_signature,
+                black_signature,
+            } => {
+                white_signature.verify()?;
+                black_signature.verify()?;
+            }
+            Self::Player { signature } => {
+                signature.verify()?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
 /// Verifies one protocol-v4 action signature against the player's
 /// authoritative Ed25519 public identity.
 ///
@@ -116,6 +179,54 @@ mod tests {
 
     fn deterministic_signing_key(seed_byte: u8) -> SigningKey {
         SigningKey::from_bytes(&[seed_byte; 32])
+    }
+
+    #[test]
+    fn action_signature_requires_exact_ed25519_length() {
+        let valid = ActionSignature(vec![7; ED25519_SIGNATURE_BYTES]);
+        valid.verify().unwrap();
+
+        assert!(ActionSignature(vec![7; 63]).verify().is_err());
+        assert!(ActionSignature(vec![7; 65]).verify().is_err());
+    }
+
+    #[test]
+    fn genesis_authentication_requires_two_well_formed_signatures() {
+        let valid = ActionAuthentication::Genesis {
+            white_signature: ActionSignature(vec![1; ED25519_SIGNATURE_BYTES]),
+            black_signature: ActionSignature(vec![2; ED25519_SIGNATURE_BYTES]),
+        };
+
+        valid.verify_structure().unwrap();
+
+        let invalid_white = ActionAuthentication::Genesis {
+            white_signature: ActionSignature(vec![1; 63]),
+            black_signature: ActionSignature(vec![2; ED25519_SIGNATURE_BYTES]),
+        };
+
+        assert!(invalid_white.verify_structure().is_err());
+
+        let invalid_black = ActionAuthentication::Genesis {
+            white_signature: ActionSignature(vec![1; ED25519_SIGNATURE_BYTES]),
+            black_signature: ActionSignature(vec![2; 65]),
+        };
+
+        assert!(invalid_black.verify_structure().is_err());
+    }
+
+    #[test]
+    fn player_authentication_requires_one_well_formed_signature() {
+        let valid = ActionAuthentication::Player {
+            signature: ActionSignature(vec![3; ED25519_SIGNATURE_BYTES]),
+        };
+
+        valid.verify_structure().unwrap();
+
+        let invalid = ActionAuthentication::Player {
+            signature: ActionSignature(vec![3; 63]),
+        };
+
+        assert!(invalid.verify_structure().is_err());
     }
 
     #[test]
