@@ -11,8 +11,8 @@ pub const ACTION_SIGNATURE_DOMAIN_V4: &[u8] = b"freenet-backgammon/action/v4";
 
 /// Protocol version authenticated by this signing and authorization scheme.
 ///
-/// The live replicated protocol remains v3 until the authenticated wire
-/// transition is made deliberately.
+/// The live replicated game-action protocol uses this authenticated v4
+/// signing and authorization scheme.
 pub const ACTION_PROTOCOL_VERSION_V4: u16 = 4;
 
 /// Final immutable action fields covered by protocol-v4 authentication.

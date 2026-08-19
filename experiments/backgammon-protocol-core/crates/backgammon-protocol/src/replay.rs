@@ -394,6 +394,61 @@ impl ReplayedGame {
     }
 }
 
+/// Builds the canonical sequence-zero CreateGame action for a new game.
+///
+/// Genesis has no prior game history from which to derive its state. The
+/// configuration is therefore validated as part of the CreateGame payload,
+/// and the resulting-state hash is derived from the exact canonical initial
+/// replay state used by normal history verification.
+///
+/// Authentication is deliberately not added here. Both players must sign the
+/// returned finalized record before it can become an authenticated protocol-v4
+/// wire action.
+pub fn build_genesis_game_action(
+    game_id: GameId,
+    action_id: crate::ActionId,
+    configuration: GameConfiguration,
+) -> Result<GameActionRecord, ReplayError> {
+    let replay = ReplayedGame {
+        game_id,
+        configuration: configuration.clone(),
+        state: GameState::standard_start(),
+        next_sequence: 1,
+        next_turn: 0,
+        completed_turns: Vec::new(),
+        roll_requested_by: None,
+        dice_round: DiceRoundState::default(),
+        status: ReplayStatus::InProgress,
+        latest_state_hash: GENESIS_STATE_HASH,
+    };
+
+    let resulting_state_hash = replay
+        .canonical_hash()
+        .map_err(|error| ReplayError::StateHash { sequence: 0, error })?;
+
+    let record = GameActionRecord {
+        protocol_version: crate::PROTOCOL_VERSION,
+        game_id,
+        action_id,
+        sequence: 0,
+        previous_state_hash: GENESIS_STATE_HASH,
+        resulting_state_hash,
+        payload: GameActionPayload::CreateGame(configuration),
+    };
+
+    record
+        .verify()
+        .map_err(|error| ReplayError::InvalidAction { sequence: 0, error })?;
+
+    /*
+     * Verify the complete sequence-zero history through the ordinary replay
+     * path as a final independent check of the derived state hash.
+     */
+    replay_game(std::slice::from_ref(&record))?;
+
+    Ok(record)
+}
+
 /// Builds one canonical action extending an already verified game history.
 ///
 /// The existing history is replayed first. The candidate payload is then
@@ -606,26 +661,48 @@ mod tests {
     }
 
     fn create_record() -> GameActionRecord {
-        let replay = ReplayedGame {
-            game_id: [9; 32],
-            configuration: configuration(),
-            state: GameState::standard_start(),
-            next_sequence: 1,
-            next_turn: 0,
-            completed_turns: Vec::new(),
-            roll_requested_by: None,
-            dice_round: DiceRoundState::default(),
-            status: ReplayStatus::InProgress,
-            latest_state_hash: GENESIS_STATE_HASH,
-        };
+        build_genesis_game_action([9; 32], [1; 32], configuration()).unwrap()
+    }
 
-        bare_record(
-            0,
-            1,
-            GENESIS_STATE_HASH,
-            replay.canonical_hash().unwrap(),
-            GameActionPayload::CreateGame(configuration()),
-        )
+    #[test]
+    fn genesis_builder_derives_verified_sequence_zero_record() {
+        let configuration = configuration();
+
+        let record = build_genesis_game_action([9; 32], [1; 32], configuration.clone()).unwrap();
+
+        assert_eq!(record.protocol_version, crate::PROTOCOL_VERSION);
+        assert_eq!(record.game_id, [9; 32]);
+        assert_eq!(record.action_id, [1; 32]);
+        assert_eq!(record.sequence, 0);
+        assert_eq!(record.previous_state_hash, GENESIS_STATE_HASH);
+        assert_eq!(
+            record.payload,
+            GameActionPayload::CreateGame(configuration.clone())
+        );
+
+        let replay = replay_game(std::slice::from_ref(&record)).unwrap();
+
+        assert_eq!(replay.game_id, record.game_id);
+        assert_eq!(replay.configuration, configuration);
+        assert_eq!(replay.next_sequence, 1);
+        assert_eq!(replay.next_turn, 0);
+        assert_eq!(replay.latest_state_hash, record.resulting_state_hash);
+    }
+
+    #[test]
+    fn identical_genesis_inputs_produce_identical_records() {
+        let first = build_genesis_game_action([9; 32], [1; 32], configuration()).unwrap();
+        let second = build_genesis_game_action([9; 32], [1; 32], configuration()).unwrap();
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn genesis_builder_rejects_invalid_configuration() {
+        let mut invalid = configuration();
+        invalid.black.id = invalid.white.id;
+
+        assert!(build_genesis_game_action([9; 32], [1; 32], invalid).is_err());
     }
 
     fn append_valid(records: &mut Vec<GameActionRecord>, payload: GameActionPayload) {
