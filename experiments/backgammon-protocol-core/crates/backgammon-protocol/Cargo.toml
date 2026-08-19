@@ -11,4 +11,5 @@ crate-type = ["rlib"]
 backgammon-core = { path = "../backgammon-core" }
 blake3 = "1.8.5"
 ciborium.workspace = true
+ed25519-dalek = { version = "3.0.0", default-features = false }
 serde.workspace = true

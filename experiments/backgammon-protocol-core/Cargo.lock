@@ -82,6 +82,7 @@ dependencies = [
  "backgammon-core",
  "blake3",
  "ciborium",
+ "ed25519-dalek",
  "serde",
 ]
 
