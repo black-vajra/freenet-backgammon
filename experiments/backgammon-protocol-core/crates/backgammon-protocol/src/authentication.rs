@@ -1,12 +1,19 @@
+use backgammon_core::Player;
 use ciborium::ser::into_writer;
 use ed25519_dalek::{Signature, VerifyingKey};
 use serde::Serialize;
 
-use crate::{ActionId, GameActionPayload, GameId, PlayerId, StateHash};
+use crate::{ActionId, GameActionPayload, GameConfiguration, GameId, PlayerId, StateHash};
 
 /// Domain separating protocol-v4 game-action signatures from every other
 /// signature produced by the same player identity.
 pub const ACTION_SIGNATURE_DOMAIN_V4: &[u8] = b"freenet-backgammon/action/v4";
+
+/// Protocol version authenticated by this signing and authorization scheme.
+///
+/// The live replicated protocol remains v3 until the authenticated wire
+/// transition is made deliberately.
+pub const ACTION_PROTOCOL_VERSION_V4: u16 = 4;
 
 /// Final immutable action fields covered by protocol-v4 authentication.
 ///
@@ -156,6 +163,94 @@ pub fn verify_action_signature_v4(
         .map_err(|error| format!("invalid protocol-v4 action signature: {error}"))
 }
 
+fn configured_player_id(configuration: &GameConfiguration, player: Player) -> &PlayerId {
+    match player {
+        Player::White => &configuration.white.id,
+        Player::Black => &configuration.black.id,
+    }
+}
+
+fn configurations_match(left: &GameConfiguration, right: &GameConfiguration) -> bool {
+    left.white.id == right.white.id
+        && left.white.display_name == right.white.display_name
+        && left.black.id == right.black.id
+        && left.black.display_name == right.black.display_name
+        && left.match_length == right.match_length
+}
+
+/// Enforces protocol-v4 authorization policy for one finalized action.
+///
+/// For genesis, `configuration` must be the exact authoritative configuration
+/// carried by the CreateGame payload. Both configured players must sign the
+/// same finalized body.
+///
+/// For supported post-genesis actions, the sole signature must verify against
+/// the configured identity for the player named by the payload.
+///
+/// Abandon is deliberately unsupported in v4 until an authenticated
+/// reconnection and abandonment policy is defined.
+pub fn verify_action_authentication_v4(
+    body: &ActionSigningBody,
+    authentication: &ActionAuthentication,
+    configuration: &GameConfiguration,
+) -> Result<(), String> {
+    if body.protocol_version != ACTION_PROTOCOL_VERSION_V4 {
+        return Err(format!(
+            "unsupported authenticated action protocol version: expected {}, got {}",
+            ACTION_PROTOCOL_VERSION_V4, body.protocol_version
+        ));
+    }
+
+    authentication.verify_structure()?;
+
+    match (&body.payload, authentication) {
+        (
+            GameActionPayload::CreateGame(genesis_configuration),
+            ActionAuthentication::Genesis {
+                white_signature,
+                black_signature,
+            },
+        ) => {
+            if !configurations_match(genesis_configuration, configuration) {
+                return Err(
+                    "genesis authentication configuration does not match action payload".to_owned(),
+                );
+            }
+
+            verify_action_signature_v4(&configuration.white.id, white_signature.as_bytes(), body)?;
+
+            verify_action_signature_v4(&configuration.black.id, black_signature.as_bytes(), body)?;
+
+            Ok(())
+        }
+
+        (
+            GameActionPayload::RequestRoll { player, .. }
+            | GameActionPayload::CommitDice { player, .. }
+            | GameActionPayload::RevealDice { player, .. }
+            | GameActionPayload::PlayTurn { player, .. }
+            | GameActionPayload::Resign { player },
+            ActionAuthentication::Player { signature },
+        ) => verify_action_signature_v4(
+            configured_player_id(configuration, *player),
+            signature.as_bytes(),
+            body,
+        ),
+
+        (GameActionPayload::Abandon { .. }, _) => {
+            Err("Abandon is unsupported by protocol-v4 authentication".to_owned())
+        }
+
+        (GameActionPayload::CreateGame(_), ActionAuthentication::Player { .. }) => {
+            Err("CreateGame requires dual genesis authentication".to_owned())
+        }
+
+        (_, ActionAuthentication::Genesis { .. }) => {
+            Err("post-genesis action requires single-player authentication".to_owned())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,7 +259,7 @@ mod tests {
 
     fn signing_body() -> ActionSigningBody {
         ActionSigningBody {
-            protocol_version: 4,
+            protocol_version: ACTION_PROTOCOL_VERSION_V4,
             game_id: [1; 32],
             action_id: [2; 32],
             sequence: 7,
@@ -179,6 +274,225 @@ mod tests {
 
     fn deterministic_signing_key(seed_byte: u8) -> SigningKey {
         SigningKey::from_bytes(&[seed_byte; 32])
+    }
+
+    fn game_configuration(white: &SigningKey, black: &SigningKey) -> GameConfiguration {
+        GameConfiguration {
+            white: crate::PlayerDescriptor {
+                id: white.verifying_key().to_bytes(),
+                display_name: "White".to_owned(),
+            },
+            black: crate::PlayerDescriptor {
+                id: black.verifying_key().to_bytes(),
+                display_name: "Black".to_owned(),
+            },
+            match_length: 1,
+        }
+    }
+
+    fn body_with_payload(payload: GameActionPayload) -> ActionSigningBody {
+        ActionSigningBody {
+            protocol_version: ACTION_PROTOCOL_VERSION_V4,
+            game_id: [11; 32],
+            action_id: [12; 32],
+            sequence: 1,
+            previous_state_hash: [13; 32],
+            resulting_state_hash: [14; 32],
+            payload,
+        }
+    }
+
+    fn player_authentication(
+        body: &ActionSigningBody,
+        signing_key: &SigningKey,
+    ) -> ActionAuthentication {
+        let message = encode_action_signing_message_v4(body).unwrap();
+
+        ActionAuthentication::Player {
+            signature: ActionSignature::from_bytes(signing_key.sign(&message).to_bytes()),
+        }
+    }
+
+    fn genesis_authentication(
+        body: &ActionSigningBody,
+        white: &SigningKey,
+        black: &SigningKey,
+    ) -> ActionAuthentication {
+        let message = encode_action_signing_message_v4(body).unwrap();
+
+        ActionAuthentication::Genesis {
+            white_signature: ActionSignature::from_bytes(white.sign(&message).to_bytes()),
+            black_signature: ActionSignature::from_bytes(black.sign(&message).to_bytes()),
+        }
+    }
+
+    #[test]
+    fn dual_signed_genesis_is_authorized() {
+        let white = deterministic_signing_key(31);
+        let black = deterministic_signing_key(32);
+        let body_configuration = game_configuration(&white, &black);
+        let authoritative_configuration = game_configuration(&white, &black);
+
+        let body = body_with_payload(GameActionPayload::CreateGame(body_configuration));
+
+        let authentication = genesis_authentication(&body, &white, &black);
+
+        verify_action_authentication_v4(&body, &authentication, &authoritative_configuration)
+            .unwrap();
+    }
+
+    #[test]
+    fn genesis_rejects_single_player_authentication() {
+        let white = deterministic_signing_key(31);
+        let black = deterministic_signing_key(32);
+        let configuration = game_configuration(&white, &black);
+
+        let body = body_with_payload(GameActionPayload::CreateGame(game_configuration(
+            &white, &black,
+        )));
+
+        let authentication = player_authentication(&body, &white);
+
+        assert!(verify_action_authentication_v4(&body, &authentication, &configuration).is_err());
+    }
+
+    #[test]
+    fn genesis_rejects_wrong_player_signature() {
+        let white = deterministic_signing_key(31);
+        let black = deterministic_signing_key(32);
+        let outsider = deterministic_signing_key(33);
+        let configuration = game_configuration(&white, &black);
+
+        let body = body_with_payload(GameActionPayload::CreateGame(game_configuration(
+            &white, &black,
+        )));
+
+        let message = encode_action_signing_message_v4(&body).unwrap();
+
+        let authentication = ActionAuthentication::Genesis {
+            white_signature: ActionSignature::from_bytes(white.sign(&message).to_bytes()),
+            black_signature: ActionSignature::from_bytes(outsider.sign(&message).to_bytes()),
+        };
+
+        assert!(verify_action_authentication_v4(&body, &authentication, &configuration).is_err());
+    }
+
+    #[test]
+    fn genesis_rejects_mismatched_authoritative_configuration() {
+        let white = deterministic_signing_key(31);
+        let black = deterministic_signing_key(32);
+        let body_configuration = game_configuration(&white, &black);
+        let mut authoritative_configuration = game_configuration(&white, &black);
+        authoritative_configuration.match_length = 3;
+
+        let body = body_with_payload(GameActionPayload::CreateGame(body_configuration));
+
+        let authentication = genesis_authentication(&body, &white, &black);
+
+        assert!(verify_action_authentication_v4(
+            &body,
+            &authentication,
+            &authoritative_configuration
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn declared_player_signature_is_authorized() {
+        let white = deterministic_signing_key(31);
+        let black = deterministic_signing_key(32);
+        let configuration = game_configuration(&white, &black);
+
+        let body = body_with_payload(GameActionPayload::RequestRoll {
+            turn: 5,
+            player: Player::White,
+        });
+
+        let authentication = player_authentication(&body, &white);
+
+        verify_action_authentication_v4(&body, &authentication, &configuration).unwrap();
+    }
+
+    #[test]
+    fn opponent_signature_is_rejected() {
+        let white = deterministic_signing_key(31);
+        let black = deterministic_signing_key(32);
+        let configuration = game_configuration(&white, &black);
+
+        let body = body_with_payload(GameActionPayload::RequestRoll {
+            turn: 5,
+            player: Player::White,
+        });
+
+        let authentication = player_authentication(&body, &black);
+
+        assert!(verify_action_authentication_v4(&body, &authentication, &configuration).is_err());
+    }
+
+    #[test]
+    fn nonparticipant_signature_is_rejected() {
+        let white = deterministic_signing_key(31);
+        let black = deterministic_signing_key(32);
+        let outsider = deterministic_signing_key(33);
+        let configuration = game_configuration(&white, &black);
+
+        let body = body_with_payload(GameActionPayload::RequestRoll {
+            turn: 5,
+            player: Player::White,
+        });
+
+        let authentication = player_authentication(&body, &outsider);
+
+        assert!(verify_action_authentication_v4(&body, &authentication, &configuration).is_err());
+    }
+
+    #[test]
+    fn post_genesis_action_rejects_genesis_authentication() {
+        let white = deterministic_signing_key(31);
+        let black = deterministic_signing_key(32);
+        let configuration = game_configuration(&white, &black);
+
+        let body = body_with_payload(GameActionPayload::RequestRoll {
+            turn: 5,
+            player: Player::White,
+        });
+
+        let authentication = genesis_authentication(&body, &white, &black);
+
+        assert!(verify_action_authentication_v4(&body, &authentication, &configuration).is_err());
+    }
+
+    #[test]
+    fn abandon_is_rejected_even_when_signed_by_named_player() {
+        let white = deterministic_signing_key(31);
+        let black = deterministic_signing_key(32);
+        let configuration = game_configuration(&white, &black);
+
+        let body = body_with_payload(GameActionPayload::Abandon {
+            player: Player::White,
+        });
+
+        let authentication = player_authentication(&body, &white);
+
+        assert!(verify_action_authentication_v4(&body, &authentication, &configuration).is_err());
+    }
+
+    #[test]
+    fn authenticated_policy_rejects_non_v4_body() {
+        let white = deterministic_signing_key(31);
+        let black = deterministic_signing_key(32);
+        let configuration = game_configuration(&white, &black);
+
+        let mut body = body_with_payload(GameActionPayload::RequestRoll {
+            turn: 5,
+            player: Player::White,
+        });
+
+        body.protocol_version = 3;
+
+        let authentication = player_authentication(&body, &white);
+
+        assert!(verify_action_authentication_v4(&body, &authentication, &configuration).is_err());
     }
 
     #[test]
