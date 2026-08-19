@@ -1,7 +1,8 @@
 use ciborium::ser::into_writer;
+use ed25519_dalek::{Signature, VerifyingKey};
 use serde::Serialize;
 
-use crate::{ActionId, GameActionPayload, GameId, StateHash};
+use crate::{ActionId, GameActionPayload, GameId, PlayerId, StateHash};
 
 /// Domain separating protocol-v4 game-action signatures from every other
 /// signature produced by the same player identity.
@@ -58,10 +59,45 @@ pub fn encode_action_signing_message_v4(body: &ActionSigningBody) -> Result<Vec<
     Ok(message)
 }
 
+/// Raw byte length of an Ed25519 signature.
+pub const ED25519_SIGNATURE_BYTES: usize = 64;
+
+/// Verifies one protocol-v4 action signature against the player's
+/// authoritative Ed25519 public identity.
+///
+/// `PlayerId` is interpreted directly as the 32-byte Ed25519 verifying key.
+/// The signed message is reconstructed locally from the finalized action body;
+/// peer-supplied signing bytes are never trusted.
+pub fn verify_action_signature_v4(
+    player_id: &PlayerId,
+    signature_bytes: &[u8],
+    body: &ActionSigningBody,
+) -> Result<(), String> {
+    let signature_array: [u8; ED25519_SIGNATURE_BYTES] = signature_bytes
+        .try_into()
+        .map_err(|_| {
+            format!(
+                "invalid Ed25519 signature length: expected {ED25519_SIGNATURE_BYTES} bytes, got {}",
+                signature_bytes.len()
+            )
+        })?;
+
+    let verifying_key = VerifyingKey::from_bytes(player_id)
+        .map_err(|error| format!("invalid Ed25519 player identity: {error}"))?;
+
+    let signature = Signature::from_bytes(&signature_array);
+    let message = encode_action_signing_message_v4(body)?;
+
+    verifying_key
+        .verify_strict(&message, &signature)
+        .map_err(|error| format!("invalid protocol-v4 action signature: {error}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use backgammon_core::Player;
+    use ed25519_dalek::{Signer, SigningKey};
 
     fn signing_body() -> ActionSigningBody {
         ActionSigningBody {
@@ -76,6 +112,62 @@ mod tests {
                 player: Player::Black,
             },
         }
+    }
+
+    fn deterministic_signing_key(seed_byte: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed_byte; 32])
+    }
+
+    #[test]
+    fn valid_action_signature_is_accepted() {
+        let body = signing_body();
+        let signing_key = deterministic_signing_key(17);
+        let player_id = signing_key.verifying_key().to_bytes();
+        let message = encode_action_signing_message_v4(&body).unwrap();
+        let signature = signing_key.sign(&message).to_bytes();
+
+        verify_action_signature_v4(&player_id, &signature, &body).unwrap();
+    }
+
+    #[test]
+    fn signature_from_wrong_player_is_rejected() {
+        let body = signing_body();
+        let signer = deterministic_signing_key(17);
+        let wrong_player = deterministic_signing_key(23);
+        let message = encode_action_signing_message_v4(&body).unwrap();
+        let signature = signer.sign(&message).to_bytes();
+
+        assert!(verify_action_signature_v4(
+            &wrong_player.verifying_key().to_bytes(),
+            &signature,
+            &body
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn signature_does_not_survive_action_mutation() {
+        let body = signing_body();
+        let signing_key = deterministic_signing_key(17);
+        let player_id = signing_key.verifying_key().to_bytes();
+        let message = encode_action_signing_message_v4(&body).unwrap();
+        let signature = signing_key.sign(&message).to_bytes();
+
+        let mut mutated = body;
+        mutated.sequence += 1;
+
+        assert!(verify_action_signature_v4(&player_id, &signature, &mutated).is_err());
+    }
+
+    #[test]
+    fn malformed_signature_lengths_are_rejected() {
+        let body = signing_body();
+        let signing_key = deterministic_signing_key(17);
+        let player_id = signing_key.verifying_key().to_bytes();
+
+        assert!(verify_action_signature_v4(&player_id, &[0; 63], &body).is_err());
+
+        assert!(verify_action_signature_v4(&player_id, &[0; 65], &body).is_err());
     }
 
     #[test]
