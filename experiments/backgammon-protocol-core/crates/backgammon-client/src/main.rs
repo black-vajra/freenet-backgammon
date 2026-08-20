@@ -8,6 +8,7 @@ pub mod controller;
 pub mod genesis_handshake;
 pub mod genesis_handshake_store;
 pub mod ledger_codec;
+pub mod lobby;
 pub mod local_identity_store;
 pub mod local_role_store;
 pub mod pending_action;
