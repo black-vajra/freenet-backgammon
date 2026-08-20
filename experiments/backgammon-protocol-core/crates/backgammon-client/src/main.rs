@@ -1,6 +1,7 @@
 #[cfg(target_arch = "wasm32")]
 mod components;
 
+pub mod challenge;
 pub mod commitment_planner;
 pub mod controller;
 pub mod genesis_handshake;
