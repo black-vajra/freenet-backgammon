@@ -26,6 +26,11 @@ const CHALLENGE_OFFER_SIGNATURE_DOMAIN_V1: &[u8] = b"freenet-backgammon/challeng
 const CHALLENGE_ACCEPTANCE_SIGNATURE_DOMAIN_V1: &[u8] =
     b"freenet-backgammon/challenge-acceptance/v1";
 
+const CHALLENGE_DECLINE_SIGNATURE_DOMAIN_V1: &[u8] = b"freenet-backgammon/challenge-decline/v1";
+
+const CHALLENGE_CANCELLATION_SIGNATURE_DOMAIN_V1: &[u8] =
+    b"freenet-backgammon/challenge-cancellation/v1";
+
 pub type ChallengeId = [u8; 32];
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -160,8 +165,40 @@ pub struct ChallengeAcceptance {
     pub signature: ChallengeSignature,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChallengeDecline {
+    pub protocol_version: u16,
+    pub challenge_id: ChallengeId,
+    pub player_id: PlayerId,
+    pub signature: ChallengeSignature,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChallengeCancellation {
+    pub protocol_version: u16,
+    pub challenge_id: ChallengeId,
+    pub player_id: PlayerId,
+    pub signature: ChallengeSignature,
+}
+
 #[derive(Serialize)]
 struct ChallengeAcceptanceSigningBody<'a> {
+    protocol_version: u16,
+    challenge_id: ChallengeId,
+    player_id: PlayerId,
+    offer: &'a ChallengeOfferBody,
+}
+
+#[derive(Serialize)]
+struct ChallengeDeclineSigningBody<'a> {
+    protocol_version: u16,
+    challenge_id: ChallengeId,
+    player_id: PlayerId,
+    offer: &'a ChallengeOfferBody,
+}
+
+#[derive(Serialize)]
+struct ChallengeCancellationSigningBody<'a> {
     protocol_version: u16,
     challenge_id: ChallengeId,
     player_id: PlayerId,
@@ -203,6 +240,38 @@ fn acceptance_signing_message(
     };
 
     encode_domain_separated_message(CHALLENGE_ACCEPTANCE_SIGNATURE_DOMAIN_V1, &body)
+}
+
+fn decline_signing_message(
+    offer: &ChallengeOfferBody,
+    protocol_version: u16,
+    challenge_id: ChallengeId,
+    player_id: PlayerId,
+) -> Result<Vec<u8>, String> {
+    let body = ChallengeDeclineSigningBody {
+        protocol_version,
+        challenge_id,
+        player_id,
+        offer,
+    };
+
+    encode_domain_separated_message(CHALLENGE_DECLINE_SIGNATURE_DOMAIN_V1, &body)
+}
+
+fn cancellation_signing_message(
+    offer: &ChallengeOfferBody,
+    protocol_version: u16,
+    challenge_id: ChallengeId,
+    player_id: PlayerId,
+) -> Result<Vec<u8>, String> {
+    let body = ChallengeCancellationSigningBody {
+        protocol_version,
+        challenge_id,
+        player_id,
+        offer,
+    };
+
+    encode_domain_separated_message(CHALLENGE_CANCELLATION_SIGNATURE_DOMAIN_V1, &body)
 }
 
 fn verify_ed25519_signature(
@@ -317,6 +386,178 @@ pub fn accept_challenge(
     verify_challenge_acceptance_at(offer, &acceptance, now_unix_seconds)?;
 
     Ok(acceptance)
+}
+
+/// Produces the challenged recipient's signed decline of this exact offer.
+///
+/// The offer must still be inside its lobby lifetime when the decline is
+/// created. Later expiration does not invalidate the resulting signature.
+pub fn decline_challenge(
+    offer: &SignedChallengeOffer,
+    signing_key: &SigningKey,
+    now_unix_seconds: u64,
+) -> Result<ChallengeDecline, String> {
+    verify_challenge_offer_at(offer, now_unix_seconds)?;
+
+    let expected_recipient = offer.body.recipient_id()?;
+    let player_id = signing_key.verifying_key().to_bytes();
+
+    if player_id != expected_recipient {
+        return Err("Only the challenged recipient may decline this challenge.".to_owned());
+    }
+
+    let protocol_version = CHALLENGE_PROTOCOL_VERSION;
+    let challenge_id = offer.body.challenge_id;
+
+    let message = decline_signing_message(&offer.body, protocol_version, challenge_id, player_id)?;
+
+    let decline = ChallengeDecline {
+        protocol_version,
+        challenge_id,
+        player_id,
+        signature: ChallengeSignature::from_bytes(signing_key.sign(&message).to_bytes()),
+    };
+
+    verify_challenge_decline(offer, &decline)?;
+
+    Ok(decline)
+}
+
+/// Cryptographically verifies a recipient's decline of the exact offer.
+///
+/// Like acceptance verification, this does not prove when the signature was
+/// created and therefore does not apply wall-clock expiry policy.
+pub fn verify_challenge_decline(
+    offer: &SignedChallengeOffer,
+    decline: &ChallengeDecline,
+) -> Result<(), String> {
+    verify_challenge_offer(offer)?;
+
+    if decline.protocol_version != CHALLENGE_PROTOCOL_VERSION {
+        return Err(format!(
+            "Challenge decline protocol version mismatch: expected {}, got {}.",
+            CHALLENGE_PROTOCOL_VERSION, decline.protocol_version
+        ));
+    }
+
+    if decline.challenge_id != offer.body.challenge_id {
+        return Err("Challenge decline refers to a different challenge ID.".to_owned());
+    }
+
+    let expected_recipient = offer.body.recipient_id()?;
+
+    if decline.player_id != expected_recipient {
+        return Err("Challenge decline was not produced by the challenged recipient.".to_owned());
+    }
+
+    let message = decline_signing_message(
+        &offer.body,
+        decline.protocol_version,
+        decline.challenge_id,
+        decline.player_id,
+    )?;
+
+    verify_ed25519_signature(
+        &decline.player_id,
+        &decline.signature,
+        &message,
+        "challenge-decline",
+    )
+}
+
+/// Live-processing variant for a still-open challenge.
+pub fn verify_challenge_decline_at(
+    offer: &SignedChallengeOffer,
+    decline: &ChallengeDecline,
+    now_unix_seconds: u64,
+) -> Result<(), String> {
+    verify_challenge_offer_at(offer, now_unix_seconds)?;
+    verify_challenge_decline(offer, decline)
+}
+
+/// Produces the original challenger's signed cancellation of this exact offer.
+///
+/// Cancellation is only created while the challenge remains live. A persisted
+/// authentic cancellation remains valid after ordinary wall-clock expiry.
+pub fn cancel_challenge(
+    offer: &SignedChallengeOffer,
+    signing_key: &SigningKey,
+    now_unix_seconds: u64,
+) -> Result<ChallengeCancellation, String> {
+    verify_challenge_offer_at(offer, now_unix_seconds)?;
+
+    let player_id = signing_key.verifying_key().to_bytes();
+
+    if player_id != offer.body.challenger_id {
+        return Err("Only the original challenger may cancel this challenge.".to_owned());
+    }
+
+    let protocol_version = CHALLENGE_PROTOCOL_VERSION;
+    let challenge_id = offer.body.challenge_id;
+
+    let message =
+        cancellation_signing_message(&offer.body, protocol_version, challenge_id, player_id)?;
+
+    let cancellation = ChallengeCancellation {
+        protocol_version,
+        challenge_id,
+        player_id,
+        signature: ChallengeSignature::from_bytes(signing_key.sign(&message).to_bytes()),
+    };
+
+    verify_challenge_cancellation(offer, &cancellation)?;
+
+    Ok(cancellation)
+}
+
+/// Cryptographically verifies the original challenger's cancellation of the
+/// exact offer.
+pub fn verify_challenge_cancellation(
+    offer: &SignedChallengeOffer,
+    cancellation: &ChallengeCancellation,
+) -> Result<(), String> {
+    verify_challenge_offer(offer)?;
+
+    if cancellation.protocol_version != CHALLENGE_PROTOCOL_VERSION {
+        return Err(format!(
+            "Challenge cancellation protocol version mismatch: expected {}, got {}.",
+            CHALLENGE_PROTOCOL_VERSION, cancellation.protocol_version
+        ));
+    }
+
+    if cancellation.challenge_id != offer.body.challenge_id {
+        return Err("Challenge cancellation refers to a different challenge ID.".to_owned());
+    }
+
+    if cancellation.player_id != offer.body.challenger_id {
+        return Err(
+            "Challenge cancellation was not produced by the original challenger.".to_owned(),
+        );
+    }
+
+    let message = cancellation_signing_message(
+        &offer.body,
+        cancellation.protocol_version,
+        cancellation.challenge_id,
+        cancellation.player_id,
+    )?;
+
+    verify_ed25519_signature(
+        &cancellation.player_id,
+        &cancellation.signature,
+        &message,
+        "challenge-cancellation",
+    )
+}
+
+/// Live-processing variant for a still-open challenge.
+pub fn verify_challenge_cancellation_at(
+    offer: &SignedChallengeOffer,
+    cancellation: &ChallengeCancellation,
+    now_unix_seconds: u64,
+) -> Result<(), String> {
+    verify_challenge_offer_at(offer, now_unix_seconds)?;
+    verify_challenge_cancellation(offer, cancellation)
 }
 
 /// Cryptographically verifies that the challenged participant accepted the
@@ -575,6 +816,119 @@ mod tests {
         acceptance.signature.0.pop();
 
         assert!(verify_challenge_acceptance_at(&offer, &acceptance, CREATED + 1).is_err());
+    }
+
+    #[test]
+    fn recipient_can_decline_exact_live_offer() {
+        let (body, white_key, black_key) = fixture();
+
+        let offer = sign_challenge_offer(body, &white_key).unwrap();
+        let decline = decline_challenge(&offer, &black_key, CREATED + 1).unwrap();
+
+        assert_eq!(decline.player_id, black_key.verifying_key().to_bytes());
+
+        assert_eq!(
+            verify_challenge_decline_at(&offer, &decline, CREATED + 1),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn challenger_and_outsider_cannot_decline() {
+        let (body, white_key, _) = fixture();
+
+        let offer = sign_challenge_offer(body, &white_key).unwrap();
+
+        assert!(decline_challenge(&offer, &white_key, CREATED + 1).is_err());
+
+        let outsider = SigningKey::from_bytes(&[65; 32]);
+
+        assert!(decline_challenge(&offer, &outsider, CREATED + 1).is_err());
+    }
+
+    #[test]
+    fn challenger_can_cancel_exact_live_offer() {
+        let (body, white_key, _) = fixture();
+
+        let offer = sign_challenge_offer(body, &white_key).unwrap();
+        let cancellation = cancel_challenge(&offer, &white_key, CREATED + 1).unwrap();
+
+        assert_eq!(cancellation.player_id, white_key.verifying_key().to_bytes());
+
+        assert_eq!(
+            verify_challenge_cancellation_at(&offer, &cancellation, CREATED + 1),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn recipient_and_outsider_cannot_cancel() {
+        let (body, white_key, black_key) = fixture();
+
+        let offer = sign_challenge_offer(body, &white_key).unwrap();
+
+        assert!(cancel_challenge(&offer, &black_key, CREATED + 1).is_err());
+
+        let outsider = SigningKey::from_bytes(&[66; 32]);
+
+        assert!(cancel_challenge(&offer, &outsider, CREATED + 1).is_err());
+    }
+
+    #[test]
+    fn decline_and_cancellation_are_bound_to_exact_offer() {
+        let (body, white_key, black_key) = fixture();
+
+        let first = sign_challenge_offer(body.clone(), &white_key).unwrap();
+
+        let decline = decline_challenge(&first, &black_key, CREATED + 1).unwrap();
+
+        let cancellation = cancel_challenge(&first, &white_key, CREATED + 1).unwrap();
+
+        let mut different_body = body;
+        different_body.challenge_id = [25; 32];
+
+        let different = sign_challenge_offer(different_body, &white_key).unwrap();
+
+        assert!(verify_challenge_decline(&different, &decline).is_err());
+
+        assert!(verify_challenge_cancellation(&different, &cancellation).is_err());
+    }
+
+    #[test]
+    fn decline_and_cancellation_remain_valid_after_expiry() {
+        let (body, white_key, black_key) = fixture();
+
+        let offer = sign_challenge_offer(body, &white_key).unwrap();
+
+        let decline = decline_challenge(&offer, &black_key, CREATED + 1).unwrap();
+
+        let cancellation = cancel_challenge(&offer, &white_key, CREATED + 1).unwrap();
+
+        assert!(verify_challenge_decline_at(&offer, &decline, EXPIRES).is_err());
+
+        assert!(verify_challenge_cancellation_at(&offer, &cancellation, EXPIRES).is_err());
+
+        assert_eq!(verify_challenge_decline(&offer, &decline), Ok(()));
+
+        assert_eq!(verify_challenge_cancellation(&offer, &cancellation), Ok(()));
+    }
+
+    #[test]
+    fn malformed_decline_and_cancellation_signatures_are_rejected() {
+        let (body, white_key, black_key) = fixture();
+
+        let offer = sign_challenge_offer(body, &white_key).unwrap();
+
+        let mut decline = decline_challenge(&offer, &black_key, CREATED + 1).unwrap();
+
+        let mut cancellation = cancel_challenge(&offer, &white_key, CREATED + 1).unwrap();
+
+        decline.signature.0.pop();
+        cancellation.signature.0.pop();
+
+        assert!(verify_challenge_decline(&offer, &decline).is_err());
+
+        assert!(verify_challenge_cancellation(&offer, &cancellation).is_err());
     }
 
     #[test]

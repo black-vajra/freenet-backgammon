@@ -2,6 +2,7 @@
 mod components;
 
 pub mod challenge;
+pub mod challenge_state;
 pub mod commitment_planner;
 pub mod controller;
 pub mod genesis_handshake;
