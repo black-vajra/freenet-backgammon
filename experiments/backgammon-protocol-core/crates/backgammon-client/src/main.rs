@@ -9,6 +9,7 @@ pub mod genesis_handshake;
 pub mod genesis_handshake_store;
 pub mod ledger_codec;
 pub mod lobby;
+pub mod lobby_profile_store;
 pub mod lobby_projection;
 pub mod local_identity_store;
 pub mod local_role_store;
@@ -30,6 +31,7 @@ mod browser {
     use backgammon_core::{GameState, MoveSource, MoveTarget, Player, TurnPhase, TurnSequence};
     use backgammon_protocol::{replay_game, DiceSecret, GameActionPayload};
     use yew::prelude::*;
+    use yew::TargetCast;
 
     use crate::commitment_planner::{plan_commitment, CommitmentPlan, CommitmentPlannerInput};
     use crate::components::board::Board;
@@ -39,6 +41,8 @@ mod browser {
     use crate::components::player_panel::PlayerPanel;
     use crate::controller::{LocalGameController, LocalGameOutcome, LocalTurnRecord};
     use crate::ledger_codec::{decode_verified_ledger, decode_verified_replay};
+    use crate::lobby_profile_store::{load_lobby_display_name, store_lobby_display_name};
+    use crate::lobby_projection::project_available_players;
     use crate::local_identity_store::{
         load_local_identity, load_or_create_local_identity, player_id_for_signing_key,
         role_for_player_id,
@@ -767,6 +771,16 @@ mod browser {
         let local_player_id = use_state(|| None::<[u8; 32]>);
 
         /*
+         * Lobby profile state is presentation/local intent only at this stage.
+         * No presence announcement is published until Freenet lobby transport
+         * is explicitly wired.
+         */
+        let lobby_display_name = use_state(String::new);
+        let lobby_available = use_state(|| false);
+        let lobby_profile_status = use_state(|| "Waiting for local identity".to_owned());
+        let lobby_profile_error = use_state(|| None::<String>);
+
+        /*
          * Role derived from this persistent PlayerId and a verified
          * authoritative GameConfiguration. None means no verified role
          * decision is available yet; Some(None) means not a participant.
@@ -830,6 +844,46 @@ mod browser {
                         player_id.set(None);
                         identity_status.set(format!("Local identity error: {error}"));
                     }
+                }
+
+                || {}
+            });
+        }
+
+        {
+            let lobby_display_name = lobby_display_name.clone();
+            let lobby_available = lobby_available.clone();
+            let lobby_profile_status = lobby_profile_status.clone();
+            let lobby_profile_error = lobby_profile_error.clone();
+
+            use_effect_with(*local_player_id, move |player_id| {
+                lobby_available.set(false);
+                lobby_profile_error.set(None);
+
+                match *player_id {
+                    None => {
+                        lobby_display_name.set(String::new());
+                        lobby_profile_status.set("Waiting for local identity".to_owned());
+                    }
+
+                    Some(player_id) => match load_lobby_display_name(&player_id) {
+                        Ok(Some(display_name)) => {
+                            lobby_display_name.set(display_name);
+                            lobby_profile_status.set("Saved display name loaded".to_owned());
+                        }
+
+                        Ok(None) => {
+                            lobby_display_name.set(String::new());
+                            lobby_profile_status.set("Choose a public display name".to_owned());
+                        }
+
+                        Err(error) => {
+                            lobby_display_name.set(String::new());
+                            lobby_profile_error
+                                .set(Some(format!("Lobby profile storage error: {error}")));
+                            lobby_profile_status.set("Lobby profile unavailable".to_owned());
+                        }
+                    },
                 }
 
                 || {}
@@ -2542,6 +2596,114 @@ mod browser {
             )
         };
 
+        let on_lobby_name_input = {
+            let lobby_display_name = lobby_display_name.clone();
+            let lobby_available = lobby_available.clone();
+            let lobby_profile_status = lobby_profile_status.clone();
+            let lobby_profile_error = lobby_profile_error.clone();
+
+            Callback::from(move |event: yew::events::InputEvent| {
+                let input: web_sys::HtmlInputElement = event.target_unchecked_into();
+
+                lobby_display_name.set(input.value());
+                lobby_available.set(false);
+                lobby_profile_status.set("Unsaved display name; currently unavailable".to_owned());
+                lobby_profile_error.set(None);
+            })
+        };
+
+        let on_save_lobby_name = {
+            let local_player_id = local_player_id.clone();
+            let lobby_display_name = lobby_display_name.clone();
+            let lobby_profile_status = lobby_profile_status.clone();
+            let lobby_profile_error = lobby_profile_error.clone();
+
+            Callback::from(move |_| {
+                let Some(player_id) = *local_player_id else {
+                    lobby_profile_error.set(Some("Local identity is not ready yet.".to_owned()));
+                    return;
+                };
+
+                match store_lobby_display_name(&player_id, lobby_display_name.as_str()) {
+                    Ok(()) => {
+                        lobby_profile_error.set(None);
+                        lobby_profile_status.set("Display name saved locally".to_owned());
+                    }
+
+                    Err(error) => {
+                        lobby_profile_error.set(Some(error));
+                    }
+                }
+            })
+        };
+
+        let on_toggle_lobby_availability = {
+            let local_player_id = local_player_id.clone();
+            let lobby_display_name = lobby_display_name.clone();
+            let lobby_available = lobby_available.clone();
+            let lobby_profile_status = lobby_profile_status.clone();
+            let lobby_profile_error = lobby_profile_error.clone();
+
+            Callback::from(move |_| {
+                if *lobby_available {
+                    lobby_available.set(false);
+                    lobby_profile_error.set(None);
+                    lobby_profile_status
+                        .set("Unavailable locally; no Freenet presence published".to_owned());
+                    return;
+                }
+
+                let Some(player_id) = *local_player_id else {
+                    lobby_profile_error.set(Some("Local identity is not ready yet.".to_owned()));
+                    return;
+                };
+
+                match store_lobby_display_name(&player_id, lobby_display_name.as_str()) {
+                    Ok(()) => {
+                        lobby_available.set(true);
+                        lobby_profile_error.set(None);
+                        lobby_profile_status
+                            .set("Available locally; Freenet publication not yet wired".to_owned());
+                    }
+
+                    Err(error) => {
+                        lobby_available.set(false);
+                        lobby_profile_error.set(Some(error));
+                    }
+                }
+            })
+        };
+
+        /*
+         * No fabricated opponents: this will remain empty until verified
+         * signed presence records are supplied by real lobby transport.
+         */
+        let available_players = match *local_player_id {
+            Some(player_id) => project_available_players(player_id, &[], 0),
+            None => Vec::new(),
+        };
+
+        let lobby_identity_text = match *local_player_id {
+            Some(player_id) => {
+                let full = format_player_id(&player_id);
+                format!("{}…{}", &full[..8], &full[full.len() - 8..])
+            }
+
+            None => "Identity unavailable".to_owned(),
+        };
+
+        let lobby_availability_label = if *lobby_available {
+            "Available"
+        } else {
+            "Unavailable"
+        };
+
+        let lobby_availability_action = if *lobby_available {
+            "Go unavailable"
+        } else {
+            "Go available"
+        };
+
         html! {
             <main class="app-shell">
                 <header class="app-header">
@@ -2561,6 +2723,168 @@ mod browser {
                         { connection_status.label() }
                     </div>
                 </header>
+
+                <section
+                    class="lobby-strip"
+                    aria-label="Multiplayer lobby"
+                >
+                    <section
+                        class="panel lobby-panel lobby-profile-panel"
+                        aria-labelledby="lobby-profile-heading"
+                    >
+                        <div class="panel-heading-row">
+                            <h2 id="lobby-profile-heading">
+                                { "Lobby profile" }
+                            </h2>
+
+                            <span class="lobby-identity">
+                                { lobby_identity_text }
+                            </span>
+                        </div>
+
+                        <label
+                            class="lobby-field-label"
+                            for="lobby-display-name"
+                        >
+                            { "Public display name" }
+                        </label>
+
+                        <input
+                            id="lobby-display-name"
+                            class="lobby-name-input"
+                            type="text"
+                            autocomplete="off"
+                            spellcheck="false"
+                            value={(*lobby_display_name).clone()}
+                            oninput={on_lobby_name_input}
+                            disabled={(*local_player_id).is_none()}
+                        />
+
+                        <div class="lobby-inline-actions">
+                            <button
+                                type="button"
+                                onclick={on_save_lobby_name}
+                                disabled={(*local_player_id).is_none()}
+                            >
+                                { "Save name" }
+                            </button>
+
+                            <span class="lobby-profile-status">
+                                { (*lobby_profile_status).clone() }
+                            </span>
+                        </div>
+
+                        {
+                            lobby_profile_error.as_ref().map_or_else(
+                                || html! {},
+                                |error| html! {
+                                    <p
+                                        class="interface-error"
+                                        role="alert"
+                                    >
+                                        { error }
+                                    </p>
+                                },
+                            )
+                        }
+                    </section>
+
+                    <section
+                        class="panel lobby-panel lobby-availability-panel"
+                        aria-labelledby="lobby-availability-heading"
+                    >
+                        <div class="panel-heading-row">
+                            <h2 id="lobby-availability-heading">
+                                { "Availability" }
+                            </h2>
+
+                            <span
+                                class={classes!(
+                                    "availability-indicator",
+                                    (*lobby_available).then_some("available"),
+                                )}
+                            >
+                                { lobby_availability_label }
+                            </span>
+                        </div>
+
+                        <p class="panel-note">
+                            {
+                                "This control is local-only in this milestone.                                  It does not yet publish presence to Freenet."
+                            }
+                        </p>
+
+                        <button
+                            type="button"
+                            class={classes!(
+                                "availability-control",
+                                (*lobby_available).then_some("selected"),
+                            )}
+                            aria-pressed={(*lobby_available).to_string()}
+                            onclick={on_toggle_lobby_availability}
+                            disabled={(*local_player_id).is_none()}
+                        >
+                            { lobby_availability_action }
+                        </button>
+                    </section>
+
+                    <section
+                        class="panel lobby-panel lobby-players-panel"
+                        aria-labelledby="available-players-heading"
+                    >
+                        <div class="panel-heading-row">
+                            <h2 id="available-players-heading">
+                                { "Available players" }
+                            </h2>
+
+                            <span class="history-count">
+                                { available_players.len() }
+                            </span>
+                        </div>
+
+                        {
+                            if available_players.is_empty() {
+                                html! {
+                                    <p class="lobby-empty-state">
+                                        {
+                                            "No verified Freenet presence                                              records loaded yet."
+                                        }
+                                    </p>
+                                }
+                            } else {
+                                html! {
+                                    <ul class="available-player-list">
+                                        {
+                                            for available_players.iter().map(
+                                                |player| {
+                                                    html! {
+                                                        <li>
+                                                            <strong>
+                                                                {
+                                                                    player
+                                                                        .display_name
+                                                                        .clone()
+                                                                }
+                                                            </strong>
+
+                                                            <span>
+                                                                {
+                                                                    format_player_id(
+                                                                        &player.player_id
+                                                                    )
+                                                                }
+                                                            </span>
+                                                        </li>
+                                                    }
+                                                }
+                                            )
+                                        }
+                                    </ul>
+                                }
+                            }
+                        }
+                    </section>
+                </section>
 
                 <section class="game-layout">
                     <aside class="left-rail">
