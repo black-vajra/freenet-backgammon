@@ -14,6 +14,7 @@ pub mod local_role_store;
 pub mod pending_action;
 pub mod pending_action_store;
 pub mod play_turn_planner;
+pub mod presence_revision_store;
 pub mod projection;
 pub mod request_roll_planner;
 pub mod reveal_planner;
