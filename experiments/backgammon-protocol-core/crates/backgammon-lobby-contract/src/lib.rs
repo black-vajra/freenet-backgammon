@@ -10,6 +10,7 @@
 use backgammon_protocol::{
     verify_presence_announcement, PlayerId, PresenceAnnouncementBody, SignedPresenceAnnouncement,
 };
+use freenet_scaffold_macro::composable;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 
@@ -205,6 +206,165 @@ impl LobbyState {
     }
 }
 
+#[derive(Serialize, Deserialize, Clone, Default, PartialEq, Eq, Debug)]
+pub struct LobbyEntries(pub LobbyState);
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct LobbyPlayerSummary {
+    pub player_id: PlayerId,
+    pub revision: u64,
+    /// Canonical retained authenticated bodies at this revision.
+    ///
+    /// Signatures are not needed in a summary. Distinct bodies are needed so
+    /// equal-revision equivocation evidence can still be synchronized.
+    pub bodies: Vec<PresenceAnnouncementBody>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default, PartialEq, Eq, Debug)]
+pub struct LobbyEntriesSummary(pub Vec<LobbyPlayerSummary>);
+
+impl LobbyEntriesSummary {
+    pub fn verify(&self) -> Result<(), String> {
+        for player in &self.0 {
+            if player.revision == 0 {
+                return Err("Lobby summary contains revision zero.".into());
+            }
+
+            if player.bodies.is_empty() {
+                return Err("Lobby summary must retain at least one body.".into());
+            }
+
+            if player.bodies.len() > MAX_EQUIVOCATION_RECORDS {
+                return Err("Lobby summary retains too many equivocation bodies.".into());
+            }
+
+            for body in &player.bodies {
+                if body.player_id != player.player_id {
+                    return Err("Lobby summary body belongs to a different PlayerId.".into());
+                }
+
+                if body.revision != player.revision {
+                    return Err("Lobby summary body belongs to a different revision.".into());
+                }
+            }
+
+            for pair in player.bodies.windows(2) {
+                if body_cmp(&pair[0], &pair[1]) != Ordering::Less {
+                    return Err("Lobby summary bodies are not in canonical order.".into());
+                }
+            }
+        }
+
+        for pair in self.0.windows(2) {
+            if pair[0].player_id >= pair[1].player_id {
+                return Err(
+                    "Lobby summary players are not in canonical unique-PlayerId order.".into(),
+                );
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl ComposableState for LobbyEntries {
+    type ParentState = LobbyContractState;
+    type Summary = LobbyEntriesSummary;
+    type Delta = LobbyState;
+    type Parameters = ();
+
+    fn verify(
+        &self,
+        _parent: &Self::ParentState,
+        _parameters: &Self::Parameters,
+    ) -> Result<(), String> {
+        self.0.verify()
+    }
+
+    fn summarize(
+        &self,
+        _parent: &Self::ParentState,
+        _parameters: &Self::Parameters,
+    ) -> Self::Summary {
+        LobbyEntriesSummary(
+            self.0
+                .players
+                .iter()
+                .map(|player| LobbyPlayerSummary {
+                    player_id: player.player_id,
+                    revision: player.revision,
+                    bodies: player
+                        .records
+                        .iter()
+                        .map(|record| record.body.clone())
+                        .collect(),
+                })
+                .collect(),
+        )
+    }
+
+    fn delta(
+        &self,
+        _parent: &Self::ParentState,
+        _parameters: &Self::Parameters,
+        old: &Self::Summary,
+    ) -> Option<Self::Delta> {
+        let mut changed = Vec::new();
+
+        for player in &self.0.players {
+            let include = match old
+                .0
+                .binary_search_by_key(&player.player_id, |summary| summary.player_id)
+            {
+                Err(_) => true,
+
+                Ok(index) => {
+                    let previous = &old.0[index];
+
+                    if player.revision > previous.revision {
+                        true
+                    } else if player.revision < previous.revision {
+                        false
+                    } else {
+                        let bodies: Vec<_> = player
+                            .records
+                            .iter()
+                            .map(|record| record.body.clone())
+                            .collect();
+
+                        bodies != previous.bodies
+                    }
+                }
+            };
+
+            if include {
+                changed.push(player.clone());
+            }
+        }
+
+        (!changed.is_empty()).then_some(LobbyState { players: changed })
+    }
+
+    fn apply_delta(
+        &mut self,
+        _parent: &Self::ParentState,
+        _parameters: &Self::Parameters,
+        delta: &Option<Self::Delta>,
+    ) -> Result<(), String> {
+        if let Some(incoming) = delta {
+            self.0.merge_from(incoming)?;
+        }
+
+        self.0.verify()
+    }
+}
+
+#[composable]
+#[derive(Serialize, Deserialize, Clone, Default, PartialEq, Eq, Debug)]
+pub struct LobbyContractState {
+    pub lobby: LobbyEntries,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -394,6 +554,167 @@ mod tests {
         combined.players.reverse();
 
         assert!(combined.verify().is_err());
+    }
+
+    #[test]
+    fn current_summary_produces_no_delta() {
+        let alice = key(20);
+        let entries = LobbyEntries(state(signed(&alice, "Alice", true, 3)));
+        let parent = LobbyContractState {
+            lobby: entries.clone(),
+        };
+
+        let summary = entries.summarize(&parent, &());
+
+        assert!(summary.verify().is_ok());
+        assert!(entries.delta(&parent, &(), &summary).is_none());
+    }
+
+    #[test]
+    fn missing_player_is_returned_in_delta() {
+        let alice = key(21);
+        let entries = LobbyEntries(state(signed(&alice, "Alice", true, 4)));
+        let parent = LobbyContractState {
+            lobby: entries.clone(),
+        };
+
+        let delta = entries
+            .delta(&parent, &(), &LobbyEntriesSummary::default())
+            .unwrap();
+
+        assert_eq!(delta, entries.0);
+    }
+
+    #[test]
+    fn newer_revision_is_returned_in_delta() {
+        let alice = key(22);
+
+        let old_entries = LobbyEntries(state(signed(&alice, "Alice", true, 5)));
+        let old_parent = LobbyContractState {
+            lobby: old_entries.clone(),
+        };
+        let old_summary = old_entries.summarize(&old_parent, &());
+
+        let new_entries = LobbyEntries(state(signed(&alice, "Alice", false, 6)));
+        let new_parent = LobbyContractState {
+            lobby: new_entries.clone(),
+        };
+
+        let delta = new_entries.delta(&new_parent, &(), &old_summary).unwrap();
+
+        assert_eq!(delta.players.len(), 1);
+        assert_eq!(delta.players[0].revision, 6);
+    }
+
+    #[test]
+    fn same_revision_equivocation_evidence_is_returned_in_delta() {
+        let alice = key(23);
+
+        let one = LobbyEntries(state(signed(&alice, "Alice", true, 7)));
+        let one_parent = LobbyContractState { lobby: one.clone() };
+        let one_summary = one.summarize(&one_parent, &());
+
+        let mut conflicted_state = state(signed(&alice, "Alice", true, 7));
+        conflicted_state
+            .merge_from(&state(signed(&alice, "Alice", false, 7)))
+            .unwrap();
+
+        let conflicted = LobbyEntries(conflicted_state);
+        let conflicted_parent = LobbyContractState {
+            lobby: conflicted.clone(),
+        };
+
+        let delta = conflicted
+            .delta(&conflicted_parent, &(), &one_summary)
+            .unwrap();
+
+        assert_eq!(delta.players.len(), 1);
+        assert_eq!(delta.players[0].records.len(), 2);
+        assert!(delta.players[0].is_equivocating());
+    }
+
+    #[test]
+    fn composable_delta_application_is_idempotent() {
+        let alice = key(24);
+
+        let source = LobbyEntries(state(signed(&alice, "Alice", true, 8)));
+        let source_parent = LobbyContractState {
+            lobby: source.clone(),
+        };
+
+        let empty = LobbyEntries::default();
+        let empty_parent = LobbyContractState {
+            lobby: empty.clone(),
+        };
+        let empty_summary = empty.summarize(&empty_parent, &());
+
+        let delta = source.delta(&source_parent, &(), &empty_summary);
+
+        let mut target = LobbyEntries::default();
+        let target_parent = LobbyContractState {
+            lobby: target.clone(),
+        };
+
+        target.apply_delta(&target_parent, &(), &delta).unwrap();
+
+        let once = target.clone();
+
+        let target_parent = LobbyContractState {
+            lobby: target.clone(),
+        };
+        target.apply_delta(&target_parent, &(), &delta).unwrap();
+
+        assert_eq!(target, once);
+        assert_eq!(target, source);
+    }
+
+    #[test]
+    fn opposite_composable_delta_orders_converge() {
+        let alice = key(25);
+
+        let first = LobbyEntries(state(signed(&alice, "Alice", true, 9)));
+        let second = LobbyEntries(state(signed(&alice, "Alice", false, 9)));
+
+        let empty = LobbyEntries::default();
+        let empty_parent = LobbyContractState {
+            lobby: empty.clone(),
+        };
+        let empty_summary = empty.summarize(&empty_parent, &());
+
+        let first_parent = LobbyContractState {
+            lobby: first.clone(),
+        };
+        let second_parent = LobbyContractState {
+            lobby: second.clone(),
+        };
+
+        let first_delta = first.delta(&first_parent, &(), &empty_summary);
+        let second_delta = second.delta(&second_parent, &(), &empty_summary);
+
+        let mut left = LobbyEntries::default();
+        let parent = LobbyContractState {
+            lobby: left.clone(),
+        };
+        left.apply_delta(&parent, &(), &first_delta).unwrap();
+
+        let parent = LobbyContractState {
+            lobby: left.clone(),
+        };
+        left.apply_delta(&parent, &(), &second_delta).unwrap();
+
+        let mut right = LobbyEntries::default();
+        let parent = LobbyContractState {
+            lobby: right.clone(),
+        };
+        right.apply_delta(&parent, &(), &second_delta).unwrap();
+
+        let parent = LobbyContractState {
+            lobby: right.clone(),
+        };
+        right.apply_delta(&parent, &(), &first_delta).unwrap();
+
+        assert_eq!(left, right);
+        assert!(left.0.players[0].is_equivocating());
     }
 
     #[test]
