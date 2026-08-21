@@ -3,12 +3,14 @@
 mod authentication;
 mod fair_dice;
 mod game_action;
+mod lobby_presence;
 mod replay;
 mod state_hash;
 
 pub use authentication::*;
 pub use fair_dice::*;
 pub use game_action::*;
+pub use lobby_presence::*;
 pub use replay::*;
 pub use state_hash::*;
 
