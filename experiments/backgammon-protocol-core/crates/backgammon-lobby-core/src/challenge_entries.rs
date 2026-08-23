@@ -1,6 +1,9 @@
 //! Convergent authenticated challenge evidence for the Freenet lobby.
 
 use backgammon_protocol::{
+    challenge_offer_body_digest, ChallengeId, ChallengeOfferBodyDigest, PlayerId,
+};
+use backgammon_protocol::{
     resolve_challenge, verify_challenge_offer, ChallengeOfferBody, ChallengeResolution,
     ChallengeTerminalEvidence, SignedChallengeOffer,
 };
@@ -10,6 +13,15 @@ use std::cmp::Ordering;
 /// Acceptance, decline, and cancellation are the only terminal evidence kinds
 /// in challenge protocol version 1.
 pub const MAX_TERMINAL_EVIDENCE_PER_OFFER: usize = 3;
+
+/// Immutable canonical ordering identity for one exact challenge-offer body.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub struct ChallengeOfferOrderKey {
+    pub created_at_unix_seconds: u64,
+    pub challenger_id: PlayerId,
+    pub challenge_id: ChallengeId,
+    pub body_digest: ChallengeOfferBodyDigest,
+}
 
 /// One exact authenticated offer and all canonical terminal evidence known for it.
 ///
@@ -127,6 +139,21 @@ impl ChallengeOfferState {
         })
     }
 
+    /// Returns the immutable key used for canonical retention ordering.
+    ///
+    /// Signature bytes and terminal evidence are deliberately excluded so the
+    /// key cannot change as equivalent authenticated representations merge.
+    pub fn order_key(&self) -> Result<ChallengeOfferOrderKey, String> {
+        self.verify()?;
+
+        Ok(ChallengeOfferOrderKey {
+            created_at_unix_seconds: self.offer.body.created_at_unix_seconds,
+            challenger_id: self.offer.body.challenger_id,
+            challenge_id: self.offer.body.challenge_id,
+            body_digest: challenge_offer_body_digest(&self.offer.body)?,
+        })
+    }
+
     pub fn body(&self) -> &ChallengeOfferBody {
         &self.offer.body
     }
@@ -194,6 +221,78 @@ mod tests {
             ChallengeTerminalEvidence::Decline(decline),
             ChallengeTerminalEvidence::Cancellation(cancellation),
         )
+    }
+
+    #[test]
+    fn order_key_round_trips_through_cbor() {
+        let (offer, _, _) = fixture(53);
+        let state = ChallengeOfferState::new(offer, Vec::new()).unwrap();
+        let expected = state.order_key().unwrap();
+        let mut encoded = Vec::new();
+
+        ciborium::ser::into_writer(&expected, &mut encoded).unwrap();
+
+        let decoded: ChallengeOfferOrderKey =
+            ciborium::de::from_reader(encoded.as_slice()).unwrap();
+
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn order_key_is_stable_as_terminal_evidence_accumulates() {
+        let (offer, white_key, black_key) = fixture(54);
+        let (acceptance, _, _) = terminal_evidence(&offer, &white_key, &black_key);
+
+        let open = ChallengeOfferState::new(offer.clone(), Vec::new()).unwrap();
+        let accepted = ChallengeOfferState::new(offer, vec![acceptance]).unwrap();
+
+        assert_eq!(open.order_key().unwrap(), accepted.order_key().unwrap());
+    }
+
+    #[test]
+    fn same_challenge_id_with_different_bodies_has_distinct_order_keys() {
+        let (first_offer, white_key, _) = fixture(55);
+        let mut second_body = first_offer.body.clone();
+
+        if second_body.proposal.configuration.match_length == 1 {
+            second_body.proposal.configuration.match_length = 2;
+        } else {
+            second_body.proposal.configuration.match_length = 1;
+        }
+
+        let second_offer = sign_challenge_offer(second_body, &white_key).unwrap();
+        let first = ChallengeOfferState::new(first_offer, Vec::new()).unwrap();
+        let second = ChallengeOfferState::new(second_offer, Vec::new()).unwrap();
+        let first_key = first.order_key().unwrap();
+        let second_key = second.order_key().unwrap();
+
+        assert_eq!(
+            first_key.created_at_unix_seconds,
+            second_key.created_at_unix_seconds
+        );
+        assert_eq!(first_key.challenger_id, second_key.challenger_id);
+        assert_eq!(first_key.challenge_id, second_key.challenge_id);
+        assert_ne!(first_key.body_digest, second_key.body_digest);
+        assert_ne!(first_key, second_key);
+    }
+
+    #[test]
+    fn order_key_prioritizes_creation_time_before_tie_breakers() {
+        let earlier = ChallengeOfferOrderKey {
+            created_at_unix_seconds: 100,
+            challenger_id: [u8::MAX; 32],
+            challenge_id: [u8::MAX; 32],
+            body_digest: [u8::MAX; 32],
+        };
+
+        let later = ChallengeOfferOrderKey {
+            created_at_unix_seconds: 101,
+            challenger_id: [0; 32],
+            challenge_id: [0; 32],
+            body_digest: [0; 32],
+        };
+
+        assert!(earlier < later);
     }
 
     #[test]
