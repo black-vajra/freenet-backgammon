@@ -33,6 +33,9 @@ const CHALLENGE_CANCELLATION_SIGNATURE_DOMAIN_V1: &[u8] =
 
 pub type ChallengeId = [u8; 32];
 
+/// Stable identity for one exact immutable challenge-offer body.
+pub type ChallengeOfferBodyDigest = [u8; 32];
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChallengeSignature(pub Vec<u8>);
 
@@ -224,6 +227,21 @@ fn encode_domain_separated_message<T: Serialize>(
 
 fn offer_signing_message(body: &ChallengeOfferBody) -> Result<Vec<u8>, String> {
     encode_domain_separated_message(CHALLENGE_OFFER_SIGNATURE_DOMAIN_V1, body)
+}
+
+/// Produces a stable domain-separated digest of an exact challenge-offer body.
+///
+/// This hashes the same canonical bytes covered by the challenger's signature,
+/// but deliberately excludes the signature itself. Equivalent valid signature
+/// representations therefore cannot change the offer's replicated identity or
+/// retention order.
+pub fn challenge_offer_body_digest(
+    body: &ChallengeOfferBody,
+) -> Result<ChallengeOfferBodyDigest, String> {
+    body.verify()?;
+
+    let message = offer_signing_message(body)?;
+    Ok(*blake3::hash(&message).as_bytes())
 }
 
 fn acceptance_signing_message(
@@ -694,6 +712,47 @@ mod tests {
         );
 
         (offer, white_key, black_key)
+    }
+
+    #[test]
+    fn offer_body_digest_is_deterministic_and_matches_signing_bytes() {
+        let (body, _, _) = fixture();
+
+        let first = challenge_offer_body_digest(&body).unwrap();
+        let second = challenge_offer_body_digest(&body).unwrap();
+        let signing_message = offer_signing_message(&body).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(first, *blake3::hash(&signing_message).as_bytes());
+    }
+
+    #[test]
+    fn offer_body_digest_changes_with_exact_offer_contents() {
+        let (body, _, _) = fixture();
+        let original = challenge_offer_body_digest(&body).unwrap();
+
+        let mut changed = body.clone();
+        changed.challenge_id[0] ^= 1;
+
+        assert_ne!(challenge_offer_body_digest(&changed).unwrap(), original);
+
+        let mut changed = body.clone();
+        changed.created_at_unix_seconds += 1;
+
+        assert_ne!(challenge_offer_body_digest(&changed).unwrap(), original);
+
+        let mut changed = body.clone();
+        changed.proposal.configuration.match_length = 5;
+
+        assert_ne!(challenge_offer_body_digest(&changed).unwrap(), original);
+    }
+
+    #[test]
+    fn offer_body_digest_rejects_invalid_offer_body() {
+        let (mut body, _, _) = fixture();
+        body.expires_at_unix_seconds = body.created_at_unix_seconds;
+
+        assert!(challenge_offer_body_digest(&body).is_err());
     }
 
     #[test]
