@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod authentication;
+mod challenge;
 mod fair_dice;
 mod game_action;
 mod genesis_handshake;
@@ -9,6 +10,7 @@ mod replay;
 mod state_hash;
 
 pub use authentication::*;
+pub use challenge::*;
 pub use fair_dice::*;
 pub use game_action::*;
 pub use genesis_handshake::*;
