@@ -3,6 +3,7 @@
 mod authentication;
 mod fair_dice;
 mod game_action;
+mod genesis_handshake;
 mod lobby_presence;
 mod replay;
 mod state_hash;
@@ -10,6 +11,7 @@ mod state_hash;
 pub use authentication::*;
 pub use fair_dice::*;
 pub use game_action::*;
+pub use genesis_handshake::*;
 pub use lobby_presence::*;
 pub use replay::*;
 pub use state_hash::*;
