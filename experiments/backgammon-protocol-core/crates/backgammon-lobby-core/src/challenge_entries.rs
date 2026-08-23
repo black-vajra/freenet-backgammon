@@ -1,5 +1,6 @@
 //! Convergent authenticated challenge evidence for the Freenet lobby.
 
+use crate::LobbyContractState;
 use backgammon_protocol::{
     challenge_offer_body_digest, ChallengeId, ChallengeOfferBodyDigest, PlayerId,
 };
@@ -7,12 +8,20 @@ use backgammon_protocol::{
     resolve_challenge, verify_challenge_offer, ChallengeOfferBody, ChallengeResolution,
     ChallengeTerminalEvidence, SignedChallengeOffer,
 };
+use freenet_scaffold::ComposableState as FreenetComposableState;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
+use std::collections::BTreeMap;
 
 /// Acceptance, decline, and cancellation are the only terminal evidence kinds
 /// in challenge protocol version 1.
 pub const MAX_TERMINAL_EVIDENCE_PER_OFFER: usize = 3;
+
+/// Maximum retained challenge offers from one challenger.
+pub const MAX_CHALLENGE_OFFERS_PER_CHALLENGER: usize = 16;
+
+/// Maximum retained challenge offers across the lobby.
+pub const MAX_CHALLENGE_OFFERS: usize = 256;
 
 /// Immutable canonical ordering identity for one exact challenge-offer body.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -159,6 +168,364 @@ impl ChallengeOfferState {
     }
 }
 
+/// A retention boundary is open until its corresponding collection reaches
+/// capacity. At capacity it publishes the oldest key still retained.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub enum ChallengeRetentionHorizon {
+    Open,
+    OldestRetained(ChallengeOfferOrderKey),
+}
+
+impl Default for ChallengeRetentionHorizon {
+    fn default() -> Self {
+        Self::Open
+    }
+}
+
+/// Per-challenger retention boundary. Absence from a summary means open.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct ChallengeChallengerHorizon {
+    pub challenger_id: PlayerId,
+    pub oldest_retained: ChallengeOfferOrderKey,
+}
+
+/// Compact representation of one retained terminal evidence kind.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct ChallengeTerminalEvidenceSummary {
+    pub kind: u8,
+    pub signature: Vec<u8>,
+}
+
+/// Summary of one exact retained offer and its canonical evidence versions.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct ChallengeOfferSummary {
+    pub key: ChallengeOfferOrderKey,
+    pub offer_signature: Vec<u8>,
+    pub terminal_evidence: Vec<ChallengeTerminalEvidenceSummary>,
+}
+
+/// Canonical receiver summary used to calculate a bounded challenge delta.
+#[derive(Serialize, Deserialize, Clone, Default, PartialEq, Eq, Debug)]
+pub struct ChallengeEntriesSummary {
+    pub offers: Vec<ChallengeOfferSummary>,
+    pub challenger_horizons: Vec<ChallengeChallengerHorizon>,
+    pub global_horizon: ChallengeRetentionHorizon,
+}
+
+/// Full authenticated offer states selected for one synchronization delta.
+#[derive(Serialize, Deserialize, Clone, Default, PartialEq, Eq, Debug)]
+pub struct ChallengeEntriesDelta {
+    pub offers: Vec<ChallengeOfferState>,
+}
+
+/// Canonically ordered, deterministically bounded challenge state.
+#[derive(Serialize, Deserialize, Clone, Default, PartialEq, Eq, Debug)]
+pub struct ChallengeEntries {
+    pub offers: Vec<ChallengeOfferState>,
+}
+
+fn canonical_challenge_offers(
+    offers: Vec<ChallengeOfferState>,
+) -> Result<Vec<ChallengeOfferState>, String> {
+    let mut keyed = Vec::with_capacity(offers.len());
+
+    for offer in offers {
+        let key = offer.order_key()?;
+        keyed.push((key, offer));
+    }
+
+    keyed.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut merged: Vec<(ChallengeOfferOrderKey, ChallengeOfferState)> =
+        Vec::with_capacity(keyed.len());
+
+    for (key, offer) in keyed {
+        if let Some((last_key, last_offer)) = merged.last_mut() {
+            if *last_key == key {
+                last_offer.merge_from(&offer)?;
+                continue;
+            }
+        }
+
+        merged.push((key, offer));
+    }
+
+    let mut by_challenger: BTreeMap<PlayerId, Vec<(ChallengeOfferOrderKey, ChallengeOfferState)>> =
+        BTreeMap::new();
+
+    for entry in merged {
+        by_challenger
+            .entry(entry.0.challenger_id)
+            .or_default()
+            .push(entry);
+    }
+
+    let mut retained = Vec::new();
+
+    for (_, mut challenger_offers) in by_challenger {
+        if challenger_offers.len() > MAX_CHALLENGE_OFFERS_PER_CHALLENGER {
+            let excess = challenger_offers.len() - MAX_CHALLENGE_OFFERS_PER_CHALLENGER;
+            challenger_offers.drain(..excess);
+        }
+
+        retained.extend(challenger_offers);
+    }
+
+    retained.sort_by(|left, right| left.0.cmp(&right.0));
+
+    if retained.len() > MAX_CHALLENGE_OFFERS {
+        let excess = retained.len() - MAX_CHALLENGE_OFFERS;
+        retained.drain(..excess);
+    }
+
+    Ok(retained.into_iter().map(|(_, offer)| offer).collect())
+}
+
+fn sender_has_new_information(
+    offer: &ChallengeOfferState,
+    receiver: &ChallengeOfferSummary,
+) -> bool {
+    if offer.offer.signature.as_bytes() < receiver.offer_signature.as_slice() {
+        return true;
+    }
+
+    offer.terminal_evidence.iter().any(|evidence| {
+        let kind = terminal_kind(evidence);
+        let signature = terminal_signature(evidence);
+        let receiver_signature = receiver
+            .terminal_evidence
+            .iter()
+            .filter(|summary| summary.kind == kind)
+            .map(|summary| summary.signature.as_slice())
+            .min();
+
+        match receiver_signature {
+            Some(known) => signature < known,
+            None => true,
+        }
+    })
+}
+
+fn key_is_above_receiver_horizons(
+    key: &ChallengeOfferOrderKey,
+    receiver: &ChallengeEntriesSummary,
+) -> bool {
+    let challenger_horizon = receiver
+        .challenger_horizons
+        .iter()
+        .find(|horizon| horizon.challenger_id == key.challenger_id);
+    let above_challenger_horizon = match challenger_horizon {
+        Some(horizon) => key > &horizon.oldest_retained,
+        None => true,
+    };
+
+    let above_global_horizon = match &receiver.global_horizon {
+        ChallengeRetentionHorizon::Open => true,
+        ChallengeRetentionHorizon::OldestRetained(oldest) => key > oldest,
+    };
+
+    above_challenger_horizon && above_global_horizon
+}
+
+impl ChallengeEntries {
+    pub fn new(offers: Vec<ChallengeOfferState>) -> Result<Self, String> {
+        let state = Self {
+            offers: canonical_challenge_offers(offers)?,
+        };
+
+        state.verify()?;
+        Ok(state)
+    }
+
+    pub fn verify(&self) -> Result<(), String> {
+        if self.offers.len() > MAX_CHALLENGE_OFFERS {
+            return Err("Lobby retains too many challenge offers.".into());
+        }
+
+        let mut previous_key: Option<ChallengeOfferOrderKey> = None;
+        let mut challenger_counts: BTreeMap<PlayerId, usize> = BTreeMap::new();
+
+        for offer in &self.offers {
+            let key = offer.order_key()?;
+
+            if previous_key
+                .as_ref()
+                .is_some_and(|previous| previous >= &key)
+            {
+                return Err("Challenge offers are not in strict canonical order.".into());
+            }
+
+            let count = challenger_counts.entry(key.challenger_id).or_default();
+            *count += 1;
+
+            if *count > MAX_CHALLENGE_OFFERS_PER_CHALLENGER {
+                return Err("Lobby retains too many offers from one challenger.".into());
+            }
+
+            previous_key = Some(key);
+        }
+
+        Ok(())
+    }
+
+    /// Associative/commutative/idempotent merge followed by deterministic
+    /// per-challenger and global top-key retention.
+    pub fn merge_from(&mut self, incoming: &Self) -> Result<(), String> {
+        self.verify()?;
+        incoming.verify()?;
+
+        let mut combined = self.offers.clone();
+        combined.extend(incoming.offers.iter().cloned());
+        self.offers = canonical_challenge_offers(combined)?;
+
+        self.verify()
+    }
+
+    pub fn challenger_horizons(&self) -> Result<Vec<ChallengeChallengerHorizon>, String> {
+        self.verify()?;
+
+        let mut grouped: BTreeMap<PlayerId, Vec<ChallengeOfferOrderKey>> = BTreeMap::new();
+
+        for offer in &self.offers {
+            let key = offer.order_key()?;
+            grouped.entry(key.challenger_id).or_default().push(key);
+        }
+
+        Ok(grouped
+            .into_iter()
+            .filter_map(|(challenger_id, keys)| {
+                (keys.len() == MAX_CHALLENGE_OFFERS_PER_CHALLENGER).then(|| {
+                    ChallengeChallengerHorizon {
+                        challenger_id,
+                        oldest_retained: keys[0].clone(),
+                    }
+                })
+            })
+            .collect())
+    }
+
+    pub fn global_horizon(&self) -> Result<ChallengeRetentionHorizon, String> {
+        self.verify()?;
+
+        if self.offers.len() < MAX_CHALLENGE_OFFERS {
+            return Ok(ChallengeRetentionHorizon::Open);
+        }
+
+        Ok(ChallengeRetentionHorizon::OldestRetained(
+            self.offers[0].order_key()?,
+        ))
+    }
+
+    pub fn retention_summary(&self) -> Result<ChallengeEntriesSummary, String> {
+        self.verify()?;
+
+        let offers = self
+            .offers
+            .iter()
+            .map(|offer| {
+                Ok(ChallengeOfferSummary {
+                    key: offer.order_key()?,
+                    offer_signature: offer.offer.signature.as_bytes().to_vec(),
+                    terminal_evidence: offer
+                        .terminal_evidence
+                        .iter()
+                        .map(|evidence| ChallengeTerminalEvidenceSummary {
+                            kind: terminal_kind(evidence),
+                            signature: terminal_signature(evidence).to_vec(),
+                        })
+                        .collect(),
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+
+        Ok(ChallengeEntriesSummary {
+            offers,
+            challenger_horizons: self.challenger_horizons()?,
+            global_horizon: self.global_horizon()?,
+        })
+    }
+
+    pub fn delta_from_summary(
+        &self,
+        receiver: &ChallengeEntriesSummary,
+    ) -> Result<Option<ChallengeEntriesDelta>, String> {
+        self.verify()?;
+
+        let offers = self
+            .offers
+            .iter()
+            .filter_map(|offer| {
+                let key = offer.order_key().ok()?;
+                let retained = receiver.offers.iter().find(|known| known.key == key);
+
+                match retained {
+                    Some(known) if sender_has_new_information(offer, known) => Some(offer.clone()),
+                    Some(_) => None,
+                    None if key_is_above_receiver_horizons(&key, receiver) => Some(offer.clone()),
+                    None => None,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        Ok((!offers.is_empty()).then_some(ChallengeEntriesDelta { offers }))
+    }
+
+    pub fn apply_challenge_delta(&mut self, delta: &ChallengeEntriesDelta) -> Result<(), String> {
+        let mut combined = self.offers.clone();
+        combined.extend(delta.offers.iter().cloned());
+        self.offers = canonical_challenge_offers(combined)?;
+
+        self.verify()
+    }
+}
+
+impl FreenetComposableState for ChallengeEntries {
+    type ParentState = LobbyContractState;
+    type Summary = ChallengeEntriesSummary;
+    type Delta = ChallengeEntriesDelta;
+    type Parameters = ();
+
+    fn verify(
+        &self,
+        _parent: &Self::ParentState,
+        _parameters: &Self::Parameters,
+    ) -> Result<(), String> {
+        ChallengeEntries::verify(self)
+    }
+
+    fn summarize(
+        &self,
+        _parent: &Self::ParentState,
+        _parameters: &Self::Parameters,
+    ) -> Self::Summary {
+        self.retention_summary()
+            .expect("validated challenge entries must be summarizable")
+    }
+
+    fn delta(
+        &self,
+        _parent: &Self::ParentState,
+        _parameters: &Self::Parameters,
+        old: &Self::Summary,
+    ) -> Option<Self::Delta> {
+        self.delta_from_summary(old)
+            .expect("validated challenge entries must produce a delta")
+    }
+
+    fn apply_delta(
+        &mut self,
+        _parent: &Self::ParentState,
+        _parameters: &Self::Parameters,
+        delta: &Option<Self::Delta>,
+    ) -> Result<(), String> {
+        if let Some(incoming) = delta {
+            self.apply_challenge_delta(incoming)?;
+        }
+
+        ChallengeEntries::verify(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,6 +568,82 @@ mod tests {
 
         let offer = sign_challenge_offer(body, &white_key).unwrap();
         (offer, white_key, black_key)
+    }
+
+    fn fixture_at(
+        challenger_seed: u8,
+        challenge_seed: u8,
+        created_at_unix_seconds: u64,
+    ) -> (SignedChallengeOffer, SigningKey, SigningKey) {
+        let white_key = SigningKey::from_bytes(&[challenger_seed; 32]);
+        let black_key = SigningKey::from_bytes(&[challenger_seed.wrapping_add(100); 32]);
+
+        let proposal = GenesisProposal::new(
+            [challenge_seed.wrapping_add(1); 32],
+            [challenge_seed.wrapping_add(2); 32],
+            GameConfiguration {
+                white: PlayerDescriptor {
+                    id: white_key.verifying_key().to_bytes(),
+                    display_name: "Alice".to_owned(),
+                },
+                black: PlayerDescriptor {
+                    id: black_key.verifying_key().to_bytes(),
+                    display_name: "Bob".to_owned(),
+                },
+                match_length: 5,
+            },
+        );
+
+        let body = ChallengeOfferBody::new(
+            [challenge_seed; 32],
+            white_key.verifying_key().to_bytes(),
+            created_at_unix_seconds,
+            created_at_unix_seconds + 600,
+            proposal,
+        );
+
+        let offer = sign_challenge_offer(body, &white_key).unwrap();
+        (offer, white_key, black_key)
+    }
+
+    fn offer_state_at(
+        challenger_seed: u8,
+        challenge_seed: u8,
+        created_at_unix_seconds: u64,
+    ) -> ChallengeOfferState {
+        let (offer, _, _) = fixture_at(challenger_seed, challenge_seed, created_at_unix_seconds);
+        ChallengeOfferState::new(offer, Vec::new()).unwrap()
+    }
+
+    fn challenger_window(
+        challenger_seed: u8,
+        first_challenge_seed: u8,
+        count: u8,
+    ) -> ChallengeEntries {
+        ChallengeEntries::new(
+            (first_challenge_seed..first_challenge_seed + count)
+                .map(|challenge_seed| {
+                    offer_state_at(
+                        challenger_seed,
+                        challenge_seed,
+                        40_000 + u64::from(challenge_seed),
+                    )
+                })
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    fn global_offer(index: usize) -> ChallengeOfferState {
+        let challenger_seed = 1 + u8::try_from(index / MAX_CHALLENGE_OFFERS_PER_CHALLENGER)
+            .expect("test index fits in u8");
+        let challenge_seed = u8::try_from(index % MAX_CHALLENGE_OFFERS_PER_CHALLENGER).unwrap();
+
+        offer_state_at(
+            challenger_seed,
+            challenge_seed,
+            100_000 + u64::try_from(index).unwrap(),
+        )
     }
 
     fn terminal_evidence(
@@ -461,5 +904,220 @@ mod tests {
         };
 
         assert!(oversized.verify().is_err());
+    }
+
+    #[test]
+    fn per_challenger_retention_keeps_newest_sixteen_and_publishes_horizon() {
+        let state = challenger_window(91, 0, 17);
+        let expected_oldest = offer_state_at(91, 1, 40_001).order_key().unwrap();
+
+        assert_eq!(state.offers.len(), MAX_CHALLENGE_OFFERS_PER_CHALLENGER);
+        assert_eq!(state.offers[0].order_key().unwrap(), expected_oldest);
+        assert_eq!(
+            state.challenger_horizons().unwrap(),
+            vec![ChallengeChallengerHorizon {
+                challenger_id: expected_oldest.challenger_id,
+                oldest_retained: expected_oldest,
+            }]
+        );
+        assert_eq!(
+            state.global_horizon().unwrap(),
+            ChallengeRetentionHorizon::Open
+        );
+    }
+
+    #[test]
+    fn global_retention_keeps_newest_256_and_suppresses_pruned_history() {
+        let all = (0..=MAX_CHALLENGE_OFFERS)
+            .map(global_offer)
+            .collect::<Vec<_>>();
+        let pruned = all[0].clone();
+        let mut state = ChallengeEntries::new(all).unwrap();
+        let expected_oldest = global_offer(1).order_key().unwrap();
+        let pruned_challenger_id = pruned.body().challenger_id;
+
+        assert_eq!(state.offers.len(), MAX_CHALLENGE_OFFERS);
+        assert_eq!(state.offers[0].order_key().unwrap(), expected_oldest);
+        assert_eq!(
+            state.global_horizon().unwrap(),
+            ChallengeRetentionHorizon::OldestRetained(expected_oldest.clone())
+        );
+        assert!(state
+            .challenger_horizons()
+            .unwrap()
+            .iter()
+            .all(|horizon| horizon.challenger_id != pruned_challenger_id));
+
+        let sender = ChallengeEntries::new(vec![pruned]).unwrap();
+        let summary = state.retention_summary().unwrap();
+
+        assert_eq!(sender.delta_from_summary(&summary).unwrap(), None);
+
+        let (oldest_offer, _, black_key) = fixture_at(1, 1, 100_001);
+        let acceptance = ChallengeTerminalEvidence::Acceptance(
+            accept_challenge(&oldest_offer, &black_key, 100_002).unwrap(),
+        );
+        let updated_oldest = ChallengeOfferState::new(oldest_offer, vec![acceptance]).unwrap();
+        assert_eq!(updated_oldest.order_key().unwrap(), expected_oldest);
+
+        let evidence_sender = ChallengeEntries::new(vec![updated_oldest]).unwrap();
+        let evidence_delta = evidence_sender
+            .delta_from_summary(&summary)
+            .unwrap()
+            .expect("new evidence at the global horizon must be delivered");
+
+        state.apply_challenge_delta(&evidence_delta).unwrap();
+        assert_eq!(
+            evidence_sender
+                .delta_from_summary(&state.retention_summary().unwrap())
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn per_challenger_trim_runs_before_global_trim() {
+        let quiet = (0..240).map(global_offer).collect::<Vec<_>>();
+        let quiet_oldest_key = quiet[0].order_key().unwrap();
+        let busy = (0..17)
+            .map(|index| offer_state_at(99, index, 200_000 + u64::from(index)))
+            .collect::<Vec<_>>();
+
+        let state = ChallengeEntries::new(quiet.into_iter().chain(busy).collect()).unwrap();
+        let busy_id = SigningKey::from_bytes(&[99; 32]).verifying_key().to_bytes();
+
+        assert_eq!(state.offers.len(), MAX_CHALLENGE_OFFERS);
+        assert!(state
+            .offers
+            .iter()
+            .any(|offer| offer.order_key().unwrap() == quiet_oldest_key));
+        assert_eq!(
+            state
+                .offers
+                .iter()
+                .filter(|offer| offer.body().challenger_id == busy_id)
+                .count(),
+            MAX_CHALLENGE_OFFERS_PER_CHALLENGER
+        );
+    }
+
+    #[test]
+    fn bounded_merge_is_associative_commutative_and_idempotent() {
+        let first = challenger_window(92, 0, 13);
+        let second = challenger_window(92, 8, 13);
+        let third = challenger_window(92, 18, 8);
+
+        let mut left = first.clone();
+        left.merge_from(&second).unwrap();
+        left.merge_from(&third).unwrap();
+
+        let mut right_group = third.clone();
+        right_group.merge_from(&second).unwrap();
+        let mut right = first.clone();
+        right.merge_from(&right_group).unwrap();
+
+        let mut reversed = third;
+        reversed.merge_from(&second).unwrap();
+        reversed.merge_from(&first).unwrap();
+
+        let mut idempotent = left.clone();
+        idempotent.merge_from(&left).unwrap();
+
+        assert_eq!(left, right);
+        assert_eq!(left, reversed);
+        assert_eq!(left, idempotent);
+        assert_eq!(left.offers.len(), MAX_CHALLENGE_OFFERS_PER_CHALLENGER);
+        assert_eq!(left.offers[0].body().challenge_id, [10; 32]);
+    }
+
+    #[test]
+    fn receiver_horizon_stops_old_window_resend_and_accepts_newer_window_once() {
+        let mut receiver = challenger_window(93, 10, 16);
+        let older_sender = challenger_window(93, 0, 16);
+        let newer_sender = challenger_window(93, 20, 16);
+
+        let receiver_summary = receiver.retention_summary().unwrap();
+        assert_eq!(
+            older_sender.delta_from_summary(&receiver_summary).unwrap(),
+            None
+        );
+
+        let delta = newer_sender
+            .delta_from_summary(&receiver_summary)
+            .unwrap()
+            .expect("newer offers must be delivered");
+        assert_eq!(delta.offers.len(), 10);
+
+        receiver.apply_challenge_delta(&delta).unwrap();
+        assert_eq!(receiver, newer_sender);
+        assert_eq!(
+            newer_sender
+                .delta_from_summary(&receiver.retention_summary().unwrap())
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn evidence_update_at_oldest_retained_key_bypasses_horizon() {
+        let mut receiver = challenger_window(94, 0, 16);
+        let (offer, _, black_key) = fixture_at(94, 0, 40_000);
+        let acceptance = ChallengeTerminalEvidence::Acceptance(
+            accept_challenge(&offer, &black_key, 40_001).unwrap(),
+        );
+        let updated_offer = ChallengeOfferState::new(offer, vec![acceptance]).unwrap();
+        let updated_key = updated_offer.order_key().unwrap();
+        let sender = ChallengeEntries::new(vec![updated_offer]).unwrap();
+        let receiver_summary = receiver.retention_summary().unwrap();
+
+        assert_eq!(
+            receiver_summary.challenger_horizons[0].oldest_retained,
+            updated_key
+        );
+
+        let delta = sender
+            .delta_from_summary(&receiver_summary)
+            .unwrap()
+            .expect("new evidence for a retained horizon key must be delivered");
+
+        receiver.apply_challenge_delta(&delta).unwrap();
+
+        let retained = receiver
+            .offers
+            .iter()
+            .find(|state| state.order_key().unwrap() == updated_key)
+            .unwrap();
+        assert_eq!(retained.evidence_mask(), 0b001);
+        assert_eq!(
+            sender
+                .delta_from_summary(&receiver.retention_summary().unwrap())
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn summaries_and_deltas_round_trip_through_cbor() {
+        let sender = challenger_window(95, 4, 4);
+        let receiver = challenger_window(95, 4, 2);
+        let summary = receiver.retention_summary().unwrap();
+        let delta = sender
+            .delta_from_summary(&summary)
+            .unwrap()
+            .expect("receiver is missing two offers");
+
+        let mut summary_bytes = Vec::new();
+        ciborium::ser::into_writer(&summary, &mut summary_bytes).unwrap();
+        let decoded_summary: ChallengeEntriesSummary =
+            ciborium::de::from_reader(summary_bytes.as_slice()).unwrap();
+
+        let mut delta_bytes = Vec::new();
+        ciborium::ser::into_writer(&delta, &mut delta_bytes).unwrap();
+        let decoded_delta: ChallengeEntriesDelta =
+            ciborium::de::from_reader(delta_bytes.as_slice()).unwrap();
+
+        assert_eq!(decoded_summary, summary);
+        assert_eq!(decoded_delta, delta);
+        assert_eq!(decoded_delta.offers.len(), 2);
     }
 }
