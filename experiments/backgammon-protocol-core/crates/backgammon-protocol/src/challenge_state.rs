@@ -4,12 +4,13 @@ use crate::challenge::{
     ChallengeDecline, SignedChallengeOffer,
 };
 use crate::genesis_handshake::GenesisProposal;
+use serde::{Deserialize, Serialize};
 
 /// Authenticated terminal evidence received for one exact challenge.
 ///
 /// Transport delivery order is deliberately absent from this representation.
 /// Freenet peers may observe these messages in different orders.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChallengeTerminalEvidence {
     Acceptance(ChallengeAcceptance),
     Decline(ChallengeDecline),
@@ -204,6 +205,22 @@ mod tests {
             ChallengeTerminalEvidence::Decline(decline),
             ChallengeTerminalEvidence::Cancellation(cancellation),
         )
+    }
+
+    #[test]
+    fn terminal_evidence_round_trips_through_cbor() {
+        let (offer, white_key, black_key, _) = fixture();
+        let (acceptance, decline, cancellation) = terminal_evidence(&offer, &white_key, &black_key);
+
+        for expected in [acceptance, decline, cancellation] {
+            let mut encoded = Vec::new();
+            ciborium::ser::into_writer(&expected, &mut encoded).unwrap();
+
+            let decoded: ChallengeTerminalEvidence =
+                ciborium::de::from_reader(encoded.as_slice()).unwrap();
+
+            assert_eq!(decoded, expected);
+        }
     }
 
     #[test]
