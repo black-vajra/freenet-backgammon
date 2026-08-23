@@ -80,12 +80,23 @@ dependencies = [
 name = "backgammon-lobby-contract"
 version = "0.1.0"
 dependencies = [
+ "backgammon-lobby-core",
  "backgammon-protocol",
  "ciborium",
  "ed25519-dalek",
  "freenet-scaffold",
- "freenet-scaffold-macro",
  "freenet-stdlib",
+ "serde",
+]
+
+[[package]]
+name = "backgammon-lobby-core"
+version = "0.1.0"
+dependencies = [
+ "backgammon-protocol",
+ "ed25519-dalek",
+ "freenet-scaffold",
+ "freenet-scaffold-macro",
  "serde",
 ]
 

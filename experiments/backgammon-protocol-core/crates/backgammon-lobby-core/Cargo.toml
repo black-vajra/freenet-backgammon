@@ -1,23 +1,17 @@
 [package]
-name = "backgammon-lobby-contract"
+name = "backgammon-lobby-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [lib]
-crate-type = ["cdylib", "rlib"]
+crate-type = ["rlib"]
 
 [dependencies]
-backgammon-lobby-core = { path = "../backgammon-lobby-core" }
 backgammon-protocol = { path = "../backgammon-protocol" }
-ciborium.workspace = true
 freenet-scaffold.workspace = true
-freenet-stdlib.workspace = true
+freenet-scaffold-macro.workspace = true
 serde.workspace = true
-
-[features]
-default = ["freenet-main-contract"]
-freenet-main-contract = []
 
 [dev-dependencies]
 ed25519-dalek = { version = "3.0.0", default-features = false }
