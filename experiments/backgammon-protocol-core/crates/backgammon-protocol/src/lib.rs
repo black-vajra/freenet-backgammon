@@ -2,6 +2,7 @@
 
 mod authentication;
 mod challenge;
+mod challenge_state;
 mod fair_dice;
 mod game_action;
 mod genesis_handshake;
@@ -11,6 +12,7 @@ mod state_hash;
 
 pub use authentication::*;
 pub use challenge::*;
+pub use challenge_state::*;
 pub use fair_dice::*;
 pub use game_action::*;
 pub use genesis_handshake::*;
