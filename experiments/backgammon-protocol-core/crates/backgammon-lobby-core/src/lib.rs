@@ -6,6 +6,10 @@
 
 #![forbid(unsafe_code)]
 
+mod challenge_entries;
+
+pub use challenge_entries::*;
+
 use backgammon_protocol::{
     verify_presence_announcement, PlayerId, PresenceAnnouncementBody, SignedPresenceAnnouncement,
 };

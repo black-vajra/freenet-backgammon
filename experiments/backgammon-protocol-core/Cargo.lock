@@ -94,6 +94,7 @@ name = "backgammon-lobby-core"
 version = "0.1.0"
 dependencies = [
  "backgammon-protocol",
+ "ciborium",
  "ed25519-dalek",
  "freenet-scaffold",
  "freenet-scaffold-macro",
