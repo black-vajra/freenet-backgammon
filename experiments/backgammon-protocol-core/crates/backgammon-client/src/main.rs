@@ -9,6 +9,7 @@ pub mod genesis_handshake;
 pub mod genesis_handshake_store;
 pub mod ledger_codec;
 pub mod lobby;
+pub mod lobby_codec;
 pub mod lobby_profile_store;
 pub mod lobby_projection;
 pub mod local_identity_store;

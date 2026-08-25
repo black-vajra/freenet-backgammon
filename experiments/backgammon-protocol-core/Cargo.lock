@@ -44,6 +44,7 @@ version = "0.1.0"
 dependencies = [
  "backgammon-contract",
  "backgammon-core",
+ "backgammon-lobby-core",
  "backgammon-protocol",
  "ciborium",
  "ed25519-dalek",
