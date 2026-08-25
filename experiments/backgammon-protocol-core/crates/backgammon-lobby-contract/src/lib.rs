@@ -164,7 +164,8 @@ impl ContractInterface for Contract {
 mod tests {
     use super::*;
     use backgammon_protocol::{
-        sign_presence_announcement, PresenceAnnouncementBody, SignedPresenceAnnouncement,
+        sign_challenge_offer, sign_presence_announcement, ChallengeOfferBody, GameConfiguration,
+        GenesisProposal, PlayerDescriptor, PresenceAnnouncementBody, SignedPresenceAnnouncement,
     };
     use ed25519_dalek::SigningKey;
 
@@ -199,6 +200,55 @@ mod tests {
         LobbyState::from_announcement(record).unwrap()
     }
 
+    fn challenge_entries(challenge_seed: u8) -> ChallengeEntries {
+        let white_key = SigningKey::from_bytes(&[81; 32]);
+        let black_key = SigningKey::from_bytes(&[82; 32]);
+
+        let proposal = GenesisProposal::new(
+            [challenge_seed.wrapping_add(1); 32],
+            [challenge_seed.wrapping_add(2); 32],
+            GameConfiguration {
+                white: PlayerDescriptor {
+                    id: white_key.verifying_key().to_bytes(),
+                    display_name: "Alice".to_owned(),
+                },
+                black: PlayerDescriptor {
+                    id: black_key.verifying_key().to_bytes(),
+                    display_name: "Bob".to_owned(),
+                },
+                match_length: 5,
+            },
+        );
+
+        let body = ChallengeOfferBody::new(
+            [challenge_seed; 32],
+            white_key.verifying_key().to_bytes(),
+            20_000,
+            20_600,
+            proposal,
+        );
+
+        let offer = sign_challenge_offer(body, &white_key).unwrap();
+        let offer = ChallengeOfferState::new(offer, Vec::new()).unwrap();
+
+        ChallengeEntries::new(vec![offer]).unwrap()
+    }
+
+    #[derive(Serialize)]
+    struct LegacyLobbyContractState {
+        lobby: LobbyEntries,
+    }
+
+    #[derive(Serialize)]
+    struct LegacyLobbyContractStateSummary {
+        lobby: LobbyEntriesSummary,
+    }
+
+    #[derive(Serialize)]
+    struct LegacyLobbyContractStateDelta {
+        lobby: Option<LobbyState>,
+    }
+
     fn contract_parameters() -> Parameters<'static> {
         Parameters::from(encoded(&()))
     }
@@ -215,6 +265,7 @@ mod tests {
     fn contract_validate_state_accepts_valid_lobby_state() {
         let alice = key(30);
         let lobby = LobbyContractState {
+            challenges: ChallengeEntries::default(),
             lobby: LobbyEntries(state(signed(&alice, "Alice", true, 1))),
         };
 
@@ -236,6 +287,7 @@ mod tests {
         forged.body.revision = 99;
 
         let lobby = LobbyContractState {
+            challenges: ChallengeEntries::default(),
             lobby: LobbyEntries(LobbyState {
                 players: vec![PlayerPresenceState {
                     player_id: forged.body.player_id,
@@ -269,6 +321,7 @@ mod tests {
 
         let current = LobbyContractState::default();
         let incoming = LobbyContractState {
+            challenges: ChallengeEntries::default(),
             lobby: LobbyEntries(state(signed(&alice, "Alice", true, 1))),
         };
 
@@ -290,6 +343,7 @@ mod tests {
 
         let current = LobbyContractState::default();
         let incoming = LobbyContractState {
+            challenges: ChallengeEntries::default(),
             lobby: LobbyEntries(state(signed(&alice, "Alice", true, 2))),
         };
 
@@ -318,6 +372,7 @@ mod tests {
         let alice = key(34);
 
         let receiver = LobbyContractState {
+            challenges: ChallengeEntries::default(),
             lobby: LobbyEntries(state(signed(&alice, "Alice", true, 3))),
         };
 
@@ -327,6 +382,7 @@ mod tests {
             .unwrap();
 
         let source = LobbyContractState {
+            challenges: ChallengeEntries::default(),
             lobby: LobbyEntries(source_state),
         };
 
@@ -355,10 +411,12 @@ mod tests {
         let alice = key(35);
 
         let first = LobbyContractState {
+            challenges: ChallengeEntries::default(),
             lobby: LobbyEntries(state(signed(&alice, "Alice", true, 4))),
         };
 
         let second = LobbyContractState {
+            challenges: ChallengeEntries::default(),
             lobby: LobbyEntries(state(signed(&alice, "Alice", false, 4))),
         };
 
@@ -393,5 +451,138 @@ mod tests {
 
         assert_eq!(left, right);
         assert!(left.lobby.0.players[0].is_equivocating());
+    }
+
+    #[test]
+    fn contract_validate_state_rejects_forged_challenge() {
+        let mut challenges = challenge_entries(40);
+        challenges.offers[0].offer.body.created_at_unix_seconds += 1;
+
+        let state = LobbyContractState {
+            lobby: LobbyEntries::default(),
+            challenges,
+        };
+
+        assert!(Contract::validate_state(
+            contract_parameters(),
+            contract_state(&state),
+            RelatedContracts::new(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn contract_state_update_merges_valid_challenge() {
+        let current = LobbyContractState::default();
+        let incoming = LobbyContractState {
+            lobby: LobbyEntries::default(),
+            challenges: challenge_entries(41),
+        };
+
+        let modification = Contract::update_state(
+            contract_parameters(),
+            contract_state(&current),
+            vec![UpdateData::State(contract_state(&incoming))],
+        )
+        .unwrap();
+
+        let result: LobbyContractState = decode(modification.unwrap_valid().as_ref()).unwrap();
+
+        assert_eq!(result, incoming);
+    }
+
+    #[test]
+    fn contract_summary_and_delta_sync_presence_and_challenge() {
+        let alice = key(37);
+        let receiver = LobbyContractState::default();
+        let source = LobbyContractState {
+            lobby: LobbyEntries(state(signed(&alice, "Alice", true, 6))),
+            challenges: challenge_entries(42),
+        };
+
+        let summary =
+            Contract::summarize_state(contract_parameters(), contract_state(&receiver)).unwrap();
+
+        let delta =
+            Contract::get_state_delta(contract_parameters(), contract_state(&source), summary)
+                .unwrap();
+
+        let modification = Contract::update_state(
+            contract_parameters(),
+            contract_state(&receiver),
+            vec![UpdateData::Delta(delta)],
+        )
+        .unwrap();
+
+        let result: LobbyContractState = decode(modification.unwrap_valid().as_ref()).unwrap();
+
+        assert_eq!(result, source);
+    }
+
+    #[test]
+    fn legacy_presence_only_state_defaults_challenges() {
+        let alice = key(36);
+        let legacy = LegacyLobbyContractState {
+            lobby: LobbyEntries(state(signed(&alice, "Alice", true, 5))),
+        };
+
+        let decoded: LobbyContractState = decode(&encoded(&legacy)).unwrap();
+
+        assert_eq!(decoded.lobby, legacy.lobby);
+        assert_eq!(decoded.challenges, ChallengeEntries::default());
+        decoded.verify(&decoded, &()).unwrap();
+    }
+
+    #[test]
+    fn legacy_presence_only_delta_defaults_challenges() {
+        let alice = key(38);
+        let expected_lobby = LobbyEntries(state(signed(&alice, "Alice", true, 7)));
+
+        let legacy_delta = LegacyLobbyContractStateDelta {
+            lobby: Some(expected_lobby.0.clone()),
+        };
+
+        let modification = Contract::update_state(
+            contract_parameters(),
+            contract_state(&LobbyContractState::default()),
+            vec![UpdateData::Delta(StateDelta::from(encoded(&legacy_delta)))],
+        )
+        .unwrap();
+
+        let result: LobbyContractState = decode(modification.unwrap_valid().as_ref()).unwrap();
+
+        assert_eq!(result.lobby, expected_lobby);
+        assert_eq!(result.challenges, ChallengeEntries::default());
+    }
+
+    #[test]
+    fn legacy_presence_only_summary_requests_challenge_delta() {
+        let receiver = LobbyContractState::default();
+        let source = LobbyContractState {
+            lobby: LobbyEntries::default(),
+            challenges: challenge_entries(43),
+        };
+
+        let legacy_summary = LegacyLobbyContractStateSummary {
+            lobby: receiver.lobby.summarize(&receiver, &()),
+        };
+
+        let delta = Contract::get_state_delta(
+            contract_parameters(),
+            contract_state(&source),
+            StateSummary::from(encoded(&legacy_summary)),
+        )
+        .unwrap();
+
+        let modification = Contract::update_state(
+            contract_parameters(),
+            contract_state(&receiver),
+            vec![UpdateData::Delta(delta)],
+        )
+        .unwrap();
+
+        let result: LobbyContractState = decode(modification.unwrap_valid().as_ref()).unwrap();
+
+        assert_eq!(result, source);
     }
 }

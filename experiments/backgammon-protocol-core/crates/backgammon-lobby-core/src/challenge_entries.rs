@@ -444,11 +444,11 @@ impl ChallengeEntries {
             offers: canonical_challenge_offers(offers)?,
         };
 
-        state.verify()?;
+        state.verify_state()?;
         Ok(state)
     }
 
-    pub fn verify(&self) -> Result<(), String> {
+    pub fn verify_state(&self) -> Result<(), String> {
         if self.offers.len() > MAX_CHALLENGE_OFFERS {
             return Err("Lobby retains too many challenge offers.".into());
         }
@@ -482,18 +482,18 @@ impl ChallengeEntries {
     /// Associative/commutative/idempotent merge followed by deterministic
     /// per-challenger and global top-key retention.
     pub fn merge_from(&mut self, incoming: &Self) -> Result<(), String> {
-        self.verify()?;
-        incoming.verify()?;
+        self.verify_state()?;
+        incoming.verify_state()?;
 
         let mut combined = self.offers.clone();
         combined.extend(incoming.offers.iter().cloned());
         self.offers = canonical_challenge_offers(combined)?;
 
-        self.verify()
+        self.verify_state()
     }
 
     pub fn challenger_horizons(&self) -> Result<Vec<ChallengeChallengerHorizon>, String> {
-        self.verify()?;
+        self.verify_state()?;
 
         let mut grouped: BTreeMap<PlayerId, Vec<ChallengeOfferOrderKey>> = BTreeMap::new();
 
@@ -516,7 +516,7 @@ impl ChallengeEntries {
     }
 
     pub fn global_horizon(&self) -> Result<ChallengeRetentionHorizon, String> {
-        self.verify()?;
+        self.verify_state()?;
 
         if self.offers.len() < MAX_CHALLENGE_OFFERS {
             return Ok(ChallengeRetentionHorizon::Open);
@@ -528,7 +528,7 @@ impl ChallengeEntries {
     }
 
     pub fn retention_summary(&self) -> Result<ChallengeEntriesSummary, String> {
-        self.verify()?;
+        self.verify_state()?;
 
         let offers = self
             .offers
@@ -560,7 +560,7 @@ impl ChallengeEntries {
         &self,
         receiver: &ChallengeEntriesSummary,
     ) -> Result<Option<ChallengeEntriesDelta>, String> {
-        self.verify()?;
+        self.verify_state()?;
         receiver.verify()?;
 
         let offers = self
@@ -587,7 +587,7 @@ impl ChallengeEntries {
         combined.extend(delta.offers.iter().cloned());
         self.offers = canonical_challenge_offers(combined)?;
 
-        self.verify()
+        self.verify_state()
     }
 }
 
@@ -604,7 +604,7 @@ impl FreenetComposableState for ChallengeEntries {
         _parent: &Self::ParentState,
         _parameters: &Self::Parameters,
     ) -> Result<(), String> {
-        ChallengeEntries::verify(self)
+        ChallengeEntries::verify_state(self)
     }
 
     fn summarize(
@@ -640,7 +640,7 @@ impl FreenetComposableState for ChallengeEntries {
             self.apply_challenge_delta(incoming)?;
         }
 
-        ChallengeEntries::verify(self)
+        ChallengeEntries::verify_state(self)
     }
 }
 

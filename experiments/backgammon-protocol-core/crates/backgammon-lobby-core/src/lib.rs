@@ -367,6 +367,9 @@ impl FreenetComposableState for LobbyEntries {
 #[derive(Serialize, Deserialize, Clone, Default, PartialEq, Eq, Debug)]
 pub struct LobbyContractState {
     pub lobby: LobbyEntries,
+
+    #[serde(default)]
+    pub challenges: ChallengeEntries,
 }
 #[cfg(test)]
 mod tests {
@@ -564,6 +567,7 @@ mod tests {
         let alice = key(20);
         let entries = LobbyEntries(state(signed(&alice, "Alice", true, 3)));
         let parent = LobbyContractState {
+            challenges: ChallengeEntries::default(),
             lobby: entries.clone(),
         };
 
@@ -578,6 +582,7 @@ mod tests {
         let alice = key(21);
         let entries = LobbyEntries(state(signed(&alice, "Alice", true, 4)));
         let parent = LobbyContractState {
+            challenges: ChallengeEntries::default(),
             lobby: entries.clone(),
         };
 
@@ -594,12 +599,14 @@ mod tests {
 
         let old_entries = LobbyEntries(state(signed(&alice, "Alice", true, 5)));
         let old_parent = LobbyContractState {
+            challenges: ChallengeEntries::default(),
             lobby: old_entries.clone(),
         };
         let old_summary = old_entries.summarize(&old_parent, &());
 
         let new_entries = LobbyEntries(state(signed(&alice, "Alice", false, 6)));
         let new_parent = LobbyContractState {
+            challenges: ChallengeEntries::default(),
             lobby: new_entries.clone(),
         };
 
@@ -614,7 +621,10 @@ mod tests {
         let alice = key(23);
 
         let one = LobbyEntries(state(signed(&alice, "Alice", true, 7)));
-        let one_parent = LobbyContractState { lobby: one.clone() };
+        let one_parent = LobbyContractState {
+            challenges: ChallengeEntries::default(),
+            lobby: one.clone(),
+        };
         let one_summary = one.summarize(&one_parent, &());
 
         let mut conflicted_state = state(signed(&alice, "Alice", true, 7));
@@ -624,6 +634,7 @@ mod tests {
 
         let conflicted = LobbyEntries(conflicted_state);
         let conflicted_parent = LobbyContractState {
+            challenges: ChallengeEntries::default(),
             lobby: conflicted.clone(),
         };
 
@@ -642,11 +653,13 @@ mod tests {
 
         let source = LobbyEntries(state(signed(&alice, "Alice", true, 8)));
         let source_parent = LobbyContractState {
+            challenges: ChallengeEntries::default(),
             lobby: source.clone(),
         };
 
         let empty = LobbyEntries::default();
         let empty_parent = LobbyContractState {
+            challenges: ChallengeEntries::default(),
             lobby: empty.clone(),
         };
         let empty_summary = empty.summarize(&empty_parent, &());
@@ -655,6 +668,7 @@ mod tests {
 
         let mut target = LobbyEntries::default();
         let target_parent = LobbyContractState {
+            challenges: ChallengeEntries::default(),
             lobby: target.clone(),
         };
 
@@ -663,6 +677,7 @@ mod tests {
         let once = target.clone();
 
         let target_parent = LobbyContractState {
+            challenges: ChallengeEntries::default(),
             lobby: target.clone(),
         };
         target.apply_delta(&target_parent, &(), &delta).unwrap();
@@ -680,14 +695,17 @@ mod tests {
 
         let empty = LobbyEntries::default();
         let empty_parent = LobbyContractState {
+            challenges: ChallengeEntries::default(),
             lobby: empty.clone(),
         };
         let empty_summary = empty.summarize(&empty_parent, &());
 
         let first_parent = LobbyContractState {
+            challenges: ChallengeEntries::default(),
             lobby: first.clone(),
         };
         let second_parent = LobbyContractState {
+            challenges: ChallengeEntries::default(),
             lobby: second.clone(),
         };
 
@@ -696,22 +714,26 @@ mod tests {
 
         let mut left = LobbyEntries::default();
         let parent = LobbyContractState {
+            challenges: ChallengeEntries::default(),
             lobby: left.clone(),
         };
         left.apply_delta(&parent, &(), &first_delta).unwrap();
 
         let parent = LobbyContractState {
+            challenges: ChallengeEntries::default(),
             lobby: left.clone(),
         };
         left.apply_delta(&parent, &(), &second_delta).unwrap();
 
         let mut right = LobbyEntries::default();
         let parent = LobbyContractState {
+            challenges: ChallengeEntries::default(),
             lobby: right.clone(),
         };
         right.apply_delta(&parent, &(), &second_delta).unwrap();
 
         let parent = LobbyContractState {
+            challenges: ChallengeEntries::default(),
             lobby: right.clone(),
         };
         right.apply_delta(&parent, &(), &first_delta).unwrap();
