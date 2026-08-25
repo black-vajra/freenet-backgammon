@@ -3,6 +3,7 @@
 use crate::LobbyContractState;
 use backgammon_protocol::{
     challenge_offer_body_digest, ChallengeId, ChallengeOfferBodyDigest, PlayerId,
+    ED25519_SIGNATURE_BYTES,
 };
 use backgammon_protocol::{
     resolve_challenge, verify_challenge_offer, ChallengeOfferBody, ChallengeResolution,
@@ -22,6 +23,10 @@ pub const MAX_CHALLENGE_OFFERS_PER_CHALLENGER: usize = 16;
 
 /// Maximum retained challenge offers across the lobby.
 pub const MAX_CHALLENGE_OFFERS: usize = 256;
+
+/// Maximum number of per-challenger retention horizons in one summary.
+pub const MAX_CHALLENGER_HORIZONS: usize =
+    MAX_CHALLENGE_OFFERS / MAX_CHALLENGE_OFFERS_PER_CHALLENGER;
 
 /// Immutable canonical ordering identity for one exact challenge-offer body.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -210,6 +215,112 @@ pub struct ChallengeEntriesSummary {
     pub offers: Vec<ChallengeOfferSummary>,
     pub challenger_horizons: Vec<ChallengeChallengerHorizon>,
     pub global_horizon: ChallengeRetentionHorizon,
+}
+
+impl ChallengeEntriesSummary {
+    /// Verify that an untrusted synchronization summary is bounded, canonical,
+    /// and internally consistent with the retention rules.
+    pub fn verify(&self) -> Result<(), String> {
+        if self.offers.len() > MAX_CHALLENGE_OFFERS {
+            return Err("Challenge summary contains too many offers.".into());
+        }
+
+        if self.challenger_horizons.len() > MAX_CHALLENGER_HORIZONS {
+            return Err("Challenge summary contains too many challenger horizons.".into());
+        }
+
+        let mut previous_key: Option<&ChallengeOfferOrderKey> = None;
+        let mut challenger_windows: BTreeMap<PlayerId, (usize, ChallengeOfferOrderKey)> =
+            BTreeMap::new();
+
+        for offer in &self.offers {
+            if previous_key
+                .as_ref()
+                .is_some_and(|previous| *previous >= &offer.key)
+            {
+                return Err("Challenge summary offers are not in strict canonical order.".into());
+            }
+
+            if offer.offer_signature.len() != ED25519_SIGNATURE_BYTES {
+                return Err(format!(
+                    "Challenge offer summary signature length is invalid: expected \
+                     {ED25519_SIGNATURE_BYTES} bytes, got {}.",
+                    offer.offer_signature.len()
+                ));
+            }
+
+            if offer.terminal_evidence.len() > MAX_TERMINAL_EVIDENCE_PER_OFFER {
+                return Err("Challenge offer summary contains too much terminal evidence.".into());
+            }
+
+            let mut previous_kind: Option<u8> = None;
+
+            for evidence in &offer.terminal_evidence {
+                if usize::from(evidence.kind) >= MAX_TERMINAL_EVIDENCE_PER_OFFER {
+                    return Err("Challenge summary contains an unknown evidence kind.".into());
+                }
+
+                if previous_kind.is_some_and(|previous| previous >= evidence.kind) {
+                    return Err(
+                        "Challenge summary evidence is not in strict canonical order.".into(),
+                    );
+                }
+
+                if evidence.signature.len() != ED25519_SIGNATURE_BYTES {
+                    return Err(format!(
+                        "Challenge evidence summary signature length is invalid: expected \
+                         {ED25519_SIGNATURE_BYTES} bytes, got {}.",
+                        evidence.signature.len()
+                    ));
+                }
+
+                previous_kind = Some(evidence.kind);
+            }
+
+            let challenger = challenger_windows
+                .entry(offer.key.challenger_id)
+                .or_insert_with(|| (0, offer.key.clone()));
+            challenger.0 += 1;
+
+            if challenger.0 > MAX_CHALLENGE_OFFERS_PER_CHALLENGER {
+                return Err(
+                    "Challenge summary contains too many offers from one challenger.".into(),
+                );
+            }
+
+            previous_key = Some(&offer.key);
+        }
+
+        let expected_challenger_horizons = challenger_windows
+            .into_iter()
+            .filter_map(|(challenger_id, (count, oldest_retained))| {
+                (count == MAX_CHALLENGE_OFFERS_PER_CHALLENGER).then_some(
+                    ChallengeChallengerHorizon {
+                        challenger_id,
+                        oldest_retained,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+
+        if self.challenger_horizons != expected_challenger_horizons {
+            return Err(
+                "Challenge summary challenger horizons do not match retained offers.".into(),
+            );
+        }
+
+        let expected_global_horizon = if self.offers.len() < MAX_CHALLENGE_OFFERS {
+            ChallengeRetentionHorizon::Open
+        } else {
+            ChallengeRetentionHorizon::OldestRetained(self.offers[0].key.clone())
+        };
+
+        if self.global_horizon != expected_global_horizon {
+            return Err("Challenge summary global horizon does not match retained offers.".into());
+        }
+
+        Ok(())
+    }
 }
 
 /// Full authenticated offer states selected for one synchronization delta.
@@ -450,6 +561,7 @@ impl ChallengeEntries {
         receiver: &ChallengeEntriesSummary,
     ) -> Result<Option<ChallengeEntriesDelta>, String> {
         self.verify()?;
+        receiver.verify()?;
 
         let offers = self
             .offers
@@ -481,7 +593,9 @@ impl ChallengeEntries {
 
 impl FreenetComposableState for ChallengeEntries {
     type ParentState = LobbyContractState;
-    type Summary = ChallengeEntriesSummary;
+    // Optional so a legacy presence-only parent summary means that the
+    // receiver has no challenge knowledge.
+    type Summary = Option<ChallengeEntriesSummary>;
     type Delta = ChallengeEntriesDelta;
     type Parameters = ();
 
@@ -498,8 +612,7 @@ impl FreenetComposableState for ChallengeEntries {
         _parent: &Self::ParentState,
         _parameters: &Self::Parameters,
     ) -> Self::Summary {
-        self.retention_summary()
-            .expect("validated challenge entries must be summarizable")
+        self.retention_summary().ok()
     }
 
     fn delta(
@@ -508,8 +621,13 @@ impl FreenetComposableState for ChallengeEntries {
         _parameters: &Self::Parameters,
         old: &Self::Summary,
     ) -> Option<Self::Delta> {
-        self.delta_from_summary(old)
-            .expect("validated challenge entries must produce a delta")
+        let empty_summary = ChallengeEntriesSummary::default();
+        let receiver = match old {
+            Some(summary) if summary.verify().is_ok() => summary,
+            _ => &empty_summary,
+        };
+
+        self.delta_from_summary(receiver).ok().flatten()
     }
 
     fn apply_delta(
@@ -1097,6 +1215,85 @@ mod tests {
     }
 
     #[test]
+    fn challenge_summaries_reject_noncanonical_and_oversized_input() {
+        let state = challenger_window(96, 10, 4);
+        let summary = state.retention_summary().unwrap();
+        summary.verify().unwrap();
+
+        let mut out_of_order = summary.clone();
+        out_of_order.offers.swap(0, 1);
+        assert!(out_of_order.verify().is_err());
+
+        let mut invalid_signature = summary.clone();
+        invalid_signature.offers[0].offer_signature.clear();
+        assert!(invalid_signature.verify().is_err());
+
+        let mut duplicate_evidence_kind = summary.clone();
+        let signature = duplicate_evidence_kind.offers[0].offer_signature.clone();
+        duplicate_evidence_kind.offers[0].terminal_evidence = vec![
+            ChallengeTerminalEvidenceSummary {
+                kind: 0,
+                signature: signature.clone(),
+            },
+            ChallengeTerminalEvidenceSummary { kind: 0, signature },
+        ];
+        assert!(duplicate_evidence_kind.verify().is_err());
+
+        let mut inconsistent_global_horizon = summary.clone();
+        inconsistent_global_horizon.global_horizon = ChallengeRetentionHorizon::OldestRetained(
+            inconsistent_global_horizon.offers[0].key.clone(),
+        );
+        assert!(inconsistent_global_horizon.verify().is_err());
+
+        let mut missing_challenger_horizon =
+            challenger_window(98, 0, 16).retention_summary().unwrap();
+        assert_eq!(missing_challenger_horizon.challenger_horizons.len(), 1);
+        let retained_horizon = missing_challenger_horizon.challenger_horizons[0].clone();
+        missing_challenger_horizon.challenger_horizons.clear();
+        assert!(missing_challenger_horizon.verify().is_err());
+
+        let mut oversized_horizons = ChallengeEntriesSummary::default();
+        oversized_horizons.challenger_horizons =
+            vec![retained_horizon; MAX_CHALLENGER_HORIZONS + 1];
+        assert!(oversized_horizons.verify().is_err());
+
+        let mut oversized = ChallengeEntriesSummary::default();
+        oversized.offers = vec![summary.offers[0].clone(); MAX_CHALLENGE_OFFERS + 1];
+        assert!(oversized.verify().is_err());
+    }
+
+    #[test]
+    fn composable_challenge_summary_is_optional_and_invalid_input_falls_back_to_empty() {
+        let sender = challenger_window(97, 20, 4);
+        let parent = LobbyContractState::default();
+        let expected_summary = sender.retention_summary().unwrap();
+
+        assert_eq!(
+            <ChallengeEntries as FreenetComposableState>::summarize(&sender, &parent, &()),
+            Some(expected_summary.clone())
+        );
+
+        let legacy_delta =
+            <ChallengeEntries as FreenetComposableState>::delta(&sender, &parent, &(), &None)
+                .expect("legacy summary must receive the bounded challenge state");
+        assert_eq!(legacy_delta.offers, sender.offers);
+
+        let mut invalid_summary = expected_summary;
+        invalid_summary.offers[0].offer_signature.clear();
+        assert!(sender.delta_from_summary(&invalid_summary).is_err());
+
+        let fallback_delta = <ChallengeEntries as FreenetComposableState>::delta(
+            &sender,
+            &parent,
+            &(),
+            &Some(invalid_summary),
+        )
+        .expect("invalid summary must fall back to an empty receiver summary");
+
+        assert_eq!(fallback_delta.offers, sender.offers);
+    }
+
+    #[test]
     fn summaries_and_deltas_round_trip_through_cbor() {
         let sender = challenger_window(95, 4, 4);
         let receiver = challenger_window(95, 4, 2);
@@ -1110,6 +1307,7 @@ mod tests {
         ciborium::ser::into_writer(&summary, &mut summary_bytes).unwrap();
         let decoded_summary: ChallengeEntriesSummary =
             ciborium::de::from_reader(summary_bytes.as_slice()).unwrap();
+        decoded_summary.verify().unwrap();
 
         let mut delta_bytes = Vec::new();
         ciborium::ser::into_writer(&delta, &mut delta_bytes).unwrap();
