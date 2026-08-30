@@ -50,6 +50,7 @@ dependencies = [
  "ed25519-dalek",
  "freenet-stdlib",
  "gloo-timers",
+ "js-sys",
  "serde",
  "wasm-bindgen-futures",
  "web-sys",

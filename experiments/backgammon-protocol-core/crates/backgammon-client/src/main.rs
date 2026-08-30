@@ -12,6 +12,7 @@ pub mod lobby;
 pub mod lobby_codec;
 pub mod lobby_profile_store;
 pub mod lobby_projection;
+pub mod lobby_transport;
 pub mod local_identity_store;
 pub mod local_role_store;
 pub mod pending_action;
@@ -29,8 +30,14 @@ mod test_support;
 
 #[cfg(target_arch = "wasm32")]
 mod browser {
+    use std::{cell::RefCell, rc::Rc};
+
     use backgammon_core::{GameState, MoveSource, MoveTarget, Player, TurnPhase, TurnSequence};
+    use backgammon_lobby_core::LobbyContractState;
     use backgammon_protocol::{replay_game, DiceSecret, GameActionPayload};
+    use freenet_stdlib::client_api::{HostResponse, WebApi};
+    use freenet_stdlib::prelude::ContractKey;
+    use js_sys::Date;
     use yew::prelude::*;
     use yew::TargetCast;
 
@@ -44,6 +51,10 @@ mod browser {
     use crate::ledger_codec::{decode_verified_ledger, decode_verified_replay};
     use crate::lobby_profile_store::{load_lobby_display_name, store_lobby_display_name};
     use crate::lobby_projection::project_available_players;
+    use crate::lobby_transport::{
+        classify_lobby_response, request_lobby_contract, ClassifiedLobbyResponse,
+        LobbyContractStatus,
+    };
     use crate::local_identity_store::{
         load_local_identity, load_or_create_local_identity, player_id_for_signing_key,
         role_for_player_id,
@@ -70,6 +81,90 @@ mod browser {
             .map(|byte| format!("{byte:02x}"))
             .collect::<Vec<_>>()
             .join("")
+    }
+
+    /*
+     * Local wall-clock time is advisory discovery input only. It may filter
+     * this browser's view of expired presence records, but it must never decide
+     * authoritative lobby state, game state, action ordering, or abandonment.
+     */
+    fn local_observation_unix_seconds() -> Result<u64, String> {
+        let milliseconds = Date::now();
+
+        if !milliseconds.is_finite() || milliseconds < 0.0 {
+            return Err("Browser Date.now() returned an invalid value.".to_owned());
+        }
+
+        let seconds = (milliseconds / 1_000.0).floor();
+
+        if seconds > u64::MAX as f64 {
+            return Err("Browser Date.now() exceeds the supported Unix range.".to_owned());
+        }
+
+        Ok(seconds as u64)
+    }
+
+    fn handle_lobby_response(
+        response: &HostResponse,
+        contract_status_handle: &UseStateHandle<LobbyContractStatus>,
+        subscription_status_handle: &UseStateHandle<SubscriptionStatus>,
+        authoritative_state_handle: &UseStateHandle<Option<LobbyContractState>>,
+        contract_key_handle: &Rc<RefCell<Option<ContractKey>>>,
+        api_handle: &Rc<RefCell<Option<WebApi>>>,
+    ) -> bool {
+        let Some(classified) = classify_lobby_response(response) else {
+            return false;
+        };
+
+        let ClassifiedLobbyResponse {
+            contract_status,
+            subscription_status,
+            contract_key,
+            authoritative_state,
+            refresh_required,
+        } = classified;
+
+        if let Some(status) = contract_status {
+            contract_status_handle.set(status);
+        }
+
+        if let Some(status) = subscription_status {
+            subscription_status_handle.set(status);
+        }
+
+        if let Some(key) = contract_key {
+            *contract_key_handle.borrow_mut() = Some(key);
+        }
+
+        if let Some(state) = authoritative_state {
+            authoritative_state_handle.set(Some(state));
+        }
+
+        if refresh_required {
+            let api = api_handle.clone();
+            let contract_status = contract_status_handle.clone();
+            let subscription_status = subscription_status_handle.clone();
+
+            wasm_bindgen_futures::spawn_local(async move {
+                let result = {
+                    let mut api = api.borrow_mut();
+
+                    match api.as_mut() {
+                        Some(api) => request_lobby_contract(api).await,
+                        None => {
+                            Err("Freenet connection closed before the lobby refresh.".to_owned())
+                        }
+                    }
+                };
+
+                if let Err(error) = result {
+                    contract_status.set(LobbyContractStatus::Failed(error));
+                    subscription_status.set(SubscriptionStatus::Inactive);
+                }
+            });
+        }
+
+        true
     }
 
     fn secure_random_32(purpose: &str) -> Result<[u8; 32], String> {
@@ -782,6 +877,15 @@ mod browser {
         let lobby_profile_error = use_state(|| None::<String>);
 
         /*
+         * Verified authoritative lobby state is separate from local profile
+         * intent. It remains absent until the published lobby contract returns
+         * a complete state that passes the hostile-input codec.
+         */
+        let lobby_contract_status = use_state(|| LobbyContractStatus::WaitingForConnection);
+        let lobby_subscription_status = use_state(|| SubscriptionStatus::Pending);
+        let authoritative_lobby_state = use_state(|| None::<LobbyContractState>);
+
+        /*
          * Role derived from this persistent PlayerId and a verified
          * authoritative GameConfiguration. None means no verified role
          * decision is available yet; Some(None) means not a participant.
@@ -795,6 +899,7 @@ mod browser {
          */
         let latest_contract_key = use_mut_ref(|| None::<freenet_stdlib::prelude::ContractKey>);
         let latest_authoritative_state = use_mut_ref(|| None::<Vec<u8>>);
+        let latest_lobby_contract_key = use_mut_ref(|| None::<ContractKey>);
 
         /*
          * The stored role is scoped to this exact contract instance.
@@ -925,6 +1030,10 @@ mod browser {
             let dice_secret_status = dice_secret_status.clone();
             let latest_contract_key = latest_contract_key.clone();
             let latest_authoritative_state = latest_authoritative_state.clone();
+            let latest_lobby_contract_key = latest_lobby_contract_key.clone();
+            let lobby_contract_status = lobby_contract_status.clone();
+            let lobby_subscription_status = lobby_subscription_status.clone();
+            let authoritative_lobby_state = authoritative_lobby_state.clone();
             let local_player_id_for_effect = local_player_id.clone();
             let authoritative_local_role_for_effect = authoritative_local_role.clone();
             let controller_for_effect = controller.clone();
@@ -939,19 +1048,26 @@ mod browser {
                 *local_dice_secret.borrow_mut() = None;
                 latest_contract_key.borrow_mut().take();
                 latest_authoritative_state.borrow_mut().take();
+                latest_lobby_contract_key.borrow_mut().take();
                 authoritative_local_role_for_effect.set(None);
 
                 let status_for_callback = connection_status.clone();
                 let contract_for_response = contract_status.clone();
                 let contract_for_host_error = contract_status.clone();
+                let lobby_contract_for_response = lobby_contract_status.clone();
+                let lobby_contract_for_host_error = lobby_contract_status.clone();
                 let subscription_for_response = subscription_status.clone();
                 let subscription_for_status = subscription_status.clone();
+                let lobby_subscription_for_response = lobby_subscription_status.clone();
+                let lobby_subscription_for_status = lobby_subscription_status.clone();
                 let api_for_response = freenet_api.clone();
                 let network_action_for_response = local_network_action_submitted.clone();
                 let secret_for_response = local_dice_secret.clone();
                 let secret_status_for_response = dice_secret_status.clone();
                 let key_for_response = latest_contract_key.clone();
                 let state_for_response = latest_authoritative_state.clone();
+                let lobby_state_for_response = authoritative_lobby_state.clone();
+                let lobby_key_for_response = latest_lobby_contract_key.clone();
                 let player_id_for_response = local_player_id_for_effect.clone();
                 let authoritative_role_for_response = authoritative_local_role_for_effect.clone();
                 let controller_for_response = controller_for_effect.clone();
@@ -960,22 +1076,37 @@ mod browser {
                 let connection_for_open = connection_status.clone();
                 let contract_for_open = contract_status.clone();
                 let subscription_for_open = subscription_status.clone();
+                let lobby_contract_for_open = lobby_contract_status.clone();
+                let lobby_subscription_for_open = lobby_subscription_status.clone();
 
                 match connect(
                     move |status| {
                         match &status {
                             ConnectionStatus::Connecting => {
                                 subscription_for_status.set(SubscriptionStatus::Pending);
+                                lobby_subscription_for_status.set(SubscriptionStatus::Pending);
                             }
                             ConnectionStatus::Connected => {}
                             ConnectionStatus::Disconnected | ConnectionStatus::Failed(_) => {
                                 subscription_for_status.set(SubscriptionStatus::Inactive);
+                                lobby_subscription_for_status.set(SubscriptionStatus::Inactive);
                             }
                         }
 
                         status_for_callback.set(status);
                     },
                     move |response| {
+                        if handle_lobby_response(
+                            &response,
+                            &lobby_contract_for_response,
+                            &lobby_subscription_for_response,
+                            &lobby_state_for_response,
+                            &lobby_key_for_response,
+                            &api_for_response,
+                        ) {
+                            return;
+                        }
+
                         if let Some(classified) = classify_response(response) {
                             let ClassifiedResponse {
                                 contract_status,
@@ -1318,36 +1449,60 @@ mod browser {
                     move |error| {
                         contract_for_host_error
                             .set(crate::transport::host_result_error_status(&error));
+
+                        lobby_contract_for_host_error
+                            .set(crate::lobby_transport::host_result_error_status(&error));
                     },
                     move || {
                         let api_for_request = api_for_open.clone();
                         let connection_for_request = connection_for_open.clone();
                         let contract_for_request = contract_for_open.clone();
                         let subscription_for_request = subscription_for_open.clone();
+                        let lobby_contract_for_request = lobby_contract_for_open.clone();
+                        let lobby_subscription_for_request = lobby_subscription_for_open.clone();
 
                         wasm_bindgen_futures::spawn_local(async move {
                             contract_for_request.set(ContractProbeStatus::Requesting);
-
                             subscription_for_request.set(SubscriptionStatus::Pending);
 
-                            let result = {
+                            lobby_contract_for_request.set(LobbyContractStatus::Requesting);
+                            lobby_subscription_for_request.set(SubscriptionStatus::Pending);
+
+                            let (game_result, lobby_result) = {
                                 let mut api = api_for_request.borrow_mut();
 
                                 match api.as_mut() {
-                                    Some(api) => request_test_contract(api).await,
-                                    None => Err(
-                                        "Freenet WebSocket opened without an active API handle."
-                                            .to_owned(),
+                                    Some(api) => {
+                                        let game_result =
+                                            request_test_contract(api).await;
+                                        let lobby_result =
+                                            request_lobby_contract(api).await;
+
+                                        (game_result, lobby_result)
+                                    }
+
+                                    None => (
+                                        Err(
+                                            "Freenet WebSocket opened without an active API handle."
+                                                .to_owned(),
+                                        ),
+                                        Err(
+                                            "Freenet WebSocket opened without an active API handle."
+                                                .to_owned(),
+                                        ),
                                     ),
                                 }
                             };
 
-                            if let Err(error) = result {
+                            if let Err(error) = game_result {
                                 connection_for_request.set(ConnectionStatus::Failed(error.clone()));
-
                                 contract_for_request.set(ContractProbeStatus::Failed(error));
-
                                 subscription_for_request.set(SubscriptionStatus::Inactive);
+                            }
+
+                            if let Err(error) = lobby_result {
+                                lobby_contract_for_request.set(LobbyContractStatus::Failed(error));
+                                lobby_subscription_for_request.set(SubscriptionStatus::Inactive);
                             }
                         });
                     },
@@ -1356,7 +1511,9 @@ mod browser {
                         *freenet_api.borrow_mut() = Some(api);
                     }
                     Err(error) => {
-                        connection_status.set(ConnectionStatus::Failed(error));
+                        connection_status.set(ConnectionStatus::Failed(error.clone()));
+                        lobby_contract_status.set(LobbyContractStatus::Failed(error));
+                        lobby_subscription_status.set(SubscriptionStatus::Inactive);
                     }
                 }
 
@@ -2074,6 +2231,10 @@ mod browser {
             let dice_secret_status = dice_secret_status.clone();
             let latest_contract_key = latest_contract_key.clone();
             let latest_authoritative_state = latest_authoritative_state.clone();
+            let latest_lobby_contract_key = latest_lobby_contract_key.clone();
+            let lobby_contract_status = lobby_contract_status.clone();
+            let lobby_subscription_status = lobby_subscription_status.clone();
+            let authoritative_lobby_state = authoritative_lobby_state.clone();
             let local_player_id_for_reconnect = local_player_id.clone();
             let authoritative_local_role_for_reconnect = authoritative_local_role.clone();
             let controller_for_reconnect = controller.clone();
@@ -2088,23 +2249,32 @@ mod browser {
                 *local_network_action_submitted.borrow_mut() = None;
                 latest_contract_key.borrow_mut().take();
                 latest_authoritative_state.borrow_mut().take();
+                latest_lobby_contract_key.borrow_mut().take();
                 authoritative_local_role_for_reconnect.set(None);
 
                 contract_status.set(ContractProbeStatus::WaitingForConnection);
                 subscription_status.set(SubscriptionStatus::Pending);
+                lobby_contract_status.set(LobbyContractStatus::WaitingForConnection);
+                lobby_subscription_status.set(SubscriptionStatus::Pending);
                 dice_secret_status.set("Checking browser storage".to_owned());
 
                 let status_for_callback = connection_status.clone();
                 let contract_for_response = contract_status.clone();
                 let contract_for_host_error = contract_status.clone();
+                let lobby_contract_for_response = lobby_contract_status.clone();
+                let lobby_contract_for_host_error = lobby_contract_status.clone();
                 let subscription_for_response = subscription_status.clone();
                 let subscription_for_status = subscription_status.clone();
+                let lobby_subscription_for_response = lobby_subscription_status.clone();
+                let lobby_subscription_for_status = lobby_subscription_status.clone();
                 let api_for_response = freenet_api.clone();
                 let network_action_for_response = local_network_action_submitted.clone();
                 let secret_for_response = local_dice_secret.clone();
                 let secret_status_for_response = dice_secret_status.clone();
                 let key_for_response = latest_contract_key.clone();
                 let state_for_response = latest_authoritative_state.clone();
+                let lobby_state_for_response = authoritative_lobby_state.clone();
+                let lobby_key_for_response = latest_lobby_contract_key.clone();
                 let player_id_for_response = local_player_id_for_reconnect.clone();
                 let authoritative_role_for_response =
                     authoritative_local_role_for_reconnect.clone();
@@ -2114,22 +2284,37 @@ mod browser {
                 let connection_for_open = connection_status.clone();
                 let contract_for_open = contract_status.clone();
                 let subscription_for_open = subscription_status.clone();
+                let lobby_contract_for_open = lobby_contract_status.clone();
+                let lobby_subscription_for_open = lobby_subscription_status.clone();
 
                 match connect(
                     move |status| {
                         match &status {
                             ConnectionStatus::Connecting => {
                                 subscription_for_status.set(SubscriptionStatus::Pending);
+                                lobby_subscription_for_status.set(SubscriptionStatus::Pending);
                             }
                             ConnectionStatus::Connected => {}
                             ConnectionStatus::Disconnected | ConnectionStatus::Failed(_) => {
                                 subscription_for_status.set(SubscriptionStatus::Inactive);
+                                lobby_subscription_for_status.set(SubscriptionStatus::Inactive);
                             }
                         }
 
                         status_for_callback.set(status);
                     },
                     move |response| {
+                        if handle_lobby_response(
+                            &response,
+                            &lobby_contract_for_response,
+                            &lobby_subscription_for_response,
+                            &lobby_state_for_response,
+                            &lobby_key_for_response,
+                            &api_for_response,
+                        ) {
+                            return;
+                        }
+
                         if let Some(classified) = classify_response(response) {
                             let ClassifiedResponse {
                                 contract_status,
@@ -2471,36 +2656,60 @@ mod browser {
                     move |error| {
                         contract_for_host_error
                             .set(crate::transport::host_result_error_status(&error));
+
+                        lobby_contract_for_host_error
+                            .set(crate::lobby_transport::host_result_error_status(&error));
                     },
                     move || {
                         let api_for_request = api_for_open.clone();
                         let connection_for_request = connection_for_open.clone();
                         let contract_for_request = contract_for_open.clone();
                         let subscription_for_request = subscription_for_open.clone();
+                        let lobby_contract_for_request = lobby_contract_for_open.clone();
+                        let lobby_subscription_for_request = lobby_subscription_for_open.clone();
 
                         wasm_bindgen_futures::spawn_local(async move {
                             contract_for_request.set(ContractProbeStatus::Requesting);
-
                             subscription_for_request.set(SubscriptionStatus::Pending);
 
-                            let result = {
+                            lobby_contract_for_request.set(LobbyContractStatus::Requesting);
+                            lobby_subscription_for_request.set(SubscriptionStatus::Pending);
+
+                            let (game_result, lobby_result) = {
                                 let mut api = api_for_request.borrow_mut();
 
                                 match api.as_mut() {
-                                    Some(api) => request_test_contract(api).await,
-                                    None => Err(
-                                        "Freenet WebSocket opened without an active API handle."
-                                            .to_owned(),
+                                    Some(api) => {
+                                        let game_result =
+                                            request_test_contract(api).await;
+                                        let lobby_result =
+                                            request_lobby_contract(api).await;
+
+                                        (game_result, lobby_result)
+                                    }
+
+                                    None => (
+                                        Err(
+                                            "Freenet WebSocket opened without an active API handle."
+                                                .to_owned(),
+                                        ),
+                                        Err(
+                                            "Freenet WebSocket opened without an active API handle."
+                                                .to_owned(),
+                                        ),
                                     ),
                                 }
                             };
 
-                            if let Err(error) = result {
+                            if let Err(error) = game_result {
                                 connection_for_request.set(ConnectionStatus::Failed(error.clone()));
-
                                 contract_for_request.set(ContractProbeStatus::Failed(error));
-
                                 subscription_for_request.set(SubscriptionStatus::Inactive);
+                            }
+
+                            if let Err(error) = lobby_result {
+                                lobby_contract_for_request.set(LobbyContractStatus::Failed(error));
+                                lobby_subscription_for_request.set(SubscriptionStatus::Inactive);
                             }
                         });
                     },
@@ -2509,7 +2718,9 @@ mod browser {
                         *freenet_api.borrow_mut() = Some(api);
                     }
                     Err(error) => {
-                        connection_status.set(ConnectionStatus::Failed(error));
+                        connection_status.set(ConnectionStatus::Failed(error.clone()));
+                        lobby_contract_status.set(LobbyContractStatus::Failed(error));
+                        lobby_subscription_status.set(SubscriptionStatus::Inactive);
                     }
                 }
             })
@@ -2676,12 +2887,60 @@ mod browser {
         };
 
         /*
-         * No fabricated opponents: this will remain empty until verified
-         * signed presence records are supplied by real lobby transport.
+         * Project opponents only from a complete, independently verified
+         * authoritative lobby state. Local intent is never mixed into this
+         * network-derived view.
          */
-        let available_players = match *local_player_id {
-            Some(player_id) => project_available_players(player_id, &[], 0),
-            None => Vec::new(),
+        let lobby_now = local_observation_unix_seconds();
+
+        let available_players = match (
+            *local_player_id,
+            (*authoritative_lobby_state).as_ref(),
+            lobby_now.as_ref(),
+        ) {
+            (Some(player_id), Some(state), Ok(now_unix_seconds)) => {
+                let announcements = state
+                    .lobby
+                    .0
+                    .players
+                    .iter()
+                    .flat_map(|player| player.records.iter().cloned())
+                    .collect::<Vec<_>>();
+
+                project_available_players(player_id, &announcements, *now_unix_seconds)
+            }
+
+            _ => Vec::new(),
+        };
+
+        let lobby_network_detail = match lobby_now.as_ref() {
+            Ok(_) => format!(
+                "{} · Subscription: {} · {} · Expiry view uses this browser's clock",
+                lobby_contract_status.label(),
+                lobby_subscription_status.label(),
+                lobby_contract_status.detail(),
+            ),
+
+            Err(error) => format!(
+                "{} · Subscription: {} · Projection unavailable: {}",
+                lobby_contract_status.label(),
+                lobby_subscription_status.label(),
+                error,
+            ),
+        };
+
+        let lobby_empty_message = match (&*lobby_contract_status, lobby_now.as_ref()) {
+            (LobbyContractStatus::Retrieved { .. }, Ok(_)) => {
+                "No opponents are currently considered available by this browser."
+            }
+
+            (LobbyContractStatus::Failed(_), _) => {
+                "Verified lobby players are currently unavailable."
+            }
+
+            (_, Err(_)) => "Available players cannot be projected without a valid browser clock.",
+
+            _ => "No verified Freenet presence records loaded yet.",
         };
 
         let lobby_identity_text = match *local_player_id {
@@ -2843,13 +3102,15 @@ mod browser {
                             </span>
                         </div>
 
+                        <p class="panel-note" role="status">
+                            { lobby_network_detail }
+                        </p>
+
                         {
                             if available_players.is_empty() {
                                 html! {
                                     <p class="lobby-empty-state">
-                                        {
-                                            "No verified Freenet presence                                              records loaded yet."
-                                        }
+                                        { lobby_empty_message }
                                     </p>
                                 }
                             } else {
