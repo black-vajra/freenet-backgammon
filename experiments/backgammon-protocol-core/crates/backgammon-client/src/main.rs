@@ -4,6 +4,7 @@ mod game_contract_publication;
 
 pub mod challenge;
 pub mod challenge_offer_planner;
+pub mod challenge_publication_store;
 pub mod challenge_state;
 pub mod commitment_planner;
 pub mod controller;
