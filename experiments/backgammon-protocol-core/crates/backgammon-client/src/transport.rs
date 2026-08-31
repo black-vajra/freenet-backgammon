@@ -181,17 +181,18 @@ pub fn connect(
 }
 
 #[cfg(target_arch = "wasm32")]
-pub async fn request_test_contract(
+pub async fn request_contract(
     api: &mut freenet_stdlib::client_api::WebApi,
+    contract_id: &str,
 ) -> Result<(), String> {
     use freenet_stdlib::client_api::{ClientRequest, ContractRequest};
     use freenet_stdlib::prelude::ContractInstanceId;
 
-    let key = ContractInstanceId::try_from(TEST_CONTRACT_ID.to_owned())
-        .map_err(|error| format!("Invalid test contract ID: {error}"))?;
+    let key = ContractInstanceId::try_from(contract_id.to_owned())
+        .map_err(|error| format!("Invalid contract ID: {error}"))?;
 
-    if key.encode() != TEST_CONTRACT_ID {
-        return Err("Test contract ID is not canonically encoded.".to_owned());
+    if key.encode() != contract_id {
+        return Err("Contract ID is not canonically encoded.".to_owned());
     }
 
     api.send(ClientRequest::ContractOp(ContractRequest::Get {
@@ -207,13 +208,14 @@ pub async fn request_test_contract(
 #[cfg(target_arch = "wasm32")]
 pub async fn submit_action_delta(
     api: &mut freenet_stdlib::client_api::WebApi,
+    expected_contract_id: &str,
     key: freenet_stdlib::prelude::ContractKey,
     delta: Vec<u8>,
 ) -> Result<(), String> {
     use freenet_stdlib::client_api::{ClientRequest, ContractRequest};
     use freenet_stdlib::prelude::UpdateData;
 
-    if key.id().encode() != TEST_CONTRACT_ID {
+    if key.id().encode() != expected_contract_id {
         return Err("Refusing to update an unexpected contract key.".to_owned());
     }
 
@@ -232,6 +234,7 @@ pub async fn submit_action_delta(
 #[cfg(target_arch = "wasm32")]
 pub fn classify_response(
     response: freenet_stdlib::client_api::HostResponse,
+    expected_contract_id: &str,
 ) -> Option<ClassifiedResponse> {
     use freenet_stdlib::client_api::{ContractResponse, HostResponse};
     use freenet_stdlib::prelude::UpdateData;
@@ -242,7 +245,7 @@ pub fn classify_response(
 
     match response {
         ContractResponse::GetResponse { key, state, .. } => {
-            if key.id().encode() != TEST_CONTRACT_ID {
+            if key.id().encode() != expected_contract_id {
                 return None;
             }
 
@@ -257,7 +260,7 @@ pub fn classify_response(
         }
 
         ContractResponse::UpdateNotification { key, update } => {
-            if key.id().encode() != TEST_CONTRACT_ID {
+            if key.id().encode() != expected_contract_id {
                 return None;
             }
 
@@ -302,7 +305,7 @@ pub fn classify_response(
         }
 
         ContractResponse::SubscribeResponse { key, subscribed } => {
-            if key.id().encode() != TEST_CONTRACT_ID {
+            if key.id().encode() != expected_contract_id {
                 return None;
             }
 
@@ -319,7 +322,7 @@ pub fn classify_response(
         }
 
         ContractResponse::NotFound { instance_id } => {
-            if instance_id.encode() != TEST_CONTRACT_ID {
+            if instance_id.encode() != expected_contract_id {
                 return None;
             }
 

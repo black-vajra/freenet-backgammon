@@ -74,7 +74,7 @@ mod browser {
     use crate::reveal_planner::{plan_reveal, RevealPlan, RevealPlannerInput};
     use crate::secret_store::{load_dice_secret, store_dice_secret};
     use crate::transport::{
-        classify_response, connect, request_test_contract, submit_action_delta, ClassifiedResponse,
+        classify_response, connect, request_contract, submit_action_delta, ClassifiedResponse,
         ConnectionStatus, ContractProbeStatus, SubscriptionStatus, TEST_CONTRACT_ID,
     };
 
@@ -1111,7 +1111,7 @@ mod browser {
                             return;
                         }
 
-                        if let Some(classified) = classify_response(response) {
+                        if let Some(classified) = classify_response(response, TEST_CONTRACT_ID) {
                             let ClassifiedResponse {
                                 contract_status,
                                 subscription_status,
@@ -1281,6 +1281,7 @@ mod browser {
                                                         Some(api) => {
                                                             submit_action_delta(
                                                                 api,
+                                                                TEST_CONTRACT_ID,
                                                                 key,
                                                                 delta,
                                                             )
@@ -1307,7 +1308,7 @@ mod browser {
 
                                                         match api.as_mut() {
                                                                 Some(api) => {
-                                                                    request_test_contract(api)
+                                                                    request_contract(api, TEST_CONTRACT_ID)
                                                                         .await
                                                                 }
 
@@ -1395,7 +1396,7 @@ mod browser {
 
                                                 match api.as_mut() {
                                                     Some(api) => {
-                                                        submit_action_delta(api, key, delta).await
+                                                        submit_action_delta(api, TEST_CONTRACT_ID, key, delta).await
                                                     }
 
                                                     None => Err(format!(
@@ -1417,7 +1418,7 @@ mod browser {
 
                                                         match api.as_mut() {
                                                             Some(api) => {
-                                                                request_test_contract(api).await
+                                                                request_contract(api, TEST_CONTRACT_ID).await
                                                             }
 
                                                             None => Err(format!(
@@ -1478,7 +1479,7 @@ mod browser {
                                 match api.as_mut() {
                                     Some(api) => {
                                         let game_result =
-                                            request_test_contract(api).await;
+                                            request_contract(api, TEST_CONTRACT_ID).await;
                                         let lobby_result =
                                             request_lobby_contract(api).await;
 
@@ -1750,7 +1751,9 @@ mod browser {
                             let mut api = api_for_update.borrow_mut();
 
                             match api.as_mut() {
-                                Some(api) => submit_action_delta(api, key, delta).await,
+                                Some(api) => {
+                                    submit_action_delta(api, TEST_CONTRACT_ID, key, delta).await
+                                }
 
                                 None => Err(
                                     "Freenet connection closed before the pending action update."
@@ -1769,7 +1772,7 @@ mod browser {
                                     let mut api = api_for_update.borrow_mut();
 
                                     match api.as_mut() {
-                                        Some(api) => request_test_contract(api).await,
+                                        Some(api) => request_contract(api, TEST_CONTRACT_ID).await,
 
                                         None => Err(
                                             "Freenet connection closed before pending action verification."
@@ -2319,7 +2322,7 @@ mod browser {
                             return;
                         }
 
-                        if let Some(classified) = classify_response(response) {
+                        if let Some(classified) = classify_response(response, TEST_CONTRACT_ID) {
                             let ClassifiedResponse {
                                 contract_status,
                                 subscription_status,
@@ -2489,6 +2492,7 @@ mod browser {
                                                         Some(api) => {
                                                             submit_action_delta(
                                                                 api,
+                                                                TEST_CONTRACT_ID,
                                                                 key,
                                                                 delta,
                                                             )
@@ -2515,7 +2519,7 @@ mod browser {
 
                                                         match api.as_mut() {
                                                                 Some(api) => {
-                                                                    request_test_contract(api)
+                                                                    request_contract(api, TEST_CONTRACT_ID)
                                                                         .await
                                                                 }
 
@@ -2603,7 +2607,7 @@ mod browser {
 
                                                 match api.as_mut() {
                                                     Some(api) => {
-                                                        submit_action_delta(api, key, delta).await
+                                                        submit_action_delta(api, TEST_CONTRACT_ID, key, delta).await
                                                     }
 
                                                     None => Err(format!(
@@ -2625,7 +2629,7 @@ mod browser {
 
                                                         match api.as_mut() {
                                                             Some(api) => {
-                                                                request_test_contract(api).await
+                                                                request_contract(api, TEST_CONTRACT_ID).await
                                                             }
 
                                                             None => Err(format!(
@@ -2685,7 +2689,7 @@ mod browser {
                                 match api.as_mut() {
                                     Some(api) => {
                                         let game_result =
-                                            request_test_contract(api).await;
+                                            request_contract(api, TEST_CONTRACT_ID).await;
                                         let lobby_result =
                                             request_lobby_contract(api).await;
 
