@@ -4,8 +4,8 @@
 //! requests and classifies lobby traffic, and it exposes complete lobby state
 //! only after hostile network bytes pass `decode_verified_lobby_state()`.
 //!
-//! Presence and challenge publication are intentionally outside this
-//! retrieval-only milestone.
+//! Publication enters through verified parent-state updates. Browser signing,
+//! revision reservation, and user-intent policy remain outside this boundary.
 
 use backgammon_lobby_core::LobbyContractState;
 
@@ -135,6 +135,57 @@ pub async fn request_lobby_contract(
     }))
     .await
     .map_err(|error| format!("Could not request the published lobby: {error:?}"))
+}
+
+/// Verifies that bytes represent a nonempty, mergeable parent-state update.
+///
+/// The hostile-input codec authenticates every retained presence and challenge
+/// record. Rejecting the default state prevents accidental no-op publication.
+#[cfg(any(test, target_arch = "wasm32"))]
+fn validate_lobby_state_update(bytes: &[u8]) -> Result<(), String> {
+    if bytes.is_empty() {
+        return Err("Refusing to submit an empty lobby state update.".to_owned());
+    }
+
+    let state = decode_verified_lobby_state(bytes)
+        .map_err(|error| format!("Lobby state update failed verification: {error}"))?;
+
+    if state.lobby.0.players.is_empty() && state.challenges.offers.is_empty() {
+        return Err(
+            "Refusing to submit a lobby state update with no presence or challenge records."
+                .to_owned(),
+        );
+    }
+
+    Ok(())
+}
+
+/// Submits one independently verified mergeable state to the published lobby.
+///
+/// The composed lobby contract accepts `UpdateData::State` and convergently
+/// merges each component. Callers do not send or replace the complete
+/// authoritative state.
+#[cfg(target_arch = "wasm32")]
+pub async fn submit_lobby_state_update(
+    api: &mut freenet_stdlib::client_api::WebApi,
+    key: freenet_stdlib::prelude::ContractKey,
+    state_update: Vec<u8>,
+) -> Result<(), String> {
+    use freenet_stdlib::client_api::{ClientRequest, ContractRequest};
+    use freenet_stdlib::prelude::UpdateData;
+
+    if key.id().encode() != LOBBY_CONTRACT_ID {
+        return Err("Refusing to update an unexpected lobby contract key.".to_owned());
+    }
+
+    validate_lobby_state_update(&state_update)?;
+
+    api.send(ClientRequest::ContractOp(ContractRequest::Update {
+        key,
+        data: UpdateData::State(state_update.into()),
+    }))
+    .await
+    .map_err(|error| format!("Could not submit the lobby state update: {error:?}"))
 }
 
 /// Classifies one host response without consuming it.
@@ -269,6 +320,49 @@ mod tests {
         b's', 0x80, 0x6a, b'c', b'h', b'a', b'l', b'l', b'e', b'n', b'g', b'e', b's', 0xa1, 0x66,
         b'o', b'f', b'f', b'e', b'r', b's', 0x80,
     ];
+
+    fn encoded_presence_update() -> Vec<u8> {
+        use backgammon_protocol::{sign_presence_announcement, PresenceAnnouncementBody};
+        use ed25519_dalek::SigningKey;
+
+        let signing_key = SigningKey::from_bytes(&[71; 32]);
+        let announcement = sign_presence_announcement(
+            PresenceAnnouncementBody::new(
+                signing_key.verifying_key().to_bytes(),
+                "Alice".to_owned(),
+                true,
+                1,
+                100_000,
+                100_600,
+            ),
+            &signing_key,
+        )
+        .unwrap();
+
+        crate::lobby_codec::build_encoded_presence_state_update(announcement).unwrap()
+    }
+
+    #[test]
+    fn verified_nonempty_state_update_is_accepted() {
+        let update = encoded_presence_update();
+
+        assert_eq!(validate_lobby_state_update(&update), Ok(()));
+    }
+
+    #[test]
+    fn empty_and_noop_state_updates_are_rejected() {
+        assert!(validate_lobby_state_update(&[]).is_err());
+
+        let noop = crate::lobby_codec::encode_verified_lobby_state(&LobbyContractState::default())
+            .unwrap();
+
+        assert!(validate_lobby_state_update(&noop).is_err());
+    }
+
+    #[test]
+    fn malformed_state_update_is_rejected() {
+        assert!(validate_lobby_state_update(&[0x9f, 0x01]).is_err());
+    }
 
     #[test]
     fn published_lobby_contract_id_is_stable() {

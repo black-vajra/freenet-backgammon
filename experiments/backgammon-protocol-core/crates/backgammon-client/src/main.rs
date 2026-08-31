@@ -10,6 +10,7 @@ pub mod genesis_handshake_store;
 pub mod ledger_codec;
 pub mod lobby;
 pub mod lobby_codec;
+pub mod lobby_presence_planner;
 pub mod lobby_profile_store;
 pub mod lobby_projection;
 pub mod lobby_transport;
@@ -49,11 +50,12 @@ mod browser {
     use crate::components::player_panel::PlayerPanel;
     use crate::controller::{LocalGameController, LocalGameOutcome, LocalTurnRecord};
     use crate::ledger_codec::{decode_verified_ledger, decode_verified_replay};
+    use crate::lobby_presence_planner::{plan_lobby_presence, LobbyPresencePlannerInput};
     use crate::lobby_profile_store::{load_lobby_display_name, store_lobby_display_name};
     use crate::lobby_projection::project_available_players;
     use crate::lobby_transport::{
-        classify_lobby_response, request_lobby_contract, ClassifiedLobbyResponse,
-        LobbyContractStatus,
+        classify_lobby_response, request_lobby_contract, submit_lobby_state_update,
+        ClassifiedLobbyResponse, LobbyContractStatus,
     };
     use crate::local_identity_store::{
         load_local_identity, load_or_create_local_identity, player_id_for_signing_key,
@@ -64,6 +66,7 @@ mod browser {
         load_pending_action, remove_pending_action, store_pending_action,
     };
     use crate::play_turn_planner::{plan_play_turn, PlayTurnPlan, PlayTurnPlannerInput};
+    use crate::presence_revision_store::reserve_next_presence_revision;
     use crate::projection::BoardView;
     use crate::request_roll_planner::{
         plan_request_roll, RequestRollPlan, RequestRollPlannerInput,
@@ -867,12 +870,13 @@ mod browser {
         let local_player_id = use_state(|| None::<[u8; 32]>);
 
         /*
-         * Lobby profile state is presentation/local intent only at this stage.
-         * No presence announcement is published until Freenet lobby transport
-         * is explicitly wired.
+         * Lobby profile state tracks this browser's latest successfully
+         * submitted presence intent. Authoritative opponent discovery remains
+         * derived exclusively from independently verified lobby state.
          */
         let lobby_display_name = use_state(String::new);
         let lobby_available = use_state(|| false);
+        let lobby_presence_submission_pending = use_state(|| false);
         let lobby_profile_status = use_state(|| "Waiting for local identity".to_owned());
         let lobby_profile_error = use_state(|| None::<String>);
 
@@ -2853,36 +2857,149 @@ mod browser {
             let local_player_id = local_player_id.clone();
             let lobby_display_name = lobby_display_name.clone();
             let lobby_available = lobby_available.clone();
+            let lobby_presence_submission_pending = lobby_presence_submission_pending.clone();
             let lobby_profile_status = lobby_profile_status.clone();
             let lobby_profile_error = lobby_profile_error.clone();
+            let latest_lobby_contract_key = latest_lobby_contract_key.clone();
+            let freenet_api = freenet_api.clone();
 
             Callback::from(move |_| {
-                if *lobby_available {
-                    lobby_available.set(false);
-                    lobby_profile_error.set(None);
-                    lobby_profile_status
-                        .set("Unavailable locally; no Freenet presence published".to_owned());
+                if *lobby_presence_submission_pending {
                     return;
                 }
 
-                let Some(player_id) = *local_player_id else {
-                    lobby_profile_error.set(Some("Local identity is not ready yet.".to_owned()));
-                    return;
-                };
+                let target_available = !*lobby_available;
 
-                match store_lobby_display_name(&player_id, lobby_display_name.as_str()) {
-                    Ok(()) => {
-                        lobby_available.set(true);
-                        lobby_profile_error.set(None);
-                        lobby_profile_status
-                            .set("Available locally; Freenet publication not yet wired".to_owned());
+                let prepared = (|| {
+                    let player_id = (*local_player_id)
+                        .ok_or_else(|| "Local identity is not ready yet.".to_owned())?;
+
+                    store_lobby_display_name(&player_id, lobby_display_name.as_str())?;
+
+                    let signing_key = load_local_identity()?
+                        .ok_or_else(|| "Stored local identity is unavailable.".to_owned())?;
+
+                    if player_id_for_signing_key(&signing_key) != player_id {
+                        return Err(
+                            "Stored signing identity does not match the active PlayerId."
+                                .to_owned(),
+                        );
                     }
+
+                    let issued_at_unix_seconds = local_observation_unix_seconds()?;
+
+                    let key = latest_lobby_contract_key
+                        .borrow()
+                        .as_ref()
+                        .cloned()
+                        .ok_or_else(|| {
+                            "The verified lobby contract key is not available yet.".to_owned()
+                        })?;
+
+                    if freenet_api.borrow().is_none() {
+                        return Err("The Freenet connection is not available.".to_owned());
+                    }
+
+                    /*
+                     * Reserve before constructing or signing. A failure after
+                     * this point may skip a revision, which is safe; reusing one
+                     * would not be.
+                     */
+                    let revision = reserve_next_presence_revision(&player_id)?;
+
+                    let plan = plan_lobby_presence(LobbyPresencePlannerInput {
+                        signing_key: &signing_key,
+                        display_name: lobby_display_name.as_str(),
+                        available: target_available,
+                        revision,
+                        issued_at_unix_seconds,
+                    })?;
+
+                    Ok((key, plan.encoded_state_update, revision))
+                })();
+
+                let (key, state_update, revision) = match prepared {
+                    Ok(prepared) => prepared,
 
                     Err(error) => {
-                        lobby_available.set(false);
                         lobby_profile_error.set(Some(error));
+                        return;
                     }
-                }
+                };
+
+                lobby_presence_submission_pending.set(true);
+                lobby_profile_error.set(None);
+                lobby_profile_status.set(format!(
+                    "Publishing {} presence revision {revision}",
+                    if target_available {
+                        "available"
+                    } else {
+                        "unavailable"
+                    },
+                ));
+
+                let api_for_update = freenet_api.clone();
+                let available_for_update = lobby_available.clone();
+                let pending_for_update = lobby_presence_submission_pending.clone();
+                let status_for_update = lobby_profile_status.clone();
+                let error_for_update = lobby_profile_error.clone();
+
+                wasm_bindgen_futures::spawn_local(async move {
+                    let submit_result = {
+                        let mut api = api_for_update.borrow_mut();
+
+                        match api.as_mut() {
+                            Some(api) => submit_lobby_state_update(api, key, state_update).await,
+
+                            None => {
+                                Err("Freenet connection closed before presence publication."
+                                    .to_owned())
+                            }
+                        }
+                    };
+
+                    match submit_result {
+                        Ok(()) => {
+                            available_for_update.set(target_available);
+                            status_for_update.set(format!(
+                                "{} presence revision {revision} submitted; awaiting verified lobby refresh",
+                                if target_available {
+                                    "Available"
+                                } else {
+                                    "Unavailable"
+                                },
+                            ));
+
+                            gloo_timers::future::TimeoutFuture::new(750).await;
+
+                            let refresh_result = {
+                                let mut api = api_for_update.borrow_mut();
+
+                                match api.as_mut() {
+                                    Some(api) => request_lobby_contract(api).await,
+
+                                    None => {
+                                        Err("Freenet connection closed before lobby verification."
+                                            .to_owned())
+                                    }
+                                }
+                            };
+
+                            if let Err(error) = refresh_result {
+                                error_for_update.set(Some(format!(
+                                    "Presence revision {revision} was submitted, but lobby refresh failed: {error}"
+                                )));
+                            }
+                        }
+
+                        Err(error) => {
+                            error_for_update.set(Some(error));
+                            status_for_update.set("Presence publication failed".to_owned());
+                        }
+                    }
+
+                    pending_for_update.set(false);
+                });
             })
         };
 
@@ -2952,17 +3069,28 @@ mod browser {
             None => "Identity unavailable".to_owned(),
         };
 
-        let lobby_availability_label = if *lobby_available {
+        let lobby_availability_label = if *lobby_presence_submission_pending {
+            "Publishing"
+        } else if *lobby_available {
             "Available"
         } else {
             "Unavailable"
         };
 
-        let lobby_availability_action = if *lobby_available {
+        let lobby_availability_action = if *lobby_presence_submission_pending {
+            "Publishing presence…"
+        } else if *lobby_available {
             "Go unavailable"
         } else {
             "Go available"
         };
+
+        let lobby_profile_controls_disabled =
+            (*local_player_id).is_none() || *lobby_available || *lobby_presence_submission_pending;
+
+        let lobby_availability_disabled = (*local_player_id).is_none()
+            || *lobby_presence_submission_pending
+            || latest_lobby_contract_key.borrow().is_none();
 
         html! {
             <main class="app-shell">
@@ -3017,14 +3145,14 @@ mod browser {
                             spellcheck="false"
                             value={(*lobby_display_name).clone()}
                             oninput={on_lobby_name_input}
-                            disabled={(*local_player_id).is_none()}
+                            disabled={lobby_profile_controls_disabled}
                         />
 
                         <div class="lobby-inline-actions">
                             <button
                                 type="button"
                                 onclick={on_save_lobby_name}
-                                disabled={(*local_player_id).is_none()}
+                                disabled={lobby_profile_controls_disabled}
                             >
                                 { "Save name" }
                             </button>
@@ -3070,7 +3198,7 @@ mod browser {
 
                         <p class="panel-note">
                             {
-                                "This control is local-only in this milestone.                                  It does not yet publish presence to Freenet."
+                                "This control publishes signed presence to Freenet. Revisions order updates; this browser's clock only bounds the ten-minute discovery lease."
                             }
                         </p>
 
@@ -3082,7 +3210,7 @@ mod browser {
                             )}
                             aria-pressed={(*lobby_available).to_string()}
                             onclick={on_toggle_lobby_availability}
-                            disabled={(*local_player_id).is_none()}
+                            disabled={lobby_availability_disabled}
                         >
                             { lobby_availability_action }
                         </button>
