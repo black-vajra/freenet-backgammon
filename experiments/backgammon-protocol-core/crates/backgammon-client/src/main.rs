@@ -45,6 +45,11 @@ mod browser {
     use yew::prelude::*;
     use yew::TargetCast;
 
+    use crate::challenge_offer_planner::{plan_outbound_challenge, OutboundChallengePlannerInput};
+    use crate::challenge_publication_store::{
+        load_outbound_challenge_publication, store_new_outbound_challenge_publication,
+        StoredOutboundChallengePublication,
+    };
     use crate::commitment_planner::{plan_commitment, CommitmentPlan, CommitmentPlannerInput};
     use crate::components::board::Board;
     use crate::components::controls::GameControls;
@@ -52,6 +57,9 @@ mod browser {
     use crate::components::history::MoveHistory;
     use crate::components::player_panel::PlayerPanel;
     use crate::controller::{LocalGameController, LocalGameOutcome, LocalTurnRecord};
+    use crate::game_contract_publication::{
+        submit_game_contract_publication, SubmittedGameContractPublication,
+    };
     use crate::ledger_codec::{decode_verified_ledger, decode_verified_replay};
     use crate::lobby_presence_planner::{plan_lobby_presence, LobbyPresencePlannerInput};
     use crate::lobby_profile_store::{load_lobby_display_name, store_lobby_display_name};
@@ -891,6 +899,17 @@ mod browser {
         let lobby_contract_status = use_state(|| LobbyContractStatus::WaitingForConnection);
         let lobby_subscription_status = use_state(|| SubscriptionStatus::Pending);
         let authoritative_lobby_state = use_state(|| None::<LobbyContractState>);
+
+        /*
+         * Outbound challenge publication remains distinct from authoritative
+         * lobby state. A durable plan is created before contract publication,
+         * and the offer is not advertised until an exact PutResponse is
+         * confirmed by the next workflow stage.
+         */
+        let challenge_publication_pending = use_state(|| false);
+        let challenge_publication_status = use_state(|| "No outbound challenge pending".to_owned());
+        let challenge_publication_error = use_state(|| None::<String>);
+        let submitted_game_contract = use_mut_ref(|| None::<SubmittedGameContractPublication>);
 
         /*
          * Role derived from this persistent PlayerId and a verified
@@ -3010,6 +3029,170 @@ mod browser {
             })
         };
 
+        let on_challenge_player: Callback<([u8; 32], String, u64)> = {
+            let local_player_id = local_player_id.clone();
+            let lobby_display_name = lobby_display_name.clone();
+            let latest_lobby_contract_key = latest_lobby_contract_key.clone();
+            let freenet_api = freenet_api.clone();
+            let challenge_publication_pending = challenge_publication_pending.clone();
+            let challenge_publication_status = challenge_publication_status.clone();
+            let challenge_publication_error = challenge_publication_error.clone();
+            let submitted_game_contract = submitted_game_contract.clone();
+
+            Callback::from(
+                move |(recipient_id, recipient_display_name, recipient_presence_expiry): (
+                    [u8; 32],
+                    String,
+                    u64,
+                )| {
+                    if *challenge_publication_pending {
+                        return;
+                    }
+
+                    let prepared = (|| {
+                        let local_player_id = (*local_player_id)
+                            .ok_or_else(|| "Local identity is not ready yet.".to_owned())?;
+
+                        let signing_key = load_local_identity()?
+                            .ok_or_else(|| "Stored local identity is unavailable.".to_owned())?;
+
+                        if player_id_for_signing_key(&signing_key) != local_player_id {
+                            return Err(
+                                "Stored signing identity does not match the active PlayerId."
+                                    .to_owned(),
+                            );
+                        }
+
+                        let now = local_observation_unix_seconds()?;
+
+                        if now >= recipient_presence_expiry {
+                            return Err(
+                                "The selected opponent's availability has expired; refresh the lobby."
+                                    .to_owned(),
+                            );
+                        }
+
+                        if latest_lobby_contract_key.borrow().is_none() {
+                            return Err(
+                                "The verified lobby contract key is not available yet.".to_owned()
+                            );
+                        }
+
+                        if freenet_api.borrow().is_none() {
+                            return Err("The Freenet connection is not available.".to_owned());
+                        }
+
+                        if load_outbound_challenge_publication(&local_player_id)?.is_some() {
+                            return Err(
+                                "A durable outbound challenge is already pending for this identity."
+                                    .to_owned(),
+                            );
+                        }
+
+                        let expires_at_unix_seconds = now
+                            .checked_add(600)
+                            .ok_or_else(|| "Challenge expiration overflowed.".to_owned())?;
+
+                        /*
+                         * These are separate calls deliberately. The planner
+                         * rejects zero or reused identifiers even if browser
+                         * randomness were ever to return an impossible
+                         * collision.
+                         */
+                        let challenge_id = secure_random_32("challenge ID")?;
+                        let game_id = secure_random_32("game ID")?;
+                        let genesis_action_id = secure_random_32("genesis action ID")?;
+
+                        let plan = plan_outbound_challenge(OutboundChallengePlannerInput {
+                            signing_key: &signing_key,
+                            challenger_display_name: lobby_display_name.as_str(),
+                            recipient_id,
+                            recipient_display_name: &recipient_display_name,
+                            match_length: 1,
+                            challenge_id,
+                            game_id,
+                            genesis_action_id,
+                            created_at_unix_seconds: now,
+                            expires_at_unix_seconds,
+                        })?;
+
+                        let stored = StoredOutboundChallengePublication::new(&plan)?;
+
+                        /*
+                         * This exact read-back-verified write must complete
+                         * before the game contract is submitted.
+                         */
+                        store_new_outbound_challenge_publication(&stored)?;
+
+                        Ok(game_id)
+                    })();
+
+                    let game_id = match prepared {
+                        Ok(game_id) => game_id,
+
+                        Err(error) => {
+                            challenge_publication_error.set(Some(error));
+                            return;
+                        }
+                    };
+
+                    challenge_publication_pending.set(true);
+                    challenge_publication_error.set(None);
+                    challenge_publication_status.set(format!(
+                        "Publishing a single-game contract before advertising the challenge to {recipient_display_name}",
+                    ));
+
+                    let api_for_publication = freenet_api.clone();
+                    let pending_for_publication = challenge_publication_pending.clone();
+                    let status_for_publication = challenge_publication_status.clone();
+                    let error_for_publication = challenge_publication_error.clone();
+                    let submitted_for_publication = submitted_game_contract.clone();
+
+                    wasm_bindgen_futures::spawn_local(async move {
+                        let result = {
+                            let mut api = api_for_publication.borrow_mut();
+
+                            match api.as_mut() {
+                                Some(api) => submit_game_contract_publication(api, game_id).await,
+
+                                None => Err(
+                                    "Freenet connection closed before game-contract publication."
+                                        .to_owned(),
+                                ),
+                            }
+                        };
+
+                        match result {
+                            Ok(submitted) => {
+                                let short_contract_id =
+                                    submitted.contract_id.chars().take(10).collect::<String>();
+
+                                *submitted_for_publication.borrow_mut() = Some(submitted);
+
+                                status_for_publication.set(format!(
+                                    "Game contract {short_contract_id}… submitted; awaiting exact confirmation before challenge advertisement",
+                                ));
+                            }
+
+                            Err(error) => {
+                                /*
+                                 * Keep the durable record and disabled state.
+                                 * A later retry/recovery path must reuse that
+                                 * exact signed evidence and game ID.
+                                 */
+                                pending_for_publication.set(true);
+                                status_for_publication.set(
+                                    "Challenge plan stored; game-contract publication requires retry"
+                                        .to_owned(),
+                                );
+                                error_for_publication.set(Some(error));
+                            }
+                        }
+                    });
+                },
+            )
+        };
+
         /*
          * Project opponents only from a complete, independently verified
          * authoritative lobby state. Local intent is never mixed into this
@@ -3098,6 +3281,11 @@ mod browser {
         let lobby_availability_disabled = (*local_player_id).is_none()
             || *lobby_presence_submission_pending
             || latest_lobby_contract_key.borrow().is_none();
+
+        let challenge_controls_disabled = *challenge_publication_pending
+            || (*local_player_id).is_none()
+            || latest_lobby_contract_key.borrow().is_none()
+            || freenet_api.borrow().is_none();
 
         html! {
             <main class="app-shell">
@@ -3241,6 +3429,27 @@ mod browser {
                             { lobby_network_detail }
                         </p>
 
+                        <p
+                            class="challenge-publication-status"
+                            role="status"
+                        >
+                            { (*challenge_publication_status).clone() }
+                        </p>
+
+                        {
+                            challenge_publication_error.as_ref().map_or_else(
+                                || html! {},
+                                |error| html! {
+                                    <p
+                                        class="interface-error"
+                                        role="alert"
+                                    >
+                                        { error }
+                                    </p>
+                                },
+                            )
+                        }
+
                         {
                             if available_players.is_empty() {
                                 html! {
@@ -3254,6 +3463,23 @@ mod browser {
                                         {
                                             for available_players.iter().map(
                                                 |player| {
+                                                    let challenge_target = (
+                                                        player.player_id,
+                                                        player.display_name.clone(),
+                                                        player.expires_at_unix_seconds,
+                                                    );
+
+                                                    let on_challenge = {
+                                                        let on_challenge_player =
+                                                            on_challenge_player.clone();
+
+                                                        Callback::from(move |_| {
+                                                            on_challenge_player.emit(
+                                                                challenge_target.clone(),
+                                                            );
+                                                        })
+                                                    };
+
                                                     html! {
                                                         <li>
                                                             <strong>
@@ -3271,6 +3497,23 @@ mod browser {
                                                                     )
                                                                 }
                                                             </span>
+
+                                                            <button
+                                                                type="button"
+                                                                class="challenge-player-button"
+                                                                onclick={on_challenge}
+                                                                disabled={
+                                                                    challenge_controls_disabled
+                                                                }
+                                                            >
+                                                                {
+                                                                    if *challenge_publication_pending {
+                                                                        "Challenge pending"
+                                                                    } else {
+                                                                        "Challenge"
+                                                                    }
+                                                                }
+                                                            </button>
                                                         </li>
                                                     }
                                                 }
