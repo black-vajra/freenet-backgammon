@@ -1,5 +1,6 @@
 #[cfg(target_arch = "wasm32")]
 mod components;
+mod game_contract_publication;
 
 pub mod challenge;
 pub mod challenge_state;
