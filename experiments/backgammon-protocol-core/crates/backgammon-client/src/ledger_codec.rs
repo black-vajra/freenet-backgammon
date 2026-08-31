@@ -47,11 +47,14 @@ pub fn decode_verified_ledger(bytes: &[u8]) -> Result<VerifiedLedger, String> {
         .collect::<Result<Vec<_>, _>>()?;
 
     /*
-     * Replay once more using the typed representation. This rejects illegal
-     * state transitions even if the outer CBOR structure was well formed.
+     * Empty action storage is the contract's valid pre-genesis state. Once
+     * any action exists, replay the typed representation to reject illegal
+     * transitions even if the outer CBOR structure was well formed.
      */
-    replay_game(&typed_actions)
-        .map_err(|error| format!("typed ledger replay failed: {error:?}"))?;
+    if !typed_actions.is_empty() {
+        replay_game(&typed_actions)
+            .map_err(|error| format!("typed ledger replay failed: {error:?}"))?;
+    }
 
     Ok(VerifiedLedger {
         storage_actions,
@@ -288,6 +291,26 @@ mod tests {
         let error = authenticate_player_action_v4(&record, &configuration, &black).unwrap_err();
 
         assert!(error.contains("does not match the authoritative White PlayerId"));
+    }
+
+    #[test]
+    fn canonical_empty_state_decodes_as_verified_pre_genesis_ledger() {
+        let empty_state = [0xa1, 0x67, b'a', b'c', b't', b'i', b'o', b'n', b's', 0x80];
+
+        let ledger = decode_verified_ledger(&empty_state).unwrap();
+
+        assert_eq!(ledger.action_count(), 0);
+        assert!(ledger.storage_actions().is_empty());
+        assert!(ledger.typed_actions().is_empty());
+    }
+
+    #[test]
+    fn canonical_empty_state_has_no_game_replay() {
+        let empty_state = [0xa1, 0x67, b'a', b'c', b't', b'i', b'o', b'n', b's', 0x80];
+
+        let error = decode_verified_replay(&empty_state).unwrap_err();
+
+        assert!(error.contains("EmptyHistory"));
     }
 
     #[test]
