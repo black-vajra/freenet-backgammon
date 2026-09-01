@@ -49,8 +49,9 @@ mod browser {
 
     use crate::challenge_offer_planner::{plan_outbound_challenge, OutboundChallengePlannerInput};
     use crate::challenge_publication_store::{
-        load_outbound_challenge_publication, store_new_outbound_challenge_publication,
-        update_outbound_challenge_publication, StoredOutboundChallengePublication,
+        load_outbound_challenge_publication, remove_outbound_challenge_publication,
+        store_new_outbound_challenge_publication, update_outbound_challenge_publication,
+        OutboundChallengePublicationStage, StoredOutboundChallengePublication,
     };
     use crate::commitment_planner::{plan_commitment, CommitmentPlan, CommitmentPlannerInput};
     use crate::components::board::Board;
@@ -121,6 +122,62 @@ mod browser {
         Ok(seconds as u64)
     }
 
+    /// Removes durable outbound publication state only after the exact signed
+    /// offer appears in a complete, independently verified lobby state.
+    fn observe_authoritative_challenge_publication(
+        state: &LobbyContractState,
+        local_player_id_handle: &UseStateHandle<Option<[u8; 32]>>,
+        pending_handle: &UseStateHandle<bool>,
+        status_handle: &UseStateHandle<String>,
+        error_handle: &UseStateHandle<Option<String>>,
+    ) {
+        let Some(local_player_id) = **local_player_id_handle else {
+            return;
+        };
+
+        let observation = (|| {
+            let Some(stored) = load_outbound_challenge_publication(&local_player_id)? else {
+                return Ok(false);
+            };
+
+            if stored.stage != OutboundChallengePublicationStage::AwaitingLobbyConfirmation {
+                return Ok(false);
+            }
+
+            if !stored.is_exact_offer_authoritative(state)? {
+                return Ok(false);
+            }
+
+            remove_outbound_challenge_publication(&local_player_id, &stored.challenge_id())?;
+
+            Ok(true)
+        })();
+
+        match observation {
+            Ok(true) => {
+                pending_handle.set(false);
+                status_handle.set(
+                    "Challenge advertised and confirmed in verified authoritative lobby state"
+                        .to_owned(),
+                );
+                error_handle.set(None);
+            }
+
+            Ok(false) => {}
+
+            Err(error) => {
+                /*
+                 * Retain the pending state and surface the error. Storage removal
+                 * itself verifies that the exact identity-scoped record vanished.
+                 */
+                pending_handle.set(true);
+                status_handle
+                    .set("Challenge publication confirmation requires recovery".to_owned());
+                error_handle.set(Some(error));
+            }
+        }
+    }
+
     fn handle_lobby_response(
         response: &HostResponse,
         contract_status_handle: &UseStateHandle<LobbyContractStatus>,
@@ -128,6 +185,10 @@ mod browser {
         authoritative_state_handle: &UseStateHandle<Option<LobbyContractState>>,
         contract_key_handle: &Rc<RefCell<Option<ContractKey>>>,
         api_handle: &Rc<RefCell<Option<WebApi>>>,
+        local_player_id_handle: &UseStateHandle<Option<[u8; 32]>>,
+        challenge_pending_handle: &UseStateHandle<bool>,
+        challenge_status_handle: &UseStateHandle<String>,
+        challenge_error_handle: &UseStateHandle<Option<String>>,
     ) -> bool {
         let Some(classified) = classify_lobby_response(response) else {
             return false;
@@ -154,6 +215,14 @@ mod browser {
         }
 
         if let Some(state) = authoritative_state {
+            observe_authoritative_challenge_publication(
+                &state,
+                local_player_id_handle,
+                challenge_pending_handle,
+                challenge_status_handle,
+                challenge_error_handle,
+            );
+
             authoritative_state_handle.set(Some(state));
         }
 
@@ -1310,6 +1379,10 @@ mod browser {
                             &lobby_state_for_response,
                             &lobby_key_for_response,
                             &api_for_response,
+                            &player_id_for_response,
+                            &challenge_pending_for_response,
+                            &challenge_status_for_response,
+                            &challenge_error_for_response,
                         ) {
                             return;
                         }
@@ -2542,6 +2615,10 @@ mod browser {
                             &lobby_state_for_response,
                             &lobby_key_for_response,
                             &api_for_response,
+                            &player_id_for_response,
+                            &challenge_pending_for_response,
+                            &challenge_status_for_response,
+                            &challenge_error_for_response,
                         ) {
                             return;
                         }

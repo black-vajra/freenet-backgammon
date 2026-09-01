@@ -1,6 +1,6 @@
 use std::io::Cursor;
 
-use backgammon_lobby_core::ChallengeOfferState;
+use backgammon_lobby_core::{ChallengeOfferState, LobbyContractState};
 use backgammon_protocol::{verify_challenge_offer, ChallengeId, PlayerId, SignedChallengeOffer};
 use ciborium::{de::from_reader, ser::into_writer};
 use serde::{Deserialize, Serialize};
@@ -117,6 +117,27 @@ impl StoredOutboundChallengePublication {
         }
 
         self.verify()
+    }
+
+    /// Returns true only when independently verified authoritative lobby
+    /// state contains this exact signed offer, including its complete body and
+    /// signature.
+    pub fn is_exact_offer_authoritative(&self, state: &LobbyContractState) -> Result<bool, String> {
+        self.verify()?;
+
+        state.lobby.0.verify().map_err(|error| {
+            format!("Authoritative lobby presence failed verification: {error}")
+        })?;
+
+        state.challenges.verify_state().map_err(|error| {
+            format!("Authoritative lobby challenges failed verification: {error}")
+        })?;
+
+        Ok(state
+            .challenges
+            .offers
+            .iter()
+            .any(|entry| entry.offer == self.signed_offer))
     }
 
     pub fn challenge_id(&self) -> ChallengeId {
@@ -441,6 +462,7 @@ fn browser_storage() -> Result<web_sys::Storage, String> {
 mod tests {
     use super::*;
     use crate::challenge_offer_planner::{plan_outbound_challenge, OutboundChallengePlannerInput};
+    use backgammon_lobby_core::ChallengeEntries;
     use ed25519_dalek::SigningKey;
 
     const CREATED: u64 = 300_000;
@@ -518,6 +540,25 @@ mod tests {
         different.signed_offer.body.challenge_id = [124_u8; 32];
 
         assert!(replacement_is_safe(&original, &different).is_err());
+    }
+
+    #[test]
+    fn only_the_exact_signed_offer_is_authoritative_confirmation() {
+        let stored = StoredOutboundChallengePublication::new(&plan()).unwrap();
+
+        let exact_offer =
+            ChallengeOfferState::new(stored.signed_offer.clone(), Vec::new()).unwrap();
+
+        let authoritative = LobbyContractState {
+            lobby: Default::default(),
+            challenges: ChallengeEntries::new(vec![exact_offer]).unwrap(),
+        };
+
+        assert!(stored.is_exact_offer_authoritative(&authoritative).unwrap());
+
+        assert!(!stored
+            .is_exact_offer_authoritative(&LobbyContractState::default(),)
+            .unwrap());
     }
 
     #[test]
