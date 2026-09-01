@@ -65,6 +65,7 @@ mod browser {
         confirm_game_contract_publication, submit_game_contract_publication,
         SubmittedGameContractPublication,
     };
+    use crate::incoming_challenge_projection::project_incoming_challenges;
     use crate::ledger_codec::{decode_verified_ledger, decode_verified_replay};
     use crate::lobby_presence_planner::{plan_lobby_presence, LobbyPresencePlannerInput};
     use crate::lobby_profile_store::{load_lobby_display_name, store_lobby_display_name};
@@ -3755,6 +3756,23 @@ mod browser {
             _ => Vec::new(),
         };
 
+        /*
+         * Incoming challenges are projected independently from the same
+         * complete verified lobby state. Only live, unresolved, exactly
+         * addressed signed offers survive this pure projection.
+         */
+        let incoming_challenges = match (
+            *local_player_id,
+            (*authoritative_lobby_state).as_ref(),
+            lobby_now.as_ref(),
+        ) {
+            (Some(player_id), Some(state), Ok(now_unix_seconds)) => {
+                project_incoming_challenges(player_id, &state.challenges.offers, *now_unix_seconds)
+            }
+
+            _ => Vec::new(),
+        };
+
         let lobby_network_detail = match lobby_now.as_ref() {
             Ok(_) => format!(
                 "{} · Subscription: {} · {} · Expiry view uses this browser's clock",
@@ -3783,6 +3801,20 @@ mod browser {
             (_, Err(_)) => "Available players cannot be projected without a valid browser clock.",
 
             _ => "No verified Freenet presence records loaded yet.",
+        };
+
+        let incoming_challenge_empty_message = match (&*lobby_contract_status, lobby_now.as_ref()) {
+            (LobbyContractStatus::Retrieved { .. }, Ok(_)) => {
+                "No live verified challenges are addressed to this identity."
+            }
+
+            (LobbyContractStatus::Failed(_), _) => {
+                "Verified incoming challenges are currently unavailable."
+            }
+
+            (_, Err(_)) => "Incoming challenges cannot be projected without a valid browser clock.",
+
+            _ => "No verified Freenet challenge records loaded yet.",
         };
 
         let lobby_identity_text = match *local_player_id {
@@ -4049,6 +4081,137 @@ mod browser {
                                                                     }
                                                                 }
                                                             </button>
+                                                        </li>
+                                                    }
+                                                }
+                                            )
+                                        }
+                                    </ul>
+                                }
+                            }
+                        }
+                    </section>
+
+                    <section
+                        class="panel lobby-panel lobby-incoming-panel"
+                        aria-labelledby="incoming-challenges-heading"
+                    >
+                        <div class="panel-heading-row">
+                            <h2 id="incoming-challenges-heading">
+                                { "Incoming challenges" }
+                            </h2>
+
+                            <span class="history-count">
+                                { incoming_challenges.len() }
+                            </span>
+                        </div>
+
+                        <p class="panel-note" role="status">
+                            {
+                                "Read-only verified view. No acceptance is signed or published by this panel."
+                            }
+                        </p>
+
+                        {
+                            if incoming_challenges.is_empty() {
+                                html! {
+                                    <p class="lobby-empty-state">
+                                        {
+                                            incoming_challenge_empty_message
+                                        }
+                                    </p>
+                                }
+                            } else {
+                                html! {
+                                    <ul class="incoming-challenge-list">
+                                        {
+                                            for incoming_challenges.iter().map(
+                                                |challenge| {
+                                                    let challenger_id =
+                                                        format_player_id(
+                                                            &challenge
+                                                                .challenger_id
+                                                        );
+
+                                                    let challenge_id =
+                                                        format_player_id(
+                                                            &challenge
+                                                                .challenge_id
+                                                        );
+
+                                                    let game_id =
+                                                        format_player_id(
+                                                            &challenge.game_id
+                                                        );
+
+                                                    html! {
+                                                        <li>
+                                                            <div
+                                                                class="incoming-challenge-heading"
+                                                            >
+                                                                <strong>
+                                                                    {
+                                                                        challenge
+                                                                            .challenger_display_name
+                                                                            .clone()
+                                                                    }
+                                                                </strong>
+
+                                                                <span>
+                                                                    {
+                                                                        format!(
+                                                                            "Match length: {}",
+                                                                            challenge.match_length,
+                                                                        )
+                                                                    }
+                                                                </span>
+                                                            </div>
+
+                                                            <dl
+                                                                class="incoming-challenge-details"
+                                                            >
+                                                                <div>
+                                                                    <dt>
+                                                                        { "Challenger ID" }
+                                                                    </dt>
+                                                                    <dd>
+                                                                        { challenger_id }
+                                                                    </dd>
+                                                                </div>
+
+                                                                <div>
+                                                                    <dt>
+                                                                        { "Challenge ID" }
+                                                                    </dt>
+                                                                    <dd>
+                                                                        { challenge_id }
+                                                                    </dd>
+                                                                </div>
+
+                                                                <div>
+                                                                    <dt>
+                                                                        { "Game ID" }
+                                                                    </dt>
+                                                                    <dd>
+                                                                        { game_id }
+                                                                    </dd>
+                                                                </div>
+
+                                                                <div>
+                                                                    <dt>
+                                                                        { "Signed expiry" }
+                                                                    </dt>
+                                                                    <dd>
+                                                                        {
+                                                                            format!(
+                                                                                "{} Unix seconds",
+                                                                                challenge
+                                                                                    .expires_at_unix_seconds,
+                                                                            )
+                                                                        }
+                                                                    </dd>
+                                                                </div>
+                                                            </dl>
                                                         </li>
                                                     }
                                                 }

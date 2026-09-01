@@ -1084,6 +1084,64 @@ h2 {
     padding-inline: 0.8rem;
 }
 
+.lobby-incoming-panel {
+    grid-column: 1 / -1;
+}
+
+.incoming-challenge-list {
+    display: grid;
+    gap: 0.65rem;
+    margin: 0.9rem 0 0;
+    padding: 0;
+    list-style: none;
+}
+
+.incoming-challenge-list > li {
+    border: 1px solid rgba(222, 179, 114, 0.24);
+    border-radius: 0.6rem;
+    padding: 0.7rem 0.8rem;
+    background: rgba(35, 20, 14, 0.5);
+}
+
+.incoming-challenge-heading {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 0.75rem;
+}
+
+.incoming-challenge-heading span {
+    color: #cbb99d;
+    font-size: 0.74rem;
+}
+
+.incoming-challenge-details {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0.55rem 1rem;
+    margin: 0.7rem 0 0;
+}
+
+.incoming-challenge-details div {
+    min-width: 0;
+}
+
+.incoming-challenge-details dt {
+    color: #d5c2a4;
+    font-size: 0.68rem;
+    font-weight: 800;
+    text-transform: uppercase;
+}
+
+.incoming-challenge-details dd {
+    margin: 0.16rem 0 0;
+    overflow-wrap: anywhere;
+    color: #bda98b;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.67rem;
+    line-height: 1.4;
+}
+
 @media (max-width: 78rem) {
     .lobby-strip {
         grid-template-columns: 1fr 1fr;
@@ -1095,6 +1153,15 @@ h2 {
 }
 
 @media (max-width: 52rem) {
+    .incoming-challenge-heading {
+        align-items: flex-start;
+        flex-direction: column;
+    }
+
+    .incoming-challenge-details {
+        grid-template-columns: 1fr;
+    }
+
     .lobby-strip {
         grid-template-columns: 1fr;
     }
