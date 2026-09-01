@@ -38,7 +38,9 @@ mod browser {
 
     use backgammon_core::{GameState, MoveSource, MoveTarget, Player, TurnPhase, TurnSequence};
     use backgammon_lobby_core::LobbyContractState;
-    use backgammon_protocol::{replay_game, DiceSecret, GameActionPayload};
+    use backgammon_protocol::{
+        replay_game, verify_challenge_offer_at, DiceSecret, GameActionPayload,
+    };
     use freenet_stdlib::client_api::{HostResponse, WebApi};
     use freenet_stdlib::prelude::ContractKey;
     use js_sys::Date;
@@ -48,7 +50,7 @@ mod browser {
     use crate::challenge_offer_planner::{plan_outbound_challenge, OutboundChallengePlannerInput};
     use crate::challenge_publication_store::{
         load_outbound_challenge_publication, store_new_outbound_challenge_publication,
-        StoredOutboundChallengePublication,
+        update_outbound_challenge_publication, StoredOutboundChallengePublication,
     };
     use crate::commitment_planner::{plan_commitment, CommitmentPlan, CommitmentPlannerInput};
     use crate::components::board::Board;
@@ -58,7 +60,8 @@ mod browser {
     use crate::components::player_panel::PlayerPanel;
     use crate::controller::{LocalGameController, LocalGameOutcome, LocalTurnRecord};
     use crate::game_contract_publication::{
-        submit_game_contract_publication, SubmittedGameContractPublication,
+        confirm_game_contract_publication, submit_game_contract_publication,
+        SubmittedGameContractPublication,
     };
     use crate::ledger_codec::{decode_verified_ledger, decode_verified_replay};
     use crate::lobby_presence_planner::{plan_lobby_presence, LobbyPresencePlannerInput};
@@ -177,6 +180,176 @@ mod browser {
                 }
             });
         }
+
+        true
+    }
+
+    /// Routes only the `PutResponse` for the currently armed per-game
+    /// contract publication.
+    ///
+    /// Exact contract confirmation is persisted before the signed challenge is
+    /// submitted to the lobby. The durable record remains until that exact offer
+    /// is later observed in independently verified authoritative lobby state.
+    fn handle_challenge_contract_publication_response(
+        response: &HostResponse,
+        submitted_handle: &Rc<RefCell<Option<SubmittedGameContractPublication>>>,
+        local_player_id_handle: &UseStateHandle<Option<[u8; 32]>>,
+        lobby_key_handle: &Rc<RefCell<Option<ContractKey>>>,
+        api_handle: &Rc<RefCell<Option<WebApi>>>,
+        pending_handle: &UseStateHandle<bool>,
+        status_handle: &UseStateHandle<String>,
+        error_handle: &UseStateHandle<Option<String>>,
+    ) -> bool {
+        let Some(submitted) = submitted_handle.borrow().clone() else {
+            return false;
+        };
+
+        let confirmation =
+            match confirm_game_contract_publication(response, &submitted.expected_key) {
+                Ok(confirmation) => confirmation,
+
+                Err(error) => {
+                    submitted_handle.borrow_mut().take();
+                    pending_handle.set(true);
+                    status_handle.set(
+                        "Challenge plan retained after an unexpected contract response".to_owned(),
+                    );
+                    error_handle.set(Some(error));
+                    return true;
+                }
+            };
+
+        let Some(confirmed_key) = confirmation else {
+            return false;
+        };
+
+        /*
+         * This exact response has now been consumed. Any failure below retains
+         * durable signed evidence but cannot reuse the in-memory response token.
+         */
+        submitted_handle.borrow_mut().take();
+
+        let prepared = (|| {
+            let local_player_id = (**local_player_id_handle).ok_or_else(|| {
+                "Local identity is unavailable during game-contract confirmation.".to_owned()
+            })?;
+
+            let mut stored =
+                load_outbound_challenge_publication(&local_player_id)?.ok_or_else(|| {
+                    "Exact game-contract confirmation has no durable challenge record.".to_owned()
+                })?;
+
+            if stored.signed_offer.body.proposal.game_id != submitted.game_id {
+                return Err(
+                    "Confirmed game contract does not match the stored signed game ID.".to_owned(),
+                );
+            }
+
+            let confirmed_contract_id = confirmed_key.id().encode();
+
+            if confirmed_contract_id != submitted.contract_id {
+                return Err(
+                    "Confirmed game contract ID differs from the armed publication ID.".to_owned(),
+                );
+            }
+
+            let now_unix_seconds = local_observation_unix_seconds()?;
+
+            verify_challenge_offer_at(
+                &stored.signed_offer,
+                now_unix_seconds,
+            )
+            .map_err(|error| {
+                format!(
+                    "Stored challenge expired or failed verification before lobby publication: {error}"
+                )
+            })?;
+
+            /*
+             * Rebuild before changing durable stage so malformed or inconsistent
+             * stored evidence can never become publication-authorized.
+             */
+            let plan = stored.rebuild_plan()?;
+
+            stored.mark_contract_confirmed()?;
+            update_outbound_challenge_publication(&stored)?;
+
+            let lobby_key = lobby_key_handle.borrow().clone().ok_or_else(|| {
+                "Game contract is confirmed, but the verified lobby key is unavailable.".to_owned()
+            })?;
+
+            Ok((
+                lobby_key,
+                plan.encoded_lobby_state_update,
+                stored.challenge_id(),
+            ))
+        })();
+
+        let (lobby_key, encoded_lobby_state_update, challenge_id) = match prepared {
+            Ok(prepared) => prepared,
+
+            Err(error) => {
+                pending_handle.set(true);
+                status_handle.set(
+                    "Challenge plan retained; lobby advertisement requires recovery".to_owned(),
+                );
+                error_handle.set(Some(error));
+                return true;
+            }
+        };
+
+        pending_handle.set(true);
+        error_handle.set(None);
+        status_handle.set("Game contract confirmed; advertising the signed challenge".to_owned());
+
+        let api = api_handle.clone();
+        let pending = pending_handle.clone();
+        let status = status_handle.clone();
+        let error = error_handle.clone();
+
+        wasm_bindgen_futures::spawn_local(async move {
+            let result = {
+                let mut api = api.borrow_mut();
+
+                match api.as_mut() {
+                    Some(api) => {
+                        submit_lobby_state_update(api, lobby_key, encoded_lobby_state_update).await
+                    }
+
+                    None => {
+                        Err("Freenet connection closed before challenge advertisement.".to_owned())
+                    }
+                }
+            };
+
+            match result {
+                Ok(()) => {
+                    let short_challenge_id = challenge_id[..5]
+                        .iter()
+                        .map(|byte| format!("{byte:02x}"))
+                        .collect::<String>();
+
+                    pending.set(true);
+                    error.set(None);
+                    status.set(format!(
+                        "Challenge {short_challenge_id}… submitted; awaiting verified authoritative lobby confirmation",
+                    ));
+                }
+
+                Err(submission_error) => {
+                    /*
+                     * The durable stage remains AwaitingLobbyConfirmation.
+                     * Recovery must resend the exact rebuilt signed offer.
+                     */
+                    pending.set(true);
+                    status.set(
+                        "Game contract confirmed; challenge advertisement requires retry"
+                            .to_owned(),
+                    );
+                    error.set(Some(submission_error));
+                }
+            }
+        });
 
         true
     }
@@ -1060,6 +1233,10 @@ mod browser {
             let lobby_contract_status = lobby_contract_status.clone();
             let lobby_subscription_status = lobby_subscription_status.clone();
             let authoritative_lobby_state = authoritative_lobby_state.clone();
+            let challenge_publication_pending = challenge_publication_pending.clone();
+            let challenge_publication_status = challenge_publication_status.clone();
+            let challenge_publication_error = challenge_publication_error.clone();
+            let submitted_game_contract = submitted_game_contract.clone();
             let local_player_id_for_effect = local_player_id.clone();
             let authoritative_local_role_for_effect = authoritative_local_role.clone();
             let controller_for_effect = controller.clone();
@@ -1094,6 +1271,10 @@ mod browser {
                 let state_for_response = latest_authoritative_state.clone();
                 let lobby_state_for_response = authoritative_lobby_state.clone();
                 let lobby_key_for_response = latest_lobby_contract_key.clone();
+                let challenge_pending_for_response = challenge_publication_pending.clone();
+                let challenge_status_for_response = challenge_publication_status.clone();
+                let challenge_error_for_response = challenge_publication_error.clone();
+                let submitted_game_for_response = submitted_game_contract.clone();
                 let player_id_for_response = local_player_id_for_effect.clone();
                 let authoritative_role_for_response = authoritative_local_role_for_effect.clone();
                 let controller_for_response = controller_for_effect.clone();
@@ -1129,6 +1310,19 @@ mod browser {
                             &lobby_state_for_response,
                             &lobby_key_for_response,
                             &api_for_response,
+                        ) {
+                            return;
+                        }
+
+                        if handle_challenge_contract_publication_response(
+                            &response,
+                            &submitted_game_for_response,
+                            &player_id_for_response,
+                            &lobby_key_for_response,
+                            &api_for_response,
+                            &challenge_pending_for_response,
+                            &challenge_status_for_response,
+                            &challenge_error_for_response,
                         ) {
                             return;
                         }
@@ -2264,6 +2458,10 @@ mod browser {
             let lobby_contract_status = lobby_contract_status.clone();
             let lobby_subscription_status = lobby_subscription_status.clone();
             let authoritative_lobby_state = authoritative_lobby_state.clone();
+            let challenge_publication_pending = challenge_publication_pending.clone();
+            let challenge_publication_status = challenge_publication_status.clone();
+            let challenge_publication_error = challenge_publication_error.clone();
+            let submitted_game_contract = submitted_game_contract.clone();
             let local_player_id_for_reconnect = local_player_id.clone();
             let authoritative_local_role_for_reconnect = authoritative_local_role.clone();
             let controller_for_reconnect = controller.clone();
@@ -2304,6 +2502,10 @@ mod browser {
                 let state_for_response = latest_authoritative_state.clone();
                 let lobby_state_for_response = authoritative_lobby_state.clone();
                 let lobby_key_for_response = latest_lobby_contract_key.clone();
+                let challenge_pending_for_response = challenge_publication_pending.clone();
+                let challenge_status_for_response = challenge_publication_status.clone();
+                let challenge_error_for_response = challenge_publication_error.clone();
+                let submitted_game_for_response = submitted_game_contract.clone();
                 let player_id_for_response = local_player_id_for_reconnect.clone();
                 let authoritative_role_for_response =
                     authoritative_local_role_for_reconnect.clone();
@@ -2340,6 +2542,19 @@ mod browser {
                             &lobby_state_for_response,
                             &lobby_key_for_response,
                             &api_for_response,
+                        ) {
+                            return;
+                        }
+
+                        if handle_challenge_contract_publication_response(
+                            &response,
+                            &submitted_game_for_response,
+                            &player_id_for_response,
+                            &lobby_key_for_response,
+                            &api_for_response,
+                            &challenge_pending_for_response,
+                            &challenge_status_for_response,
+                            &challenge_error_for_response,
                         ) {
                             return;
                         }
