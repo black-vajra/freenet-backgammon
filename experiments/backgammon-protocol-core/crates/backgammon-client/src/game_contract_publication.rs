@@ -123,6 +123,7 @@ pub struct SubmittedGameContractPublication {
 pub async fn submit_game_contract_publication(
     api: &mut freenet_stdlib::client_api::WebApi,
     game_id: GameId,
+    mut on_prepared: impl FnMut(Option<&SubmittedGameContractPublication>),
 ) -> Result<SubmittedGameContractPublication, String> {
     use freenet_stdlib::client_api::{ClientRequest, ContractRequest};
     use freenet_stdlib::prelude::{ContractContainer, Parameters, RelatedContracts, WrappedState};
@@ -147,21 +148,35 @@ pub async fn submit_game_contract_publication(
         return Err("Calculated game contract ID is unexpectedly empty.".to_owned());
     }
 
-    api.send(ClientRequest::ContractOp(ContractRequest::Put {
-        contract,
-        state,
-        related_contracts: RelatedContracts::new(),
-        subscribe: true,
-        blocking_subscribe: true,
-    }))
-    .await
-    .map_err(|error| format!("Could not submit the new game contract publication: {error:?}"))?;
-
-    Ok(SubmittedGameContractPublication {
+    let submitted = SubmittedGameContractPublication {
         game_id,
         expected_key,
         contract_id,
-    })
+    };
+
+    // Arm response routing before the request can produce a PutResponse.
+    on_prepared(Some(&submitted));
+
+    let send_result = api
+        .send(ClientRequest::ContractOp(ContractRequest::Put {
+            contract,
+            state,
+            related_contracts: RelatedContracts::new(),
+            subscribe: true,
+            blocking_subscribe: true,
+        }))
+        .await;
+
+    if let Err(error) = send_result {
+        // A failed send cannot have a valid pending publication response.
+        on_prepared(None);
+
+        return Err(format!(
+            "Could not submit the new game contract publication: {error:?}"
+        ));
+    }
+
+    Ok(submitted)
 }
 
 /// Recognizes only a publication response whose complete key exactly matches

@@ -3153,7 +3153,19 @@ mod browser {
                             let mut api = api_for_publication.borrow_mut();
 
                             match api.as_mut() {
-                                Some(api) => submit_game_contract_publication(api, game_id).await,
+                                Some(api) => {
+                                    let submitted_before_send = submitted_for_publication.clone();
+
+                                    submit_game_contract_publication(
+                                        api,
+                                        game_id,
+                                        move |submitted| {
+                                            *submitted_before_send.borrow_mut() =
+                                                submitted.cloned();
+                                        },
+                                    )
+                                    .await
+                                }
 
                                 None => Err(
                                     "Freenet connection closed before game-contract publication."
