@@ -1154,6 +1154,12 @@ mod browser {
         let submitted_game_contract = use_mut_ref(|| None::<SubmittedGameContractPublication>);
 
         /*
+         * Recovery is attempted at most once per live connection. A reconnect
+         * resets this guard and reuses only the exact durable signed evidence.
+         */
+        let challenge_recovery_attempted = use_mut_ref(|| false);
+
+        /*
          * Role derived from this persistent PlayerId and a verified
          * authoritative GameConfiguration. None means no verified role
          * decision is available yet; Some(None) means not a participant.
@@ -1288,6 +1294,224 @@ mod browser {
             });
         }
 
+        let challenge_recovery_ready = (
+            *local_player_id,
+            matches!(
+                &*lobby_contract_status,
+                LobbyContractStatus::Retrieved { .. }
+            ),
+        );
+
+        {
+            let freenet_api = freenet_api.clone();
+            let submitted_game_contract = submitted_game_contract.clone();
+            let challenge_recovery_attempted = challenge_recovery_attempted.clone();
+            let challenge_publication_pending = challenge_publication_pending.clone();
+            let challenge_publication_status = challenge_publication_status.clone();
+            let challenge_publication_error = challenge_publication_error.clone();
+
+            use_effect_with(challenge_recovery_ready, move |(player_id, lobby_ready)| {
+                if let Some(player_id) = *player_id {
+                    match load_outbound_challenge_publication(&player_id) {
+                        Ok(None) => {}
+
+                        Err(error) => {
+                            *challenge_recovery_attempted.borrow_mut() = true;
+
+                            challenge_publication_pending.set(true);
+                            challenge_publication_status
+                                .set("Stored challenge recovery is blocked".to_owned());
+                            challenge_publication_error.set(Some(error));
+                        }
+
+                        Ok(Some(stored)) => {
+                            challenge_publication_pending.set(true);
+
+                            if !*lobby_ready {
+                                challenge_publication_status.set(
+                                    "Stored challenge loaded; waiting for verified lobby recovery"
+                                        .to_owned(),
+                                );
+                            } else {
+                                let already_attempted = *challenge_recovery_attempted.borrow()
+                                    || submitted_game_contract.borrow().is_some();
+
+                                if !already_attempted {
+                                    *challenge_recovery_attempted.borrow_mut() = true;
+
+                                    match local_observation_unix_seconds() {
+                                        Err(error) => {
+                                            challenge_publication_status
+                                                    .set(
+                                                        "Stored challenge recovery requires a valid browser clock"
+                                                            .to_owned(),
+                                                    );
+                                            challenge_publication_error.set(Some(error));
+                                        }
+
+                                        Ok(now_unix_seconds)
+                                            if now_unix_seconds
+                                                >= stored
+                                                    .signed_offer
+                                                    .body
+                                                    .expires_at_unix_seconds =>
+                                        {
+                                            match remove_outbound_challenge_publication(
+                                                &player_id,
+                                                &stored.challenge_id(),
+                                            ) {
+                                                Ok(()) => {
+                                                    challenge_publication_pending.set(false);
+                                                    challenge_publication_status
+                                                            .set(
+                                                                "Expired stored challenge removed; ready for a new challenge"
+                                                                    .to_owned(),
+                                                            );
+                                                    challenge_publication_error.set(None);
+                                                }
+
+                                                Err(error) => {
+                                                    challenge_publication_status
+                                                            .set(
+                                                                "Expired challenge cleanup requires recovery"
+                                                                    .to_owned(),
+                                                            );
+                                                    challenge_publication_error.set(Some(error));
+                                                }
+                                            }
+                                        }
+
+                                        Ok(now_unix_seconds) => {
+                                            let prepared = (|| {
+                                                verify_challenge_offer_at(
+                                                        &stored.signed_offer,
+                                                        now_unix_seconds,
+                                                    )
+                                                    .map_err(|error| {
+                                                        format!(
+                                                            "Stored challenge failed live recovery verification: {error}"
+                                                        )
+                                                    })?;
+
+                                                let plan = stored.rebuild_plan()?;
+
+                                                if plan.contract_publication.game_id
+                                                    != stored.signed_offer.body.proposal.game_id
+                                                {
+                                                    return Err(
+                                                            "Recovered challenge game ID does not match its contract publication."
+                                                                .to_owned(),
+                                                        );
+                                                }
+
+                                                Ok((
+                                                    plan.contract_publication.game_id,
+                                                    stored.challenge_id(),
+                                                ))
+                                            })(
+                                            );
+
+                                            match prepared {
+                                                Err(error) => {
+                                                    challenge_publication_status
+                                                            .set(
+                                                                "Stored challenge failed exact recovery validation"
+                                                                    .to_owned(),
+                                                            );
+                                                    challenge_publication_error.set(Some(error));
+                                                }
+
+                                                Ok((game_id, challenge_id)) => {
+                                                    let short_challenge_id = challenge_id[..5]
+                                                        .iter()
+                                                        .map(|byte| format!("{byte:02x}"))
+                                                        .collect::<String>();
+
+                                                    challenge_publication_status
+                                                            .set(format!(
+                                                                "Recovering challenge {short_challenge_id}… by re-confirming its exact game contract",
+                                                            ));
+                                                    challenge_publication_error.set(None);
+
+                                                    let api = freenet_api.clone();
+                                                    let submitted = submitted_game_contract.clone();
+                                                    let pending =
+                                                        challenge_publication_pending.clone();
+                                                    let status =
+                                                        challenge_publication_status.clone();
+                                                    let error = challenge_publication_error.clone();
+
+                                                    wasm_bindgen_futures::spawn_local(async move {
+                                                        let result = {
+                                                            let mut api = api.borrow_mut();
+
+                                                            match api
+                                                                        .as_mut()
+                                                                    {
+                                                                        Some(api) => {
+                                                                            let submitted_before_send =
+                                                                                submitted.clone();
+
+                                                                            submit_game_contract_publication(
+                                                                                api,
+                                                                                game_id,
+                                                                                move |prepared| {
+                                                                                    *submitted_before_send
+                                                                                        .borrow_mut() =
+                                                                                        prepared.cloned();
+                                                                                },
+                                                                            )
+                                                                            .await
+                                                                        }
+
+                                                                        None => Err(
+                                                                            "Freenet connection closed before stored challenge recovery."
+                                                                                .to_owned(),
+                                                                        ),
+                                                                    }
+                                                        };
+
+                                                        match result {
+                                                            Ok(publication) => {
+                                                                let short_contract_id = publication
+                                                                    .contract_id
+                                                                    .chars()
+                                                                    .take(10)
+                                                                    .collect::<String>();
+
+                                                                pending.set(true);
+                                                                error.set(None);
+                                                                status
+                                                                            .set(format!(
+                                                                                "Recovered game contract {short_contract_id}… submitted; awaiting exact confirmation",
+                                                                            ));
+                                                            }
+
+                                                            Err(recovery_error) => {
+                                                                pending.set(true);
+                                                                status
+                                                                            .set(
+                                                                                "Stored challenge retained; contract recovery requires reconnect"
+                                                                                    .to_owned(),
+                                                                            );
+                                                                error.set(Some(recovery_error));
+                                                            }
+                                                        }
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                || {}
+            });
+        }
+
         {
             let connection_status = connection_status.clone();
             let contract_status = contract_status.clone();
@@ -1306,6 +1530,7 @@ mod browser {
             let challenge_publication_status = challenge_publication_status.clone();
             let challenge_publication_error = challenge_publication_error.clone();
             let submitted_game_contract = submitted_game_contract.clone();
+            let challenge_recovery_attempted = challenge_recovery_attempted.clone();
             let local_player_id_for_effect = local_player_id.clone();
             let authoritative_local_role_for_effect = authoritative_local_role.clone();
             let controller_for_effect = controller.clone();
@@ -1316,6 +1541,8 @@ mod browser {
                  * closure. Any durable pending action remains in storage.
                  */
                 freenet_api.borrow_mut().take();
+                submitted_game_contract.borrow_mut().take();
+                *challenge_recovery_attempted.borrow_mut() = false;
                 *local_network_action_submitted.borrow_mut() = None;
                 *local_dice_secret.borrow_mut() = None;
                 latest_contract_key.borrow_mut().take();
@@ -2535,12 +2762,15 @@ mod browser {
             let challenge_publication_status = challenge_publication_status.clone();
             let challenge_publication_error = challenge_publication_error.clone();
             let submitted_game_contract = submitted_game_contract.clone();
+            let challenge_recovery_attempted = challenge_recovery_attempted.clone();
             let local_player_id_for_reconnect = local_player_id.clone();
             let authoritative_local_role_for_reconnect = authoritative_local_role.clone();
             let controller_for_reconnect = controller.clone();
 
             Callback::from(move |_| {
                 freenet_api.borrow_mut().take();
+                submitted_game_contract.borrow_mut().take();
+                *challenge_recovery_attempted.borrow_mut() = false;
 
                 /*
                  * Permit one submission attempt on the new connection.
