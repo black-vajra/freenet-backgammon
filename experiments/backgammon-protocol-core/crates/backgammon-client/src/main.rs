@@ -11,6 +11,7 @@ pub mod controller;
 pub mod genesis_handshake;
 pub mod genesis_handshake_store;
 pub mod incoming_challenge_acceptance_planner;
+pub mod incoming_challenge_acceptance_store;
 pub mod incoming_challenge_projection;
 pub mod ledger_codec;
 pub mod lobby;
