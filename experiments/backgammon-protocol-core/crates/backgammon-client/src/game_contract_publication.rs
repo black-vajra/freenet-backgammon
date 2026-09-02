@@ -3,6 +3,7 @@ use std::io::Cursor;
 use backgammon_contract::LedgerState;
 use backgammon_protocol::{GameId, LedgerParameters};
 use ciborium::{de::from_reader, ser::into_writer};
+use freenet_stdlib::prelude::{ContractContainer, ContractKey, Parameters};
 use serde::{de::DeserializeOwned, Serialize};
 
 /// Versioned Freenet package built from the protocol-v4 game contract.
@@ -106,6 +107,54 @@ pub fn prepare_game_contract_publication(
     })
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExpectedGameContract {
+    pub game_id: GameId,
+    pub full_key: ContractKey,
+    pub contract_id: String,
+    pub empty_state_bytes: Vec<u8>,
+}
+
+fn build_game_contract(
+    game_id: GameId,
+) -> Result<(GameContractPublicationInputs, ContractContainer), String> {
+    let inputs = prepare_game_contract_publication(game_id)?;
+    let parameters = Parameters::from(inputs.parameter_bytes.clone());
+
+    let contract = ContractContainer::try_from((GAME_CONTRACT_PACKAGE.to_vec(), &parameters))
+        .map_err(|error| {
+            format!(
+                "Could not load pinned game contract package \
+             {GAME_CONTRACT_PACKAGE_SHA256}: {error}"
+            )
+        })?;
+
+    Ok((inputs, contract))
+}
+
+/// Reconstructs the complete expected Freenet identity and canonical empty
+/// state for the exact game ID authenticated by a challenge offer.
+///
+/// The complete key includes both the parameter-derived instance ID and pinned
+/// contract-code hash. It can therefore be compared directly with the full key
+/// returned by Freenet before any challenge acceptance is signed.
+pub fn calculate_expected_game_contract(game_id: GameId) -> Result<ExpectedGameContract, String> {
+    let (inputs, contract) = build_game_contract(game_id)?;
+    let full_key = contract.key();
+    let contract_id = full_key.id().encode();
+
+    if contract_id.is_empty() {
+        return Err("Calculated game contract ID is unexpectedly empty.".to_owned());
+    }
+
+    Ok(ExpectedGameContract {
+        game_id,
+        full_key,
+        contract_id,
+        empty_state_bytes: inputs.state_bytes,
+    })
+}
+
 #[cfg(target_arch = "wasm32")]
 #[derive(Clone, Debug)]
 pub struct SubmittedGameContractPublication {
@@ -126,21 +175,10 @@ pub async fn submit_game_contract_publication(
     mut on_prepared: impl FnMut(Option<&SubmittedGameContractPublication>),
 ) -> Result<SubmittedGameContractPublication, String> {
     use freenet_stdlib::client_api::{ClientRequest, ContractRequest};
-    use freenet_stdlib::prelude::{ContractContainer, Parameters, RelatedContracts, WrappedState};
+    use freenet_stdlib::prelude::{RelatedContracts, WrappedState};
 
-    let inputs = prepare_game_contract_publication(game_id)?;
-
-    let parameters = Parameters::from(inputs.parameter_bytes);
+    let (inputs, contract) = build_game_contract(game_id)?;
     let state = WrappedState::from(inputs.state_bytes);
-
-    let contract = ContractContainer::try_from((GAME_CONTRACT_PACKAGE.to_vec(), &parameters))
-        .map_err(|error| {
-            format!(
-                "Could not load pinned game contract package \
-             {GAME_CONTRACT_PACKAGE_SHA256}: {error}"
-            )
-        })?;
-
     let expected_key = contract.key();
     let contract_id = expected_key.id().encode();
 

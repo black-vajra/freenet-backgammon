@@ -13,9 +13,9 @@ backgammon-protocol = { path = "../backgammon-protocol" }
 ciborium.workspace = true
 ed25519-dalek = { version = "3.0.0", default-features = false, features = ["zeroize"] }
 serde.workspace = true
+freenet-stdlib = { version = "0.8.5", features = ["net"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-freenet-stdlib = { version = "0.8.5", features = ["net"] }
 gloo-timers = { version = "0.3", features = ["futures"] }
 js-sys = "0.3"
 wasm-bindgen-futures = "0.4"
