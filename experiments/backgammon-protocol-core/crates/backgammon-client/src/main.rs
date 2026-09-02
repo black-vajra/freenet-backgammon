@@ -69,7 +69,12 @@ mod browser {
         SubmittedGameContractPublication,
     };
     use crate::incoming_challenge_acceptance_planner::{
-        prepare_incoming_challenge_contract_probe, IncomingChallengeContractProbe,
+        finalize_incoming_challenge_acceptance, prepare_incoming_challenge_contract_probe,
+        IncomingChallengeContractProbe,
+    };
+    use crate::incoming_challenge_acceptance_store::{
+        load_incoming_challenge_acceptance, store_new_incoming_challenge_acceptance,
+        StoredIncomingChallengeAcceptance,
     };
     use crate::incoming_challenge_acceptance_transport::{
         classify_incoming_challenge_contract_response, IncomingChallengeContractRead,
@@ -264,18 +269,22 @@ mod browser {
         true
     }
 
-    /// Captures only the direct contract read for the currently armed,
-    /// unsigned incoming-challenge probe.
+    /// Finalizes only the direct contract read for the currently armed
+    /// incoming-challenge probe.
     ///
-    /// This boundary never signs or persists an acceptance. Complete-key,
-    /// empty-state, identity, clock, and current-challenge verification remain
-    /// the responsibility of the later finalization step.
+    /// Every non-signing prerequisite is resolved before finalization begins.
+    /// The resulting signature is converted to read-back-verified durable
+    /// evidence before any lobby update is submitted.
     fn handle_incoming_challenge_contract_response(
         response: &HostResponse,
         armed_probe_handle: &Rc<RefCell<Option<IncomingChallengeContractProbe>>>,
         retrieved_read_handle: &Rc<
             RefCell<Option<(IncomingChallengeContractProbe, ContractKey, Vec<u8>)>>,
         >,
+        authoritative_state_handle: &UseStateHandle<Option<LobbyContractState>>,
+        local_player_id_handle: &UseStateHandle<Option<[u8; 32]>>,
+        lobby_key_handle: &Rc<RefCell<Option<ContractKey>>>,
+        api_handle: &Rc<RefCell<Option<WebApi>>>,
         pending_handle: &UseStateHandle<bool>,
         status_handle: &UseStateHandle<String>,
         error_handle: &UseStateHandle<Option<String>>,
@@ -292,33 +301,197 @@ mod browser {
 
         armed_probe_handle.borrow_mut().take();
 
-        match classified {
-            IncomingChallengeContractRead::Retrieved {
-                contract_key,
-                state,
-            } => {
-                *retrieved_read_handle.borrow_mut() = Some((probe, contract_key, state));
+        let IncomingChallengeContractRead::Retrieved {
+            contract_key,
+            state,
+        } = classified
+        else {
+            retrieved_read_handle.borrow_mut().take();
+            pending_handle.set(false);
+            status_handle.set("Game contract was not found; no acceptance was created".to_owned());
+            error_handle.set(Some(format!(
+                "The challenged game contract {} is unavailable.",
+                probe.contract_id,
+            )));
+            return true;
+        };
 
-                pending_handle.set(true);
-                status_handle.set(
-                    "Direct game-contract read captured; acceptance remains \
-                     unsigned pending exact proof finalization"
-                        .to_owned(),
-                );
-                error_handle.set(None);
+        /*
+         * Keep the response and its originating probe inseparable until this
+         * handler consumes them for finalization.
+         */
+        *retrieved_read_handle.borrow_mut() = Some((probe, contract_key, state));
+
+        let Some((probe, contract_key, state)) = retrieved_read_handle.borrow_mut().take() else {
+            pending_handle.set(false);
+            status_handle.set("Incoming contract response could not be retained".to_owned());
+            error_handle.set(Some(
+                "The direct contract response lost its originating probe.".to_owned(),
+            ));
+            return true;
+        };
+
+        let mut finalization_started = false;
+
+        let prepared = (|| {
+            let active_player_id = (**local_player_id_handle).ok_or_else(|| {
+                "Local identity disappeared before acceptance finalization.".to_owned()
+            })?;
+
+            if active_player_id != probe.local_player_id {
+                return Err("Active PlayerId differs from the challenged recipient.".to_owned());
             }
 
-            IncomingChallengeContractRead::NotFound => {
-                retrieved_read_handle.borrow_mut().take();
-                pending_handle.set(false);
-                status_handle
-                    .set("Game contract was not found; no acceptance was created".to_owned());
-                error_handle.set(Some(format!(
-                    "The challenged game contract {} is unavailable.",
-                    probe.contract_id,
-                )));
+            if load_incoming_challenge_acceptance(&active_player_id)?.is_some() {
+                return Err("A durable incoming challenge acceptance already exists \
+                     for this identity."
+                    .to_owned());
             }
-        }
+
+            let authoritative_state = (**authoritative_state_handle).as_ref().ok_or_else(|| {
+                "Authoritative lobby state disappeared before \
+                         acceptance finalization."
+                    .to_owned()
+            })?;
+
+            let mut exact_matches = authoritative_state
+                .challenges
+                .offers
+                .iter()
+                .filter(|entry| entry.offer == probe.signed_offer);
+
+            let current_challenge = exact_matches.next().ok_or_else(|| {
+                "The probed signed challenge is no longer present in \
+                     authoritative lobby state."
+                    .to_owned()
+            })?;
+
+            if exact_matches.next().is_some() {
+                return Err("Authoritative lobby state contains ambiguous duplicate \
+                     records for the probed challenge."
+                    .to_owned());
+            }
+
+            let signing_key = load_local_identity()?
+                .ok_or_else(|| "Persistent signing identity is unavailable.".to_owned())?;
+
+            if player_id_for_signing_key(&signing_key) != active_player_id {
+                return Err("Persistent signing identity does not match the active \
+                     PlayerId."
+                    .to_owned());
+            }
+
+            let now_unix_seconds = local_observation_unix_seconds()?;
+
+            let lobby_key = lobby_key_handle
+                .borrow()
+                .clone()
+                .ok_or_else(|| "The verified lobby contract key is unavailable.".to_owned())?;
+
+            if api_handle.borrow().is_none() {
+                return Err("The Freenet connection closed before acceptance \
+                     finalization."
+                    .to_owned());
+            }
+
+            /*
+             * From this point onward a signature may be created. Any error is
+             * therefore treated conservatively as requiring recovery.
+             */
+            finalization_started = true;
+
+            let plan = finalize_incoming_challenge_acceptance(
+                &probe,
+                current_challenge,
+                &contract_key,
+                &state,
+                &signing_key,
+                now_unix_seconds,
+            )?;
+
+            let stored = StoredIncomingChallengeAcceptance::new(&plan)?;
+
+            let challenge_id = stored.challenge_id();
+
+            /*
+             * This exact read-back-verified durable write must complete before
+             * the signed lobby update is allowed onto the network.
+             */
+            store_new_incoming_challenge_acceptance(&stored)?;
+
+            Ok((lobby_key, plan.encoded_lobby_state_update, challenge_id))
+        })();
+
+        let (lobby_key, encoded_lobby_state_update, challenge_id) = match prepared {
+            Ok(prepared) => prepared,
+
+            Err(error) => {
+                pending_handle.set(finalization_started);
+
+                if finalization_started {
+                    status_handle
+                        .set("Acceptance finalization requires durable recovery".to_owned());
+                } else {
+                    status_handle
+                        .set("Contract proof was rejected; no acceptance was created".to_owned());
+                }
+
+                error_handle.set(Some(error));
+                return true;
+            }
+        };
+
+        pending_handle.set(true);
+        error_handle.set(None);
+        status_handle
+            .set("Acceptance verified and stored; publishing its exact lobby update".to_owned());
+
+        let api = api_handle.clone();
+        let pending = pending_handle.clone();
+        let status = status_handle.clone();
+        let error = error_handle.clone();
+
+        wasm_bindgen_futures::spawn_local(async move {
+            let result = {
+                let mut api = api.borrow_mut();
+
+                match api.as_mut() {
+                    Some(api) => {
+                        submit_lobby_state_update(api, lobby_key, encoded_lobby_state_update).await
+                    }
+
+                    None => Err("Freenet connection closed before the stored \
+                         acceptance could be published."
+                        .to_owned()),
+                }
+            };
+
+            let short_challenge_id = challenge_id[..5]
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+
+            match result {
+                Ok(()) => {
+                    pending.set(true);
+                    status.set(format!(
+                        "Acceptance for challenge {short_challenge_id}… \
+                         submitted; awaiting verified authoritative confirmation",
+                    ));
+                    error.set(None);
+                }
+
+                Err(submission_error) => {
+                    /*
+                     * Durable signed evidence remains. Recovery must rebuild and
+                     * resend those exact bytes without signing again.
+                     */
+                    pending.set(true);
+                    status.set("Acceptance is stored; lobby publication requires retry".to_owned());
+                    error.set(Some(submission_error));
+                }
+            }
+        });
 
         true
     }
@@ -1745,6 +1918,10 @@ mod browser {
                             &response,
                             &incoming_probe_for_response,
                             &incoming_read_for_response,
+                            &lobby_state_for_response,
+                            &player_id_for_response,
+                            &lobby_key_for_response,
+                            &api_for_response,
                             &incoming_pending_for_response,
                             &incoming_status_for_response,
                             &incoming_error_for_response,
@@ -3038,6 +3215,10 @@ mod browser {
                             &response,
                             &incoming_probe_for_response,
                             &incoming_read_for_response,
+                            &lobby_state_for_response,
+                            &player_id_for_response,
+                            &lobby_key_for_response,
+                            &api_for_response,
                             &incoming_pending_for_response,
                             &incoming_status_for_response,
                             &incoming_error_for_response,
