@@ -68,6 +68,10 @@ mod browser {
         confirm_game_contract_publication, submit_game_contract_publication,
         SubmittedGameContractPublication,
     };
+    use crate::incoming_challenge_acceptance_planner::IncomingChallengeContractProbe;
+    use crate::incoming_challenge_acceptance_transport::{
+        classify_incoming_challenge_contract_response, IncomingChallengeContractRead,
+    };
     use crate::incoming_challenge_projection::project_incoming_challenges;
     use crate::ledger_codec::{decode_verified_ledger, decode_verified_replay};
     use crate::lobby_presence_planner::{plan_lobby_presence, LobbyPresencePlannerInput};
@@ -253,6 +257,65 @@ mod browser {
                     subscription_status.set(SubscriptionStatus::Inactive);
                 }
             });
+        }
+
+        true
+    }
+
+    /// Captures only the direct contract read for the currently armed,
+    /// unsigned incoming-challenge probe.
+    ///
+    /// This boundary never signs or persists an acceptance. Complete-key,
+    /// empty-state, identity, clock, and current-challenge verification remain
+    /// the responsibility of the later finalization step.
+    fn handle_incoming_challenge_contract_response(
+        response: &HostResponse,
+        armed_probe_handle: &Rc<RefCell<Option<IncomingChallengeContractProbe>>>,
+        retrieved_read_handle: &Rc<
+            RefCell<Option<(IncomingChallengeContractProbe, ContractKey, Vec<u8>)>>,
+        >,
+        pending_handle: &UseStateHandle<bool>,
+        status_handle: &UseStateHandle<String>,
+        error_handle: &UseStateHandle<Option<String>>,
+    ) -> bool {
+        let Some(probe) = armed_probe_handle.borrow().clone() else {
+            return false;
+        };
+
+        let Some(classified) =
+            classify_incoming_challenge_contract_response(response, &probe.contract_id)
+        else {
+            return false;
+        };
+
+        armed_probe_handle.borrow_mut().take();
+
+        match classified {
+            IncomingChallengeContractRead::Retrieved {
+                contract_key,
+                state,
+            } => {
+                *retrieved_read_handle.borrow_mut() = Some((probe, contract_key, state));
+
+                pending_handle.set(true);
+                status_handle.set(
+                    "Direct game-contract read captured; acceptance remains \
+                     unsigned pending exact proof finalization"
+                        .to_owned(),
+                );
+                error_handle.set(None);
+            }
+
+            IncomingChallengeContractRead::NotFound => {
+                retrieved_read_handle.borrow_mut().take();
+                pending_handle.set(false);
+                status_handle
+                    .set("Game contract was not found; no acceptance was created".to_owned());
+                error_handle.set(Some(format!(
+                    "The challenged game contract {} is unavailable.",
+                    probe.contract_id,
+                )));
+            }
         }
 
         true
@@ -1159,6 +1222,20 @@ mod browser {
         let submitted_game_contract = use_mut_ref(|| None::<SubmittedGameContractPublication>);
 
         /*
+         * Incoming acceptance begins with volatile unsigned evidence only.
+         * The direct read and its originating probe remain inseparable.
+         */
+        let incoming_acceptance_pending = use_state(|| false);
+        let incoming_acceptance_status = use_state(|| {
+            "No incoming acceptance pending; contract proof is required before signing".to_owned()
+        });
+        let incoming_acceptance_error = use_state(|| None::<String>);
+        let pending_incoming_acceptance_probe =
+            use_mut_ref(|| None::<IncomingChallengeContractProbe>);
+        let retrieved_incoming_acceptance_read =
+            use_mut_ref(|| None::<(IncomingChallengeContractProbe, ContractKey, Vec<u8>)>);
+
+        /*
          * Recovery is attempted at most once per live connection. A reconnect
          * resets this guard and reuses only the exact durable signed evidence.
          */
@@ -1535,6 +1612,11 @@ mod browser {
             let challenge_publication_status = challenge_publication_status.clone();
             let challenge_publication_error = challenge_publication_error.clone();
             let submitted_game_contract = submitted_game_contract.clone();
+            let incoming_acceptance_pending = incoming_acceptance_pending.clone();
+            let incoming_acceptance_status = incoming_acceptance_status.clone();
+            let incoming_acceptance_error = incoming_acceptance_error.clone();
+            let pending_incoming_acceptance_probe = pending_incoming_acceptance_probe.clone();
+            let retrieved_incoming_acceptance_read = retrieved_incoming_acceptance_read.clone();
             let challenge_recovery_attempted = challenge_recovery_attempted.clone();
             let local_player_id_for_effect = local_player_id.clone();
             let authoritative_local_role_for_effect = authoritative_local_role.clone();
@@ -1547,6 +1629,14 @@ mod browser {
                  */
                 freenet_api.borrow_mut().take();
                 submitted_game_contract.borrow_mut().take();
+                pending_incoming_acceptance_probe.borrow_mut().take();
+                retrieved_incoming_acceptance_read.borrow_mut().take();
+                incoming_acceptance_pending.set(false);
+                incoming_acceptance_status.set(
+                    "No incoming acceptance pending; contract proof is required before signing"
+                        .to_owned(),
+                );
+                incoming_acceptance_error.set(None);
                 *challenge_recovery_attempted.borrow_mut() = false;
                 *local_network_action_submitted.borrow_mut() = None;
                 *local_dice_secret.borrow_mut() = None;
@@ -1576,9 +1666,20 @@ mod browser {
                 let challenge_status_for_response = challenge_publication_status.clone();
                 let challenge_error_for_response = challenge_publication_error.clone();
                 let submitted_game_for_response = submitted_game_contract.clone();
+                let incoming_probe_for_response = pending_incoming_acceptance_probe.clone();
+                let incoming_read_for_response = retrieved_incoming_acceptance_read.clone();
+                let incoming_pending_for_response = incoming_acceptance_pending.clone();
+                let incoming_status_for_response = incoming_acceptance_status.clone();
+                let incoming_error_for_response = incoming_acceptance_error.clone();
                 let player_id_for_response = local_player_id_for_effect.clone();
                 let authoritative_role_for_response = authoritative_local_role_for_effect.clone();
                 let controller_for_response = controller_for_effect.clone();
+
+                let incoming_probe_for_status = pending_incoming_acceptance_probe.clone();
+                let incoming_read_for_status = retrieved_incoming_acceptance_read.clone();
+                let incoming_pending_for_status = incoming_acceptance_pending.clone();
+                let incoming_status_for_status = incoming_acceptance_status.clone();
+                let incoming_error_for_status = incoming_acceptance_error.clone();
 
                 let api_for_open = freenet_api.clone();
                 let connection_for_open = connection_status.clone();
@@ -1598,6 +1699,25 @@ mod browser {
                             ConnectionStatus::Disconnected | ConnectionStatus::Failed(_) => {
                                 subscription_for_status.set(SubscriptionStatus::Inactive);
                                 lobby_subscription_for_status.set(SubscriptionStatus::Inactive);
+
+                                let had_volatile_incoming_evidence =
+                                    incoming_probe_for_status.borrow().is_some()
+                                        || incoming_read_for_status.borrow().is_some();
+
+                                incoming_probe_for_status.borrow_mut().take();
+                                incoming_read_for_status.borrow_mut().take();
+
+                                if had_volatile_incoming_evidence {
+                                    incoming_pending_for_status.set(false);
+                                    incoming_status_for_status.set(
+                                        "Incoming contract proof was interrupted;                                          retry after reconnecting"
+                                            .to_owned(),
+                                    );
+                                    incoming_error_for_status.set(Some(
+                                        "Volatile unsigned acceptance evidence                                          was cleared when the connection closed."
+                                            .to_owned(),
+                                    ));
+                                }
                             }
                         }
 
@@ -1615,6 +1735,17 @@ mod browser {
                             &challenge_pending_for_response,
                             &challenge_status_for_response,
                             &challenge_error_for_response,
+                        ) {
+                            return;
+                        }
+
+                        if handle_incoming_challenge_contract_response(
+                            &response,
+                            &incoming_probe_for_response,
+                            &incoming_read_for_response,
+                            &incoming_pending_for_response,
+                            &incoming_status_for_response,
+                            &incoming_error_for_response,
                         ) {
                             return;
                         }
@@ -2767,6 +2898,11 @@ mod browser {
             let challenge_publication_status = challenge_publication_status.clone();
             let challenge_publication_error = challenge_publication_error.clone();
             let submitted_game_contract = submitted_game_contract.clone();
+            let incoming_acceptance_pending = incoming_acceptance_pending.clone();
+            let incoming_acceptance_status = incoming_acceptance_status.clone();
+            let incoming_acceptance_error = incoming_acceptance_error.clone();
+            let pending_incoming_acceptance_probe = pending_incoming_acceptance_probe.clone();
+            let retrieved_incoming_acceptance_read = retrieved_incoming_acceptance_read.clone();
             let challenge_recovery_attempted = challenge_recovery_attempted.clone();
             let local_player_id_for_reconnect = local_player_id.clone();
             let authoritative_local_role_for_reconnect = authoritative_local_role.clone();
@@ -2775,6 +2911,14 @@ mod browser {
             Callback::from(move |_| {
                 freenet_api.borrow_mut().take();
                 submitted_game_contract.borrow_mut().take();
+                pending_incoming_acceptance_probe.borrow_mut().take();
+                retrieved_incoming_acceptance_read.borrow_mut().take();
+                incoming_acceptance_pending.set(false);
+                incoming_acceptance_status.set(
+                    "No incoming acceptance pending; contract proof is required before signing"
+                        .to_owned(),
+                );
+                incoming_acceptance_error.set(None);
                 *challenge_recovery_attempted.borrow_mut() = false;
 
                 /*
@@ -2814,10 +2958,21 @@ mod browser {
                 let challenge_status_for_response = challenge_publication_status.clone();
                 let challenge_error_for_response = challenge_publication_error.clone();
                 let submitted_game_for_response = submitted_game_contract.clone();
+                let incoming_probe_for_response = pending_incoming_acceptance_probe.clone();
+                let incoming_read_for_response = retrieved_incoming_acceptance_read.clone();
+                let incoming_pending_for_response = incoming_acceptance_pending.clone();
+                let incoming_status_for_response = incoming_acceptance_status.clone();
+                let incoming_error_for_response = incoming_acceptance_error.clone();
                 let player_id_for_response = local_player_id_for_reconnect.clone();
                 let authoritative_role_for_response =
                     authoritative_local_role_for_reconnect.clone();
                 let controller_for_response = controller_for_reconnect.clone();
+
+                let incoming_probe_for_status = pending_incoming_acceptance_probe.clone();
+                let incoming_read_for_status = retrieved_incoming_acceptance_read.clone();
+                let incoming_pending_for_status = incoming_acceptance_pending.clone();
+                let incoming_status_for_status = incoming_acceptance_status.clone();
+                let incoming_error_for_status = incoming_acceptance_error.clone();
 
                 let api_for_open = freenet_api.clone();
                 let connection_for_open = connection_status.clone();
@@ -2837,6 +2992,25 @@ mod browser {
                             ConnectionStatus::Disconnected | ConnectionStatus::Failed(_) => {
                                 subscription_for_status.set(SubscriptionStatus::Inactive);
                                 lobby_subscription_for_status.set(SubscriptionStatus::Inactive);
+
+                                let had_volatile_incoming_evidence =
+                                    incoming_probe_for_status.borrow().is_some()
+                                        || incoming_read_for_status.borrow().is_some();
+
+                                incoming_probe_for_status.borrow_mut().take();
+                                incoming_read_for_status.borrow_mut().take();
+
+                                if had_volatile_incoming_evidence {
+                                    incoming_pending_for_status.set(false);
+                                    incoming_status_for_status.set(
+                                        "Incoming contract proof was interrupted;                                          retry after reconnecting"
+                                            .to_owned(),
+                                    );
+                                    incoming_error_for_status.set(Some(
+                                        "Volatile unsigned acceptance evidence                                          was cleared when the connection closed."
+                                            .to_owned(),
+                                    ));
+                                }
                             }
                         }
 
@@ -2854,6 +3028,17 @@ mod browser {
                             &challenge_pending_for_response,
                             &challenge_status_for_response,
                             &challenge_error_for_response,
+                        ) {
+                            return;
+                        }
+
+                        if handle_incoming_challenge_contract_response(
+                            &response,
+                            &incoming_probe_for_response,
+                            &incoming_read_for_response,
+                            &incoming_pending_for_response,
+                            &incoming_status_for_response,
+                            &incoming_error_for_response,
                         ) {
                             return;
                         }
