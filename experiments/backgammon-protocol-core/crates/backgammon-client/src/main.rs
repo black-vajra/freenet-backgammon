@@ -73,8 +73,8 @@ mod browser {
         IncomingChallengeContractProbe,
     };
     use crate::incoming_challenge_acceptance_store::{
-        load_incoming_challenge_acceptance, store_new_incoming_challenge_acceptance,
-        StoredIncomingChallengeAcceptance,
+        load_incoming_challenge_acceptance, remove_incoming_challenge_acceptance,
+        store_new_incoming_challenge_acceptance, StoredIncomingChallengeAcceptance,
     };
     use crate::incoming_challenge_acceptance_transport::{
         classify_incoming_challenge_contract_response, IncomingChallengeContractRead,
@@ -194,6 +194,59 @@ mod browser {
         }
     }
 
+    /// Removes durable incoming acceptance evidence only after the exact
+    /// signed offer and exact signed acceptance appear together in a complete,
+    /// independently verified authoritative lobby state.
+    fn observe_authoritative_incoming_challenge_acceptance(
+        state: &LobbyContractState,
+        local_player_id_handle: &UseStateHandle<Option<[u8; 32]>>,
+        pending_handle: &UseStateHandle<bool>,
+        status_handle: &UseStateHandle<String>,
+        error_handle: &UseStateHandle<Option<String>>,
+    ) {
+        let Some(local_player_id) = **local_player_id_handle else {
+            return;
+        };
+
+        let observation = (|| {
+            let Some(stored) = load_incoming_challenge_acceptance(&local_player_id)? else {
+                return Ok(false);
+            };
+
+            if !stored.is_exact_acceptance_authoritative(state)? {
+                return Ok(false);
+            }
+
+            remove_incoming_challenge_acceptance(&local_player_id, &stored.challenge_id())?;
+
+            Ok(true)
+        })();
+
+        match observation {
+            Ok(true) => {
+                pending_handle.set(false);
+                status_handle.set(
+                    "Challenge acceptance confirmed in verified authoritative \
+                     lobby state"
+                        .to_owned(),
+                );
+                error_handle.set(None);
+            }
+
+            Ok(false) => {}
+
+            Err(error) => {
+                /*
+                 * Retain the durable record and pending state. Removal itself
+                 * verifies that the exact identity-scoped record vanished.
+                 */
+                pending_handle.set(true);
+                status_handle.set("Challenge acceptance confirmation requires recovery".to_owned());
+                error_handle.set(Some(error));
+            }
+        }
+    }
+
     fn handle_lobby_response(
         response: &HostResponse,
         contract_status_handle: &UseStateHandle<LobbyContractStatus>,
@@ -205,6 +258,9 @@ mod browser {
         challenge_pending_handle: &UseStateHandle<bool>,
         challenge_status_handle: &UseStateHandle<String>,
         challenge_error_handle: &UseStateHandle<Option<String>>,
+        incoming_pending_handle: &UseStateHandle<bool>,
+        incoming_status_handle: &UseStateHandle<String>,
+        incoming_error_handle: &UseStateHandle<Option<String>>,
     ) -> bool {
         let Some(classified) = classify_lobby_response(response) else {
             return false;
@@ -237,6 +293,14 @@ mod browser {
                 challenge_pending_handle,
                 challenge_status_handle,
                 challenge_error_handle,
+            );
+
+            observe_authoritative_incoming_challenge_acceptance(
+                &state,
+                local_player_id_handle,
+                incoming_pending_handle,
+                incoming_status_handle,
+                incoming_error_handle,
             );
 
             authoritative_state_handle.set(Some(state));
@@ -1910,6 +1974,9 @@ mod browser {
                             &challenge_pending_for_response,
                             &challenge_status_for_response,
                             &challenge_error_for_response,
+                            &incoming_pending_for_response,
+                            &incoming_status_for_response,
+                            &incoming_error_for_response,
                         ) {
                             return;
                         }
@@ -3207,6 +3274,9 @@ mod browser {
                             &challenge_pending_for_response,
                             &challenge_status_for_response,
                             &challenge_error_for_response,
+                            &incoming_pending_for_response,
+                            &incoming_status_for_response,
+                            &incoming_error_for_response,
                         ) {
                             return;
                         }
