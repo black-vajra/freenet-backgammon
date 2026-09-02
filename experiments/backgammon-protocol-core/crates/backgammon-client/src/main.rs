@@ -1475,10 +1475,16 @@ mod browser {
             use_mut_ref(|| None::<(IncomingChallengeContractProbe, ContractKey, Vec<u8>)>);
 
         /*
-         * Recovery is attempted at most once per live connection. A reconnect
-         * resets this guard and reuses only the exact durable signed evidence.
+         * Outbound recovery is attempted at most once per live connection.
+         * A reconnect resets this guard and reuses exact durable evidence.
          */
         let challenge_recovery_attempted = use_mut_ref(|| false);
+
+        /*
+         * Incoming acceptance recovery has an independent per-connection
+         * guard. It reuses the stored signature and never signs again.
+         */
+        let incoming_acceptance_recovery_attempted = use_mut_ref(|| false);
 
         /*
          * Role derived from this persistent PlayerId and a verified
@@ -1613,6 +1619,193 @@ mod browser {
 
                 || {}
             });
+        }
+
+        let incoming_acceptance_recovery_ready = (
+            *local_player_id,
+            matches!(
+                &*lobby_contract_status,
+                LobbyContractStatus::Retrieved { .. }
+            ),
+        );
+
+        {
+            let freenet_api = freenet_api.clone();
+            let latest_lobby_contract_key = latest_lobby_contract_key.clone();
+            let incoming_acceptance_recovery_attempted =
+                incoming_acceptance_recovery_attempted.clone();
+            let incoming_acceptance_pending = incoming_acceptance_pending.clone();
+            let incoming_acceptance_status = incoming_acceptance_status.clone();
+            let incoming_acceptance_error = incoming_acceptance_error.clone();
+
+            use_effect_with(
+                incoming_acceptance_recovery_ready,
+                move |(player_id, lobby_ready)| {
+                    if let Some(player_id) = *player_id {
+                        match load_incoming_challenge_acceptance(&player_id) {
+                            Ok(None) => {}
+
+                            Err(error) => {
+                                *incoming_acceptance_recovery_attempted.borrow_mut() = true;
+
+                                incoming_acceptance_pending.set(true);
+                                incoming_acceptance_status.set(
+                                    "Stored incoming acceptance recovery is \
+                                     blocked"
+                                        .to_owned(),
+                                );
+                                incoming_acceptance_error.set(Some(error));
+                            }
+
+                            Ok(Some(stored)) => {
+                                incoming_acceptance_pending.set(true);
+
+                                if !*lobby_ready {
+                                    incoming_acceptance_status.set(
+                                        "Stored acceptance loaded; waiting for \
+                                         verified lobby recovery"
+                                            .to_owned(),
+                                    );
+                                } else if !*incoming_acceptance_recovery_attempted.borrow() {
+                                    /*
+                                     * Arm before validation or asynchronous
+                                     * submission. Any failure retains the
+                                     * exact durable record until reconnect.
+                                     */
+                                    *incoming_acceptance_recovery_attempted.borrow_mut() = true;
+
+                                    let prepared = (|| {
+                                        if load_outbound_challenge_publication(&player_id)?
+                                            .is_some()
+                                        {
+                                            return Err("Incoming acceptance recovery \
+                                                 is blocked by a durable \
+                                                 outbound challenge."
+                                                .to_owned());
+                                        }
+
+                                        /*
+                                         * Rebuilding regenerates the original
+                                         * acceptance, proposal, full contract
+                                         * key, contract ID, and encoded lobby
+                                         * update. It performs no signing.
+                                         */
+                                        let plan = stored.rebuild_plan()?;
+
+                                        let lobby_key = latest_lobby_contract_key
+                                            .borrow()
+                                            .clone()
+                                            .ok_or_else(|| {
+                                                "Verified lobby retrieval \
+                                                     did not retain its full \
+                                                     contract key."
+                                                    .to_owned()
+                                            })?;
+
+                                        Ok((
+                                            lobby_key,
+                                            plan.encoded_lobby_state_update,
+                                            stored.challenge_id(),
+                                        ))
+                                    })();
+
+                                    match prepared {
+                                        Err(error) => {
+                                            incoming_acceptance_status.set(
+                                                "Stored acceptance failed \
+                                                 exact recovery validation"
+                                                    .to_owned(),
+                                            );
+                                            incoming_acceptance_error.set(Some(error));
+                                        }
+
+                                        Ok((
+                                            lobby_key,
+                                            encoded_lobby_state_update,
+                                            challenge_id,
+                                        )) => {
+                                            let short_challenge_id = challenge_id[..5]
+                                                .iter()
+                                                .map(|byte| format!("{byte:02x}"))
+                                                .collect::<String>();
+
+                                            incoming_acceptance_status.set(format!(
+                                                "Recovering acceptance for \
+                                                     challenge \
+                                                     {short_challenge_id}…",
+                                            ));
+                                            incoming_acceptance_error.set(None);
+
+                                            let api = freenet_api.clone();
+                                            let pending = incoming_acceptance_pending.clone();
+                                            let status = incoming_acceptance_status.clone();
+                                            let error = incoming_acceptance_error.clone();
+
+                                            wasm_bindgen_futures::spawn_local(async move {
+                                                let result = {
+                                                    let mut api = api.borrow_mut();
+
+                                                    match api.as_mut() {
+                                                        Some(api) => {
+                                                            submit_lobby_state_update(
+                                                                api,
+                                                                lobby_key,
+                                                                encoded_lobby_state_update,
+                                                            )
+                                                            .await
+                                                        }
+
+                                                        None => Err("Freenet \
+                                                                 connection \
+                                                                 closed before \
+                                                                 incoming \
+                                                                 acceptance \
+                                                                 recovery."
+                                                            .to_owned()),
+                                                    }
+                                                };
+
+                                                match result {
+                                                    Ok(()) => {
+                                                        pending.set(true);
+                                                        error.set(None);
+                                                        status.set(format!(
+                                                            "Recovered \
+                                                                 acceptance for \
+                                                                 challenge \
+                                                                 {short_challenge_id}… \
+                                                                 submitted; \
+                                                                 awaiting verified \
+                                                                 authoritative \
+                                                                 confirmation",
+                                                        ));
+                                                    }
+
+                                                    Err(submit_error) => {
+                                                        pending.set(true);
+                                                        status.set(
+                                                            "Stored \
+                                                                 acceptance \
+                                                                 retained; \
+                                                                 recovery \
+                                                                 submission \
+                                                                 failed"
+                                                                .to_owned(),
+                                                        );
+                                                        error.set(Some(submit_error));
+                                                    }
+                                                }
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    || {}
+                },
+            );
         }
 
         let challenge_recovery_ready = (
@@ -1857,6 +2050,8 @@ mod browser {
             let pending_incoming_acceptance_probe = pending_incoming_acceptance_probe.clone();
             let retrieved_incoming_acceptance_read = retrieved_incoming_acceptance_read.clone();
             let challenge_recovery_attempted = challenge_recovery_attempted.clone();
+            let incoming_acceptance_recovery_attempted =
+                incoming_acceptance_recovery_attempted.clone();
             let local_player_id_for_effect = local_player_id.clone();
             let authoritative_local_role_for_effect = authoritative_local_role.clone();
             let controller_for_effect = controller.clone();
@@ -1877,6 +2072,7 @@ mod browser {
                 );
                 incoming_acceptance_error.set(None);
                 *challenge_recovery_attempted.borrow_mut() = false;
+                *incoming_acceptance_recovery_attempted.borrow_mut() = false;
                 *local_network_action_submitted.borrow_mut() = None;
                 *local_dice_secret.borrow_mut() = None;
                 latest_contract_key.borrow_mut().take();
@@ -3150,6 +3346,8 @@ mod browser {
             let pending_incoming_acceptance_probe = pending_incoming_acceptance_probe.clone();
             let retrieved_incoming_acceptance_read = retrieved_incoming_acceptance_read.clone();
             let challenge_recovery_attempted = challenge_recovery_attempted.clone();
+            let incoming_acceptance_recovery_attempted =
+                incoming_acceptance_recovery_attempted.clone();
             let local_player_id_for_reconnect = local_player_id.clone();
             let authoritative_local_role_for_reconnect = authoritative_local_role.clone();
             let controller_for_reconnect = controller.clone();
@@ -3166,6 +3364,7 @@ mod browser {
                 );
                 incoming_acceptance_error.set(None);
                 *challenge_recovery_attempted.borrow_mut() = false;
+                *incoming_acceptance_recovery_attempted.borrow_mut() = false;
 
                 /*
                  * Permit one submission attempt on the new connection.
