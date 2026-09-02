@@ -43,7 +43,7 @@ mod browser {
     use backgammon_core::{GameState, MoveSource, MoveTarget, Player, TurnPhase, TurnSequence};
     use backgammon_lobby_core::LobbyContractState;
     use backgammon_protocol::{
-        replay_game, verify_challenge_offer_at, DiceSecret, GameActionPayload,
+        replay_game, verify_challenge_offer_at, DiceSecret, GameActionPayload, SignedChallengeOffer,
     };
     use freenet_stdlib::client_api::{HostResponse, WebApi};
     use freenet_stdlib::prelude::ContractKey;
@@ -68,7 +68,9 @@ mod browser {
         confirm_game_contract_publication, submit_game_contract_publication,
         SubmittedGameContractPublication,
     };
-    use crate::incoming_challenge_acceptance_planner::IncomingChallengeContractProbe;
+    use crate::incoming_challenge_acceptance_planner::{
+        prepare_incoming_challenge_contract_probe, IncomingChallengeContractProbe,
+    };
     use crate::incoming_challenge_acceptance_transport::{
         classify_incoming_challenge_contract_response, IncomingChallengeContractRead,
     };
@@ -3917,6 +3919,139 @@ mod browser {
             )
         };
 
+        let on_accept_incoming_challenge: Callback<SignedChallengeOffer> = {
+            let local_player_id = local_player_id.clone();
+            let authoritative_lobby_state = authoritative_lobby_state.clone();
+            let freenet_api = freenet_api.clone();
+            let outbound_pending = challenge_publication_pending.clone();
+            let incoming_pending = incoming_acceptance_pending.clone();
+            let incoming_status = incoming_acceptance_status.clone();
+            let incoming_error = incoming_acceptance_error.clone();
+            let pending_probe = pending_incoming_acceptance_probe.clone();
+            let retrieved_read = retrieved_incoming_acceptance_read.clone();
+
+            Callback::from(move |signed_offer: SignedChallengeOffer| {
+                if *incoming_pending {
+                    return;
+                }
+
+                let prepared = (|| {
+                    if *outbound_pending {
+                        return Err("An outbound challenge workflow is already pending.".to_owned());
+                    }
+
+                    let local_player_id = (*local_player_id)
+                        .ok_or_else(|| "Local identity is not ready yet.".to_owned())?;
+
+                    let now_unix_seconds = local_observation_unix_seconds()?;
+
+                    let authoritative_state =
+                        (*authoritative_lobby_state).as_ref().ok_or_else(|| {
+                            "Verified authoritative lobby state is unavailable.".to_owned()
+                        })?;
+
+                    let mut exact_matches = authoritative_state
+                        .challenges
+                        .offers
+                        .iter()
+                        .filter(|entry| entry.offer == signed_offer);
+
+                    let current_challenge = exact_matches.next().ok_or_else(|| {
+                        "The selected signed challenge is no longer present \
+                             in authoritative lobby state."
+                            .to_owned()
+                    })?;
+
+                    if exact_matches.next().is_some() {
+                        return Err("Authoritative lobby state contains ambiguous \
+                             duplicate records for this signed challenge."
+                            .to_owned());
+                    }
+
+                    if freenet_api.borrow().is_none() {
+                        return Err("The Freenet connection is not available.".to_owned());
+                    }
+
+                    prepare_incoming_challenge_contract_probe(
+                        current_challenge,
+                        local_player_id,
+                        now_unix_seconds,
+                    )
+                })();
+
+                let probe = match prepared {
+                    Ok(probe) => probe,
+
+                    Err(error) => {
+                        incoming_pending.set(false);
+                        incoming_status
+                            .set("Incoming acceptance probe could not be prepared".to_owned());
+                        incoming_error.set(Some(error));
+                        return;
+                    }
+                };
+
+                let short_challenge_id = probe.signed_offer.body.challenge_id[..5]
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>();
+
+                let contract_id = probe.contract_id.clone();
+
+                /*
+                 * Arm before the asynchronous send. Even an immediate response
+                 * therefore has its exact unsigned originating evidence.
+                 */
+                retrieved_read.borrow_mut().take();
+                *pending_probe.borrow_mut() = Some(probe);
+
+                incoming_pending.set(true);
+                incoming_error.set(None);
+                incoming_status.set(format!(
+                    "Challenge {short_challenge_id}… remains unsigned; \
+                     requesting its exact game contract",
+                ));
+
+                let api = freenet_api.clone();
+                let pending_probe_for_request = pending_probe.clone();
+                let pending_for_request = incoming_pending.clone();
+                let status_for_request = incoming_status.clone();
+                let error_for_request = incoming_error.clone();
+
+                wasm_bindgen_futures::spawn_local(async move {
+                    let result = {
+                        let mut api = api.borrow_mut();
+
+                        match api.as_mut() {
+                            Some(api) => request_contract(api, &contract_id).await,
+
+                            None => Err("Freenet connection closed before the incoming \
+                                 game-contract request."
+                                .to_owned()),
+                        }
+                    };
+
+                    if let Err(error) = result {
+                        let should_clear = pending_probe_for_request
+                            .borrow()
+                            .as_ref()
+                            .is_some_and(|probe| probe.contract_id == contract_id);
+
+                        if should_clear {
+                            pending_probe_for_request.borrow_mut().take();
+                            pending_for_request.set(false);
+                            status_for_request.set(
+                                "Incoming game-contract request failed; \
+                                 no acceptance was created"
+                                    .to_owned(),
+                            );
+                            error_for_request.set(Some(error));
+                        }
+                    }
+                });
+            })
+        };
+
         /*
          * Project opponents only from a complete, independently verified
          * authoritative lobby state. Local intent is never mixed into this
@@ -4040,6 +4175,12 @@ mod browser {
         let challenge_controls_disabled = *challenge_publication_pending
             || (*local_player_id).is_none()
             || latest_lobby_contract_key.borrow().is_none()
+            || freenet_api.borrow().is_none();
+
+        let incoming_acceptance_controls_disabled = *incoming_acceptance_pending
+            || *challenge_publication_pending
+            || (*local_player_id).is_none()
+            || (*authoritative_lobby_state).is_none()
             || freenet_api.borrow().is_none();
 
         html! {
@@ -4296,9 +4437,21 @@ mod browser {
 
                         <p class="panel-note" role="status">
                             {
-                                "Read-only verified view. No acceptance is signed or published by this panel."
+                                (*incoming_acceptance_status).clone()
                             }
                         </p>
+
+                        {
+                            match &*incoming_acceptance_error {
+                                Some(error) => html! {
+                                    <p class="interface-error" role="alert">
+                                        { error.clone() }
+                                    </p>
+                                },
+
+                                None => html! {},
+                            }
+                        }
 
                         {
                             if incoming_challenges.is_empty() {
@@ -4331,6 +4484,26 @@ mod browser {
                                                         format_player_id(
                                                             &challenge.game_id
                                                         );
+
+                                                    let signed_offer =
+                                                        challenge
+                                                            .signed_offer
+                                                            .clone();
+
+                                                    let on_accept = {
+                                                        let callback =
+                                                            on_accept_incoming_challenge
+                                                                .clone();
+
+                                                        Callback::from(
+                                                            move |_| {
+                                                                callback.emit(
+                                                                    signed_offer
+                                                                        .clone(),
+                                                                );
+                                                            },
+                                                        )
+                                                    };
 
                                                     html! {
                                                         <li>
@@ -4400,6 +4573,23 @@ mod browser {
                                                                     </dd>
                                                                 </div>
                                                             </dl>
+
+                                                            <button
+                                                                type="button"
+                                                                class="challenge-player-button"
+                                                                onclick={on_accept}
+                                                                disabled={
+                                                                    incoming_acceptance_controls_disabled
+                                                                }
+                                                            >
+                                                                {
+                                                                    if *incoming_acceptance_pending {
+                                                                        "Acceptance pending"
+                                                                    } else {
+                                                                        "Accept challenge"
+                                                                    }
+                                                                }
+                                                            </button>
                                                         </li>
                                                     }
                                                 }
