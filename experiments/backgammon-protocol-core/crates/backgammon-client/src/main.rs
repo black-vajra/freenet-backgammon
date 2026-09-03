@@ -774,13 +774,14 @@ mod browser {
     }
 
     fn plan_browser_commitment(
+        contract_id: &str,
         authoritative_state: &[u8],
         local_player: Player,
     ) -> Result<CommitmentPlan, String> {
         let signing_key = load_local_identity()?
             .ok_or_else(|| "Local signing identity is unavailable.".to_owned())?;
 
-        let pending = load_pending_action(TEST_CONTRACT_ID)?;
+        let pending = load_pending_action(contract_id)?;
 
         let stored_secret = if let Some(pending) = pending.as_ref() {
             let record = pending.verify()?;
@@ -795,11 +796,11 @@ mod browser {
                 );
             }
 
-            load_dice_secret(TEST_CONTRACT_ID, &pending.game_id, *turn, *player)?
+            load_dice_secret(contract_id, &pending.game_id, *turn, *player)?
         } else if let Some((game_id, turn, player)) =
             local_commitment_storage_context(authoritative_state, local_player)?
         {
-            load_dice_secret(TEST_CONTRACT_ID, &game_id, turn, player)?
+            load_dice_secret(contract_id, &game_id, turn, player)?
         } else {
             None
         };
@@ -823,7 +824,7 @@ mod browser {
         };
 
         let plan = plan_commitment(CommitmentPlannerInput {
-            contract_id: TEST_CONTRACT_ID,
+            contract_id: contract_id,
             local_player,
             signing_key: &signing_key,
             authoritative_state,
@@ -838,7 +839,7 @@ mod browser {
 
             CommitmentPlan::Accepted { .. } => {
                 if pending.is_some() {
-                    remove_pending_action(TEST_CONTRACT_ID)?;
+                    remove_pending_action(contract_id)?;
                 }
             }
 
@@ -867,7 +868,7 @@ mod browser {
                      * A crash must never leave a retryable commitment without
                      * its corresponding reveal material.
                      */
-                    store_dice_secret(TEST_CONTRACT_ID, &pending.game_id, turn, player, secret)?;
+                    store_dice_secret(contract_id, &pending.game_id, turn, player, secret)?;
 
                     /*
                      * Persist the exact encoded delta before network
@@ -920,13 +921,14 @@ mod browser {
     }
 
     fn plan_browser_reveal(
+        contract_id: &str,
         authoritative_state: &[u8],
         local_player: Player,
     ) -> Result<RevealPlan, String> {
         let signing_key = load_local_identity()?
             .ok_or_else(|| "Local signing identity is unavailable.".to_owned())?;
 
-        let pending = load_pending_action(TEST_CONTRACT_ID)?;
+        let pending = load_pending_action(contract_id)?;
 
         let stored_secret = if let Some(pending) = pending.as_ref() {
             let record = pending.verify()?;
@@ -939,11 +941,11 @@ mod browser {
                 return Err("Stored pending reveal belongs to a different local player.".to_owned());
             }
 
-            load_dice_secret(TEST_CONTRACT_ID, &pending.game_id, *turn, *player)?
+            load_dice_secret(contract_id, &pending.game_id, *turn, *player)?
         } else if let Some((game_id, turn, player)) =
             local_commitment_storage_context(authoritative_state, local_player)?
         {
-            load_dice_secret(TEST_CONTRACT_ID, &game_id, turn, player)?
+            load_dice_secret(contract_id, &game_id, turn, player)?
         } else {
             None
         };
@@ -959,7 +961,7 @@ mod browser {
         };
 
         let plan = plan_reveal(RevealPlannerInput {
-            contract_id: TEST_CONTRACT_ID,
+            contract_id: contract_id,
             local_player,
             signing_key: &signing_key,
             authoritative_state,
@@ -973,7 +975,7 @@ mod browser {
 
             RevealPlan::Accepted { .. } => {
                 if pending.is_some() {
-                    remove_pending_action(TEST_CONTRACT_ID)?;
+                    remove_pending_action(contract_id)?;
                 }
             }
 
@@ -1030,6 +1032,7 @@ mod browser {
     }
 
     fn plan_browser_play_turn(
+        contract_id: &str,
         authoritative_state: &[u8],
         local_player: Player,
         sequence: Option<&TurnSequence>,
@@ -1037,7 +1040,7 @@ mod browser {
         let signing_key = load_local_identity()?
             .ok_or_else(|| "Local signing identity is unavailable.".to_owned())?;
 
-        let pending = load_pending_action(TEST_CONTRACT_ID)?;
+        let pending = load_pending_action(contract_id)?;
 
         if let Some(pending) = pending.as_ref() {
             let record = pending.verify()?;
@@ -1062,7 +1065,7 @@ mod browser {
         };
 
         let plan = plan_play_turn(PlayTurnPlannerInput {
-            contract_id: TEST_CONTRACT_ID,
+            contract_id: contract_id,
             local_player,
             signing_key: &signing_key,
             authoritative_state,
@@ -1076,7 +1079,7 @@ mod browser {
 
             PlayTurnPlan::Accepted => {
                 if pending.is_some() {
-                    remove_pending_action(TEST_CONTRACT_ID)?;
+                    remove_pending_action(contract_id)?;
                 }
             }
 
@@ -1130,6 +1133,7 @@ mod browser {
     }
 
     fn plan_browser_request_roll(
+        contract_id: &str,
         authoritative_state: &[u8],
         local_player: Player,
         requested: bool,
@@ -1137,7 +1141,7 @@ mod browser {
         let signing_key = load_local_identity()?
             .ok_or_else(|| "Local signing identity is unavailable.".to_owned())?;
 
-        let pending = load_pending_action(TEST_CONTRACT_ID)?;
+        let pending = load_pending_action(contract_id)?;
 
         if let Some(pending) = pending.as_ref() {
             let record = pending.verify()?;
@@ -1164,7 +1168,7 @@ mod browser {
         };
 
         let plan = plan_request_roll(RequestRollPlannerInput {
-            contract_id: TEST_CONTRACT_ID,
+            contract_id: contract_id,
             local_player,
             signing_key: &signing_key,
             authoritative_state,
@@ -1178,7 +1182,7 @@ mod browser {
 
             RequestRollPlan::Accepted => {
                 if pending.is_some() {
-                    remove_pending_action(TEST_CONTRACT_ID)?;
+                    remove_pending_action(contract_id)?;
                 }
             }
 
@@ -1232,15 +1236,16 @@ mod browser {
     }
 
     fn plan_browser_network_action(
+        contract_id: &str,
         authoritative_state: &[u8],
         local_player: Player,
     ) -> Result<BrowserNetworkActionPlan, String> {
-        if let Some(pending) = load_pending_action(TEST_CONTRACT_ID)? {
+        if let Some(pending) = load_pending_action(contract_id)? {
             let record = pending.verify()?;
 
             return match record.payload {
                 GameActionPayload::CommitDice { .. } => {
-                    match plan_browser_commitment(authoritative_state, local_player)? {
+                    match plan_browser_commitment(contract_id, authoritative_state, local_player)? {
                         CommitmentPlan::NoAction => Ok(BrowserNetworkActionPlan::NoAction),
 
                         CommitmentPlan::Accepted { secret } => {
@@ -1249,7 +1254,11 @@ mod browser {
                              * immediately into reveal planning so the browser does
                              * not require an unrelated later update to advance.
                              */
-                            match plan_browser_reveal(authoritative_state, local_player)? {
+                            match plan_browser_reveal(
+                                contract_id,
+                                authoritative_state,
+                                local_player,
+                            )? {
                                 RevealPlan::NoAction => Ok(BrowserNetworkActionPlan::Accepted {
                                     secret,
                                     kind: NetworkActionKind::Commitment,
@@ -1273,16 +1282,22 @@ mod browser {
                 }
 
                 GameActionPayload::RevealDice { .. } => Ok(map_reveal_plan(plan_browser_reveal(
+                    contract_id,
                     authoritative_state,
                     local_player,
                 )?)),
 
-                GameActionPayload::RequestRoll { .. } => Ok(map_request_roll_plan(
-                    plan_browser_request_roll(authoritative_state, local_player, false)?,
-                )),
+                GameActionPayload::RequestRoll { .. } => {
+                    Ok(map_request_roll_plan(plan_browser_request_roll(
+                        contract_id,
+                        authoritative_state,
+                        local_player,
+                        false,
+                    )?))
+                }
 
                 GameActionPayload::PlayTurn { .. } => Ok(map_play_turn_plan(
-                    plan_browser_play_turn(authoritative_state, local_player, None)?,
+                    plan_browser_play_turn(contract_id, authoritative_state, local_player, None)?,
                 )),
 
                 _ => Err(
@@ -1292,14 +1307,15 @@ mod browser {
             };
         }
 
-        match plan_browser_commitment(authoritative_state, local_player)? {
+        match plan_browser_commitment(contract_id, authoritative_state, local_player)? {
             CommitmentPlan::NoAction => Ok(map_reveal_plan(plan_browser_reveal(
+                contract_id,
                 authoritative_state,
                 local_player,
             )?)),
 
             CommitmentPlan::Accepted { secret } => {
-                match plan_browser_reveal(authoritative_state, local_player)? {
+                match plan_browser_reveal(contract_id, authoritative_state, local_player)? {
                     RevealPlan::NoAction => Ok(BrowserNetworkActionPlan::Accepted {
                         secret,
                         kind: NetworkActionKind::Commitment,
@@ -1322,12 +1338,12 @@ mod browser {
         }
     }
 
-    fn choose_local_role(player: Player) -> Result<(), String> {
-        if load_pending_action(TEST_CONTRACT_ID)?.is_some() {
+    fn choose_local_role(contract_id: &str, player: Player) -> Result<(), String> {
+        if load_pending_action(contract_id)?.is_some() {
             return Err("The local role cannot change while an action is pending.".to_owned());
         }
 
-        match load_local_role(TEST_CONTRACT_ID)? {
+        match load_local_role(contract_id)? {
             Some(existing) if existing == player => Ok(()),
 
             Some(existing) => Err(format!(
@@ -1335,7 +1351,7 @@ mod browser {
                 player_name(existing),
             )),
 
-            None => store_local_role(TEST_CONTRACT_ID, player),
+            None => store_local_role(contract_id, player),
         }
     }
 
@@ -2308,19 +2324,22 @@ mod browser {
                                     return;
                                 };
 
-                                let plan =
-                                    match plan_browser_network_action(&state_bytes, local_player) {
-                                        Ok(plan) => plan,
-                                        Err(error) => {
-                                            secret_status_for_response
-                                                .set(format!("Recovery failed: {error}"));
+                                let plan = match plan_browser_network_action(
+                                    TEST_CONTRACT_ID,
+                                    &state_bytes,
+                                    local_player,
+                                ) {
+                                    Ok(plan) => plan,
+                                    Err(error) => {
+                                        secret_status_for_response
+                                            .set(format!("Recovery failed: {error}"));
 
-                                            contract_for_response
-                                                .set(ContractProbeStatus::Failed(error));
+                                        contract_for_response
+                                            .set(ContractProbeStatus::Failed(error));
 
-                                            return;
-                                        }
-                                    };
+                                        return;
+                                    }
+                                };
 
                                 match plan {
                                     BrowserNetworkActionPlan::NoAction => {
@@ -2792,32 +2811,38 @@ mod browser {
             let local_role = local_role.clone();
             let interface_error = interface_error.clone();
 
-            Callback::from(move |_| match choose_local_role(Player::White) {
-                Ok(()) => {
-                    interface_error.set(None);
-                    local_role.set(Ok(Some(Player::White)));
-                }
+            Callback::from(
+                move |_| match choose_local_role(TEST_CONTRACT_ID, Player::White) {
+                    Ok(()) => {
+                        interface_error.set(None);
+                        local_role.set(Ok(Some(Player::White)));
+                    }
 
-                Err(error) => {
-                    interface_error.set(Some(format!("White role could not be selected: {error}")));
-                }
-            })
+                    Err(error) => {
+                        interface_error
+                            .set(Some(format!("White role could not be selected: {error}")));
+                    }
+                },
+            )
         };
 
         let on_select_black = {
             let local_role = local_role.clone();
             let interface_error = interface_error.clone();
 
-            Callback::from(move |_| match choose_local_role(Player::Black) {
-                Ok(()) => {
-                    interface_error.set(None);
-                    local_role.set(Ok(Some(Player::Black)));
-                }
+            Callback::from(
+                move |_| match choose_local_role(TEST_CONTRACT_ID, Player::Black) {
+                    Ok(()) => {
+                        interface_error.set(None);
+                        local_role.set(Ok(Some(Player::Black)));
+                    }
 
-                Err(error) => {
-                    interface_error.set(Some(format!("Black role could not be selected: {error}")));
-                }
-            })
+                    Err(error) => {
+                        interface_error
+                            .set(Some(format!("Black role could not be selected: {error}")));
+                    }
+                },
+            )
         };
 
         let submit_pending_secretless_action = {
@@ -2940,7 +2965,7 @@ mod browser {
                         .clone()
                         .ok_or_else(|| "No verified authoritative parent state is available.".to_owned())?;
 
-                    match plan_browser_request_roll(&state_bytes, local_player, true)? {
+                    match plan_browser_request_roll(TEST_CONTRACT_ID, &state_bytes, local_player, true)? {
                         RequestRollPlan::Submit {
                             pending,
                             recovered_pending: false,
@@ -3027,6 +3052,7 @@ mod browser {
                         })?;
 
                     match plan_browser_play_turn(
+                        TEST_CONTRACT_ID,
                         &state_bytes,
                         local_player,
                         Some(&sequence),
@@ -3143,6 +3169,7 @@ mod browser {
                                     })?;
 
                             match plan_browser_play_turn(
+                                TEST_CONTRACT_ID,
                                 &state_bytes,
                                 local_player,
                                 Some(&sequence),
@@ -3611,19 +3638,22 @@ mod browser {
                                     return;
                                 };
 
-                                let plan =
-                                    match plan_browser_network_action(&state_bytes, local_player) {
-                                        Ok(plan) => plan,
-                                        Err(error) => {
-                                            secret_status_for_response
-                                                .set(format!("Recovery failed: {error}"));
+                                let plan = match plan_browser_network_action(
+                                    TEST_CONTRACT_ID,
+                                    &state_bytes,
+                                    local_player,
+                                ) {
+                                    Ok(plan) => plan,
+                                    Err(error) => {
+                                        secret_status_for_response
+                                            .set(format!("Recovery failed: {error}"));
 
-                                            contract_for_response
-                                                .set(ContractProbeStatus::Failed(error));
+                                        contract_for_response
+                                            .set(ContractProbeStatus::Failed(error));
 
-                                            return;
-                                        }
-                                    };
+                                        return;
+                                    }
+                                };
 
                                 match plan {
                                     BrowserNetworkActionPlan::NoAction => {
