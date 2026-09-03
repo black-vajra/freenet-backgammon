@@ -52,6 +52,7 @@ mod browser {
     use yew::prelude::*;
     use yew::TargetCast;
 
+    use crate::accepted_game_projection::project_accepted_games;
     use crate::challenge_offer_planner::{plan_outbound_challenge, OutboundChallengePlannerInput};
     use crate::challenge_publication_store::{
         load_outbound_challenge_publication, remove_outbound_challenge_publication,
@@ -4547,6 +4548,20 @@ mod browser {
             _ => Vec::new(),
         };
 
+        /*
+         * Accepted games are projected from the complete verified lobby state
+         * without consulting the browser clock. This is a read-only runtime
+         * candidate set; it does not yet select a game, retarget transport, or
+         * replace the fixed test contract.
+         */
+        let accepted_games = match (*local_player_id, (*authoritative_lobby_state).as_ref()) {
+            (Some(player_id), Some(state)) => {
+                project_accepted_games(player_id, &state.challenges.offers)
+            }
+
+            _ => Ok(Vec::new()),
+        };
+
         let lobby_network_detail = match lobby_now.as_ref() {
             Ok(_) => format!(
                 "{} · Subscription: {} · {} · Expiry view uses this browser's clock",
@@ -5241,6 +5256,22 @@ mod browser {
                                 <dd>{ authoritative_identity_role_text }</dd>
                             </div>
 
+
+                                <div>
+                                    <dt>{ "Accepted games" }</dt>
+                                    <dd>
+                                        {
+                                            match &accepted_games {
+                                                Ok(games) => {
+                                                    format!("{} verified", games.len())
+                                                }
+                                                Err(error) => {
+                                                    format!("Projection unavailable: {error}")
+                                                }
+                                            }
+                                        }
+                                    </dd>
+                                </div>
 
                                 <div>
                                     <dt>{ "Player ID" }</dt>
