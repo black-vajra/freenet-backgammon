@@ -1434,6 +1434,12 @@ mod browser {
 
     #[function_component(App)]
     fn app() -> Html {
+        /*
+         * One behavior-preserving scope for all game transport, durable
+         * pending actions, dice secrets, and role storage. This still targets
+         * the published test contract; accepted-game activation comes later.
+         */
+        let active_game_contract_id = TEST_CONTRACT_ID;
         let controller = use_state(LocalGameController::new);
         let interface_error = use_state(|| None::<String>);
         let pending_confirmation = use_state(|| None::<PendingConfirmation>);
@@ -1534,7 +1540,7 @@ mod browser {
          * An invalid stored value is retained as an error rather than silently
          * converted into a player role.
          */
-        let local_role = use_state(|| load_local_role(TEST_CONTRACT_ID));
+        let local_role = use_state(move || load_local_role(active_game_contract_id));
 
         let selected_local_role = match &*local_role {
             Ok(role) => *role,
@@ -2232,7 +2238,9 @@ mod browser {
                             return;
                         }
 
-                        if let Some(classified) = classify_response(response, TEST_CONTRACT_ID) {
+                        if let Some(classified) =
+                            classify_response(response, active_game_contract_id)
+                        {
                             let ClassifiedResponse {
                                 contract_status,
                                 subscription_status,
@@ -2325,7 +2333,7 @@ mod browser {
                                 };
 
                                 let plan = match plan_browser_network_action(
-                                    TEST_CONTRACT_ID,
+                                    active_game_contract_id,
                                     &state_bytes,
                                     local_player,
                                 ) {
@@ -2405,7 +2413,7 @@ mod browser {
                                                         Some(api) => {
                                                             submit_action_delta(
                                                                 api,
-                                                                TEST_CONTRACT_ID,
+                                                                active_game_contract_id,
                                                                 key,
                                                                 delta,
                                                             )
@@ -2432,7 +2440,7 @@ mod browser {
 
                                                         match api.as_mut() {
                                                                 Some(api) => {
-                                                                    request_contract(api, TEST_CONTRACT_ID)
+                                                                    request_contract(api, active_game_contract_id)
                                                                         .await
                                                                 }
 
@@ -2520,7 +2528,7 @@ mod browser {
 
                                                 match api.as_mut() {
                                                     Some(api) => {
-                                                        submit_action_delta(api, TEST_CONTRACT_ID, key, delta).await
+                                                        submit_action_delta(api, active_game_contract_id, key, delta).await
                                                     }
 
                                                     None => Err(format!(
@@ -2542,7 +2550,7 @@ mod browser {
 
                                                         match api.as_mut() {
                                                             Some(api) => {
-                                                                request_contract(api, TEST_CONTRACT_ID).await
+                                                                request_contract(api, active_game_contract_id).await
                                                             }
 
                                                             None => Err(format!(
@@ -2603,7 +2611,7 @@ mod browser {
                                 match api.as_mut() {
                                     Some(api) => {
                                         let game_result =
-                                            request_contract(api, TEST_CONTRACT_ID).await;
+                                            request_contract(api, active_game_contract_id).await;
                                         let lobby_result =
                                             request_lobby_contract(api).await;
 
@@ -2657,7 +2665,7 @@ mod browser {
         let left_table = controller.has_left_table();
         let session_active = controller.is_active();
 
-        let pending_role_check = load_pending_action(TEST_CONTRACT_ID);
+        let pending_role_check = load_pending_action(active_game_contract_id);
 
         let no_pending_action = matches!(&pending_role_check, Ok(None));
 
@@ -2811,8 +2819,8 @@ mod browser {
             let local_role = local_role.clone();
             let interface_error = interface_error.clone();
 
-            Callback::from(
-                move |_| match choose_local_role(TEST_CONTRACT_ID, Player::White) {
+            Callback::from(move |_| {
+                match choose_local_role(active_game_contract_id, Player::White) {
                     Ok(()) => {
                         interface_error.set(None);
                         local_role.set(Ok(Some(Player::White)));
@@ -2822,16 +2830,16 @@ mod browser {
                         interface_error
                             .set(Some(format!("White role could not be selected: {error}")));
                     }
-                },
-            )
+                }
+            })
         };
 
         let on_select_black = {
             let local_role = local_role.clone();
             let interface_error = interface_error.clone();
 
-            Callback::from(
-                move |_| match choose_local_role(TEST_CONTRACT_ID, Player::Black) {
+            Callback::from(move |_| {
+                match choose_local_role(active_game_contract_id, Player::Black) {
                     Ok(()) => {
                         interface_error.set(None);
                         local_role.set(Ok(Some(Player::Black)));
@@ -2841,8 +2849,8 @@ mod browser {
                         interface_error
                             .set(Some(format!("Black role could not be selected: {error}")));
                     }
-                },
-            )
+                }
+            })
         };
 
         let submit_pending_secretless_action = {
@@ -2882,7 +2890,8 @@ mod browser {
 
                             match api.as_mut() {
                                 Some(api) => {
-                                    submit_action_delta(api, TEST_CONTRACT_ID, key, delta).await
+                                    submit_action_delta(api, active_game_contract_id, key, delta)
+                                        .await
                                 }
 
                                 None => Err(
@@ -2902,7 +2911,7 @@ mod browser {
                                     let mut api = api_for_update.borrow_mut();
 
                                     match api.as_mut() {
-                                        Some(api) => request_contract(api, TEST_CONTRACT_ID).await,
+                                        Some(api) => request_contract(api, active_game_contract_id).await,
 
                                         None => Err(
                                             "Freenet connection closed before pending action verification."
@@ -2965,7 +2974,7 @@ mod browser {
                         .clone()
                         .ok_or_else(|| "No verified authoritative parent state is available.".to_owned())?;
 
-                    match plan_browser_request_roll(TEST_CONTRACT_ID, &state_bytes, local_player, true)? {
+                    match plan_browser_request_roll(active_game_contract_id, &state_bytes, local_player, true)? {
                         RequestRollPlan::Submit {
                             pending,
                             recovered_pending: false,
@@ -3052,7 +3061,7 @@ mod browser {
                         })?;
 
                     match plan_browser_play_turn(
-                        TEST_CONTRACT_ID,
+                        active_game_contract_id,
                         &state_bytes,
                         local_player,
                         Some(&sequence),
@@ -3169,7 +3178,7 @@ mod browser {
                                     })?;
 
                             match plan_browser_play_turn(
-                                TEST_CONTRACT_ID,
+                                active_game_contract_id,
                                 &state_bytes,
                                 local_player,
                                 Some(&sequence),
@@ -3546,7 +3555,9 @@ mod browser {
                             return;
                         }
 
-                        if let Some(classified) = classify_response(response, TEST_CONTRACT_ID) {
+                        if let Some(classified) =
+                            classify_response(response, active_game_contract_id)
+                        {
                             let ClassifiedResponse {
                                 contract_status,
                                 subscription_status,
@@ -3639,7 +3650,7 @@ mod browser {
                                 };
 
                                 let plan = match plan_browser_network_action(
-                                    TEST_CONTRACT_ID,
+                                    active_game_contract_id,
                                     &state_bytes,
                                     local_player,
                                 ) {
@@ -3719,7 +3730,7 @@ mod browser {
                                                         Some(api) => {
                                                             submit_action_delta(
                                                                 api,
-                                                                TEST_CONTRACT_ID,
+                                                                active_game_contract_id,
                                                                 key,
                                                                 delta,
                                                             )
@@ -3746,7 +3757,7 @@ mod browser {
 
                                                         match api.as_mut() {
                                                                 Some(api) => {
-                                                                    request_contract(api, TEST_CONTRACT_ID)
+                                                                    request_contract(api, active_game_contract_id)
                                                                         .await
                                                                 }
 
@@ -3834,7 +3845,7 @@ mod browser {
 
                                                 match api.as_mut() {
                                                     Some(api) => {
-                                                        submit_action_delta(api, TEST_CONTRACT_ID, key, delta).await
+                                                        submit_action_delta(api, active_game_contract_id, key, delta).await
                                                     }
 
                                                     None => Err(format!(
@@ -3856,7 +3867,7 @@ mod browser {
 
                                                         match api.as_mut() {
                                                             Some(api) => {
-                                                                request_contract(api, TEST_CONTRACT_ID).await
+                                                                request_contract(api, active_game_contract_id).await
                                                             }
 
                                                             None => Err(format!(
@@ -3916,7 +3927,7 @@ mod browser {
                                 match api.as_mut() {
                                     Some(api) => {
                                         let game_result =
-                                            request_contract(api, TEST_CONTRACT_ID).await;
+                                            request_contract(api, active_game_contract_id).await;
                                         let lobby_result =
                                             request_lobby_contract(api).await;
 
