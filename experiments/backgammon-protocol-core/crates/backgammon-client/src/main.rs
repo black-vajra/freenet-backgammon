@@ -52,7 +52,9 @@ mod browser {
     use yew::prelude::*;
     use yew::TargetCast;
 
-    use crate::accepted_game_projection::project_accepted_games;
+    use crate::accepted_game_projection::{
+        project_accepted_games, resolve_accepted_game_selection,
+    };
     use crate::challenge_offer_planner::{plan_outbound_challenge, OutboundChallengePlannerInput};
     use crate::challenge_publication_store::{
         load_outbound_challenge_publication, remove_outbound_challenge_publication,
@@ -1441,6 +1443,13 @@ mod browser {
         let lobby_presence_submission_pending = use_state(|| false);
         let lobby_profile_status = use_state(|| "Waiting for local identity".to_owned());
         let lobby_profile_error = use_state(|| None::<String>);
+
+        /*
+         * Accepted-game selection is volatile UI intent. A game becomes a
+         * usable selected candidate only when it resolves uniquely against the
+         * current verified authoritative accepted-game projection.
+         */
+        let selected_accepted_game_id = use_state(|| None::<[u8; 32]>);
 
         /*
          * Verified authoritative lobby state is separate from local profile
@@ -4562,6 +4571,27 @@ mod browser {
             _ => Ok(Vec::new()),
         };
 
+        /*
+         * Never trust the retained game ID by itself. Re-resolve it against
+         * the current authoritative candidates before exposing any selected
+         * AcceptedGame to later runtime work.
+         */
+        let selected_accepted_game = match (&accepted_games, *selected_accepted_game_id) {
+            (_, None) => Ok(None),
+
+            (Ok(games), Some(game_id)) => resolve_accepted_game_selection(Some(game_id), games),
+
+            (Err(error), Some(_)) => Err(format!("Accepted-game projection failed: {error}")),
+        };
+
+        let on_clear_accepted_game = {
+            let selected_game_id = selected_accepted_game_id.clone();
+
+            Callback::from(move |_| {
+                selected_game_id.set(None);
+            })
+        };
+
         let lobby_network_detail = match lobby_now.as_ref() {
             Ok(_) => format!(
                 "{} · Subscription: {} · {} · Expiry view uses this browser's clock",
@@ -5258,16 +5288,175 @@ mod browser {
 
 
                                 <div>
+                                    <dt>{ "Selected game" }</dt>
+                                    <dd>
+                                        {
+                                            match &selected_accepted_game {
+                                                Ok(Some(game)) => html! {
+                                                    <>
+                                                        <span>
+                                                            {
+                                                                format!(
+                                                                    "{} · {}",
+                                                                    format_player_id(
+                                                                        &game.game_id
+                                                                    ),
+                                                                    game.contract_id,
+                                                                )
+                                                            }
+                                                        </span>
+
+                                                        <button
+                                                            type="button"
+                                                            class="challenge-player-button"
+                                                            onclick={
+                                                                on_clear_accepted_game.clone()
+                                                            }
+                                                        >
+                                                            { "Clear selection" }
+                                                        </button>
+                                                    </>
+                                                },
+
+                                                Ok(None) => html! {
+                                                    <span>{ "None selected" }</span>
+                                                },
+
+                                                Err(error) => html! {
+                                                    <span
+                                                        class="interface-error"
+                                                        role="alert"
+                                                    >
+                                                        {
+                                                            format!(
+                                                                "Selection inactive: {error}"
+                                                            )
+                                                        }
+                                                    </span>
+                                                },
+                                            }
+                                        }
+                                    </dd>
+                                </div>
+
+                                <div>
                                     <dt>{ "Accepted games" }</dt>
                                     <dd>
                                         {
                                             match &accepted_games {
-                                                Ok(games) => {
-                                                    format!("{} verified", games.len())
-                                                }
-                                                Err(error) => {
-                                                    format!("Projection unavailable: {error}")
-                                                }
+                                                Ok(games) if games.is_empty() => html! {
+                                                    <span>{ "0 verified" }</span>
+                                                },
+
+                                                Ok(games) => html! {
+                                                    <>
+                                                        <span>
+                                                            {
+                                                                format!(
+                                                                    "{} verified",
+                                                                    games.len()
+                                                                )
+                                                            }
+                                                        </span>
+
+                                                        <ul
+                                                            class="available-player-list"
+                                                        >
+                                                            {
+                                                                for games.iter().map(
+                                                                    |game| {
+                                                                        let game_id =
+                                                                            game.game_id;
+
+                                                                        let is_selected =
+                                                                            matches!(
+                                                                                &selected_accepted_game,
+                                                                                Ok(Some(selected))
+                                                                                    if selected.game_id
+                                                                                        == game_id
+                                                                            );
+
+                                                                        let on_select = {
+                                                                            let selected_game_id =
+                                                                                selected_accepted_game_id
+                                                                                    .clone();
+
+                                                                            Callback::from(
+                                                                                move |_| {
+                                                                                    selected_game_id
+                                                                                        .set(
+                                                                                            Some(
+                                                                                                game_id
+                                                                                            )
+                                                                                        );
+                                                                                },
+                                                                            )
+                                                                        };
+
+                                                                        html! {
+                                                                            <li>
+                                                                                <strong>
+                                                                                    {
+                                                                                        format_player_id(
+                                                                                            &game.game_id
+                                                                                        )
+                                                                                    }
+                                                                                </strong>
+
+                                                                                <span>
+                                                                                    {
+                                                                                        format!(
+                                                                                            "Peer: {} · Role: {} · Contract: {}",
+                                                                                            format_player_id(
+                                                                                                &game.peer_id
+                                                                                            ),
+                                                                                            player_name(
+                                                                                                game.local_role
+                                                                                            ),
+                                                                                            game.contract_id,
+                                                                                        )
+                                                                                    }
+                                                                                </span>
+
+                                                                                <button
+                                                                                    type="button"
+                                                                                    class="challenge-player-button"
+                                                                                    onclick={
+                                                                                        on_select
+                                                                                    }
+                                                                                    disabled={
+                                                                                        is_selected
+                                                                                    }
+                                                                                >
+                                                                                    {
+                                                                                        if is_selected {
+                                                                                            "Selected"
+                                                                                        } else {
+                                                                                            "Select game"
+                                                                                        }
+                                                                                    }
+                                                                                </button>
+                                                                            </li>
+                                                                        }
+                                                                    }
+                                                                )
+                                                            }
+                                                        </ul>
+                                                    </>
+                                                },
+
+                                                Err(error) => html! {
+                                                    <span
+                                                        class="interface-error"
+                                                        role="alert"
+                                                    >
+                                                        {
+                                                            format!(
+                                                                "Projection unavailable: {error}"
+                                                            )
+                                                        }
+                                                    </span>
+                                                },
                                             }
                                         }
                                     </dd>

@@ -85,6 +85,39 @@ pub fn project_accepted_games(
         .collect())
 }
 
+/// Resolves volatile browser selection exclusively against the current
+/// authoritative accepted-game projection.
+///
+/// The requested game ID is only UI intent. It never becomes a usable runtime
+/// candidate unless exactly one currently verified accepted game carries that
+/// ID. Missing and ambiguous selections therefore fail closed.
+pub fn resolve_accepted_game_selection(
+    selected_game_id: Option<GameId>,
+    accepted_games: &[AcceptedGame],
+) -> Result<Option<&AcceptedGame>, String> {
+    let Some(selected_game_id) = selected_game_id else {
+        return Ok(None);
+    };
+
+    let mut matches = accepted_games
+        .iter()
+        .filter(|accepted| accepted.game_id == selected_game_id);
+
+    let Some(selected) = matches.next() else {
+        return Err("Selected game is no longer present in the authoritative \
+             accepted-game set."
+            .to_owned());
+    };
+
+    if matches.next().is_some() {
+        return Err("Selected game ID is ambiguous in the authoritative \
+             accepted-game set."
+            .to_owned());
+    }
+
+    Ok(Some(selected))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,5 +278,52 @@ mod tests {
         game_ids.sort();
 
         assert_eq!(game_ids, vec![[42; 32], [45; 32]]);
+    }
+
+    #[test]
+    fn absent_selection_resolves_to_no_runtime_candidate() {
+        assert_eq!(resolve_accepted_game_selection(None, &[]).unwrap(), None);
+    }
+
+    #[test]
+    fn exact_current_candidate_is_selected() {
+        let challenger = key(10);
+        let recipient = key(11);
+        let state = accepted_state(&challenger, &recipient, 51, 52, 53);
+
+        let accepted =
+            project_accepted_games(recipient.verifying_key().to_bytes(), &[state]).unwrap();
+
+        let selected = resolve_accepted_game_selection(Some([52; 32]), &accepted)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(selected, &accepted[0]);
+    }
+
+    #[test]
+    fn selection_missing_from_current_candidates_fails_closed() {
+        let challenger = key(12);
+        let recipient = key(13);
+        let state = accepted_state(&challenger, &recipient, 61, 62, 63);
+
+        let accepted =
+            project_accepted_games(recipient.verifying_key().to_bytes(), &[state]).unwrap();
+
+        assert!(resolve_accepted_game_selection(Some([64; 32]), &accepted).is_err());
+    }
+
+    #[test]
+    fn duplicate_game_id_selection_fails_as_ambiguous() {
+        let challenger = key(14);
+        let recipient = key(15);
+        let state = accepted_state(&challenger, &recipient, 71, 72, 73);
+
+        let accepted =
+            project_accepted_games(recipient.verifying_key().to_bytes(), &[state]).unwrap();
+
+        let duplicated = vec![accepted[0].clone(), accepted[0].clone()];
+
+        assert!(resolve_accepted_game_selection(Some([72; 32]), &duplicated).is_err());
     }
 }
