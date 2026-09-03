@@ -2,6 +2,7 @@
 mod components;
 mod game_contract_publication;
 
+pub mod accepted_game_projection;
 pub mod challenge;
 pub mod challenge_offer_planner;
 pub mod challenge_publication_store;
