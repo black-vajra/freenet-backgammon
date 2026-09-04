@@ -2420,8 +2420,18 @@ mod browser {
 
                                         let api_for_update = api_for_response.clone();
                                         let contract_for_update = contract_for_response.clone();
+                                        let scope_for_update = scope_for_response.clone();
+                                        let scope_snapshot_for_update =
+                                            scope_snapshot_for_response.clone();
 
                                         wasm_bindgen_futures::spawn_local(async move {
+                                            if !scope_for_update
+                                                .borrow()
+                                                .recognizes(&scope_snapshot_for_update)
+                                            {
+                                                return;
+                                            }
+
                                             let submit_result = {
                                                 let mut api = api_for_update.borrow_mut();
 
@@ -2443,6 +2453,13 @@ mod browser {
                                                     }
                                             };
 
+                                            if !scope_for_update
+                                                .borrow()
+                                                .recognizes(&scope_snapshot_for_update)
+                                            {
+                                                return;
+                                            }
+
                                             match submit_result {
                                                 Ok(()) => {
                                                     contract_for_update
@@ -2450,6 +2467,13 @@ mod browser {
 
                                                     gloo_timers::future::TimeoutFuture::new(750)
                                                         .await;
+
+                                                    if !scope_for_update
+                                                        .borrow()
+                                                        .recognizes(&scope_snapshot_for_update)
+                                                    {
+                                                        return;
+                                                    }
 
                                                     let refresh_result = {
                                                         let mut api = api_for_update.borrow_mut();
@@ -2466,6 +2490,13 @@ mod browser {
                                                                 ),
                                                             }
                                                     };
+
+                                                    if !scope_for_update
+                                                        .borrow()
+                                                        .recognizes(&scope_snapshot_for_update)
+                                                    {
+                                                        return;
+                                                    }
 
                                                     if let Err(error) = refresh_result {
                                                         contract_for_update.set(
@@ -2537,8 +2568,18 @@ mod browser {
 
                                         let api_for_update = api_for_response.clone();
                                         let contract_for_update = contract_for_response.clone();
+                                        let scope_for_update = scope_for_response.clone();
+                                        let scope_snapshot_for_update =
+                                            scope_snapshot_for_response.clone();
 
                                         wasm_bindgen_futures::spawn_local(async move {
+                                            if !scope_for_update
+                                                .borrow()
+                                                .recognizes(&scope_snapshot_for_update)
+                                            {
+                                                return;
+                                            }
+
                                             let submit_result = {
                                                 let mut api = api_for_update.borrow_mut();
 
@@ -2553,6 +2594,13 @@ mod browser {
                                                 }
                                             };
 
+                                            if !scope_for_update
+                                                .borrow()
+                                                .recognizes(&scope_snapshot_for_update)
+                                            {
+                                                return;
+                                            }
+
                                             match submit_result {
                                                 Ok(()) => {
                                                     contract_for_update
@@ -2560,6 +2608,13 @@ mod browser {
 
                                                     gloo_timers::future::TimeoutFuture::new(750)
                                                         .await;
+
+                                                    if !scope_for_update
+                                                        .borrow()
+                                                        .recognizes(&scope_snapshot_for_update)
+                                                    {
+                                                        return;
+                                                    }
 
                                                     let refresh_result = {
                                                         let mut api = api_for_update.borrow_mut();
@@ -2574,6 +2629,13 @@ mod browser {
                                                             )),
                                                         }
                                                     };
+
+                                                    if !scope_for_update
+                                                        .borrow()
+                                                        .recognizes(&scope_snapshot_for_update)
+                                                    {
+                                                        return;
+                                                    }
 
                                                     if let Err(error) = refresh_result {
                                                         contract_for_update.set(
@@ -3747,8 +3809,18 @@ mod browser {
 
                                         let api_for_update = api_for_response.clone();
                                         let contract_for_update = contract_for_response.clone();
+                                        let scope_for_update = scope_for_response.clone();
+                                        let scope_snapshot_for_update =
+                                            scope_snapshot_for_response.clone();
 
                                         wasm_bindgen_futures::spawn_local(async move {
+                                            if !scope_for_update
+                                                .borrow()
+                                                .recognizes(&scope_snapshot_for_update)
+                                            {
+                                                return;
+                                            }
+
                                             let submit_result = {
                                                 let mut api = api_for_update.borrow_mut();
 
@@ -3770,6 +3842,13 @@ mod browser {
                                                     }
                                             };
 
+                                            if !scope_for_update
+                                                .borrow()
+                                                .recognizes(&scope_snapshot_for_update)
+                                            {
+                                                return;
+                                            }
+
                                             match submit_result {
                                                 Ok(()) => {
                                                     contract_for_update
@@ -3777,6 +3856,13 @@ mod browser {
 
                                                     gloo_timers::future::TimeoutFuture::new(750)
                                                         .await;
+
+                                                    if !scope_for_update
+                                                        .borrow()
+                                                        .recognizes(&scope_snapshot_for_update)
+                                                    {
+                                                        return;
+                                                    }
 
                                                     let refresh_result = {
                                                         let mut api = api_for_update.borrow_mut();
@@ -3793,6 +3879,13 @@ mod browser {
                                                                 ),
                                                             }
                                                     };
+
+                                                    if !scope_for_update
+                                                        .borrow()
+                                                        .recognizes(&scope_snapshot_for_update)
+                                                    {
+                                                        return;
+                                                    }
 
                                                     if let Err(error) = refresh_result {
                                                         contract_for_update.set(
@@ -3864,8 +3957,18 @@ mod browser {
 
                                         let api_for_update = api_for_response.clone();
                                         let contract_for_update = contract_for_response.clone();
+                                        let scope_for_update = scope_for_response.clone();
+                                        let scope_snapshot_for_update =
+                                            scope_snapshot_for_response.clone();
 
                                         wasm_bindgen_futures::spawn_local(async move {
+                                            if !scope_for_update
+                                                .borrow()
+                                                .recognizes(&scope_snapshot_for_update)
+                                            {
+                                                return;
+                                            }
+
                                             let submit_result = {
                                                 let mut api = api_for_update.borrow_mut();
 
@@ -3880,6 +3983,13 @@ mod browser {
                                                 }
                                             };
 
+                                            if !scope_for_update
+                                                .borrow()
+                                                .recognizes(&scope_snapshot_for_update)
+                                            {
+                                                return;
+                                            }
+
                                             match submit_result {
                                                 Ok(()) => {
                                                     contract_for_update
@@ -3887,6 +3997,13 @@ mod browser {
 
                                                     gloo_timers::future::TimeoutFuture::new(750)
                                                         .await;
+
+                                                    if !scope_for_update
+                                                        .borrow()
+                                                        .recognizes(&scope_snapshot_for_update)
+                                                    {
+                                                        return;
+                                                    }
 
                                                     let refresh_result = {
                                                         let mut api = api_for_update.borrow_mut();
@@ -3901,6 +4018,13 @@ mod browser {
                                                             )),
                                                         }
                                                     };
+
+                                                    if !scope_for_update
+                                                        .borrow()
+                                                        .recognizes(&scope_snapshot_for_update)
+                                                    {
+                                                        return;
+                                                    }
 
                                                     if let Err(error) = refresh_result {
                                                         contract_for_update.set(
