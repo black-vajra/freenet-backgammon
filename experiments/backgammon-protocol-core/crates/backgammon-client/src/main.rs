@@ -56,6 +56,7 @@ mod browser {
     use crate::accepted_game_projection::{
         project_accepted_games, resolve_accepted_game_selection,
     };
+    use crate::active_game_scope::ActiveGameScope;
     use crate::challenge_offer_planner::{plan_outbound_challenge, OutboundChallengePlannerInput};
     use crate::challenge_publication_store::{
         load_outbound_challenge_publication, remove_outbound_challenge_publication,
@@ -1440,6 +1441,10 @@ mod browser {
          * pending actions, dice secrets, and role storage. This still targets
          * the published test contract; accepted-game activation comes later.
          */
+        let active_game_scope = use_mut_ref(|| {
+            ActiveGameScope::initial_test(TEST_CONTRACT_ID)
+                .expect("the fixed test contract ID must be a valid active-game scope")
+        });
         let active_game_contract_id = TEST_CONTRACT_ID;
         let controller = use_state(LocalGameController::new);
         let interface_error = use_state(|| None::<String>);
@@ -2071,6 +2076,7 @@ mod browser {
             let latest_contract_key = latest_contract_key.clone();
             let latest_authoritative_state = latest_authoritative_state.clone();
             let latest_lobby_contract_key = latest_lobby_contract_key.clone();
+            let active_game_scope = active_game_scope.clone();
             let lobby_contract_status = lobby_contract_status.clone();
             let lobby_subscription_status = lobby_subscription_status.clone();
             let authoritative_lobby_state = authoritative_lobby_state.clone();
@@ -2129,6 +2135,8 @@ mod browser {
                 let secret_status_for_response = dice_secret_status.clone();
                 let key_for_response = latest_contract_key.clone();
                 let state_for_response = latest_authoritative_state.clone();
+                let scope_for_response = active_game_scope.clone();
+                let scope_snapshot_for_response = scope_for_response.borrow().snapshot();
                 let lobby_state_for_response = authoritative_lobby_state.clone();
                 let lobby_key_for_response = latest_lobby_contract_key.clone();
                 let challenge_pending_for_response = challenge_publication_pending.clone();
@@ -2236,6 +2244,13 @@ mod browser {
                             &challenge_status_for_response,
                             &challenge_error_for_response,
                         ) {
+                            return;
+                        }
+
+                        if !scope_for_response
+                            .borrow()
+                            .recognizes(&scope_snapshot_for_response)
+                        {
                             return;
                         }
 
@@ -3381,6 +3396,7 @@ mod browser {
             let latest_contract_key = latest_contract_key.clone();
             let latest_authoritative_state = latest_authoritative_state.clone();
             let latest_lobby_contract_key = latest_lobby_contract_key.clone();
+            let active_game_scope = active_game_scope.clone();
             let lobby_contract_status = lobby_contract_status.clone();
             let lobby_subscription_status = lobby_subscription_status.clone();
             let authoritative_lobby_state = authoritative_lobby_state.clone();
@@ -3445,6 +3461,8 @@ mod browser {
                 let secret_status_for_response = dice_secret_status.clone();
                 let key_for_response = latest_contract_key.clone();
                 let state_for_response = latest_authoritative_state.clone();
+                let scope_for_response = active_game_scope.clone();
+                let scope_snapshot_for_response = scope_for_response.borrow().snapshot();
                 let lobby_state_for_response = authoritative_lobby_state.clone();
                 let lobby_key_for_response = latest_lobby_contract_key.clone();
                 let challenge_pending_for_response = challenge_publication_pending.clone();
@@ -3553,6 +3571,13 @@ mod browser {
                             &challenge_status_for_response,
                             &challenge_error_for_response,
                         ) {
+                            return;
+                        }
+
+                        if !scope_for_response
+                            .borrow()
+                            .recognizes(&scope_snapshot_for_response)
+                        {
                             return;
                         }
 
