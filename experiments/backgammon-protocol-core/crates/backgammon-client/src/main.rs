@@ -2936,12 +2936,21 @@ mod browser {
             let contract_status = contract_status.clone();
             let interface_error = interface_error.clone();
             let local_network_action_submitted = local_network_action_submitted.clone();
+            let scope_for_action = active_game_scope.clone();
+            let scope_snapshot_for_action = scope_for_action.borrow().snapshot();
 
             Callback::from(
                 move |(key, pending): (
                     freenet_stdlib::prelude::ContractKey,
                     crate::pending_action::PendingAction,
                 )| {
+                    if !scope_for_action
+                        .borrow()
+                        .recognizes(&scope_snapshot_for_action)
+                    {
+                        return;
+                    }
+
                     let action_id = pending.action_id;
                     let delta = pending.delta;
 
@@ -2961,8 +2970,17 @@ mod browser {
                     let api_for_update = freenet_api.clone();
                     let contract_for_update = contract_status.clone();
                     let interface_for_update = interface_error.clone();
+                    let scope_for_update = scope_for_action.clone();
+                    let scope_snapshot_for_update = scope_snapshot_for_action.clone();
 
                     wasm_bindgen_futures::spawn_local(async move {
+                        if !scope_for_update
+                            .borrow()
+                            .recognizes(&scope_snapshot_for_update)
+                        {
+                            return;
+                        }
+
                         let submit_result = {
                             let mut api = api_for_update.borrow_mut();
 
@@ -2979,11 +2997,25 @@ mod browser {
                             }
                         };
 
+                        if !scope_for_update
+                            .borrow()
+                            .recognizes(&scope_snapshot_for_update)
+                        {
+                            return;
+                        }
+
                         match submit_result {
                             Ok(()) => {
                                 contract_for_update.set(ContractProbeStatus::VerifyingUpdate);
 
                                 gloo_timers::future::TimeoutFuture::new(750).await;
+
+                                if !scope_for_update
+                                    .borrow()
+                                    .recognizes(&scope_snapshot_for_update)
+                                {
+                                    return;
+                                }
 
                                 let refresh_result = {
                                     let mut api = api_for_update.borrow_mut();
@@ -2997,6 +3029,13 @@ mod browser {
                                         ),
                                     }
                                 };
+
+                                if !scope_for_update
+                                    .borrow()
+                                    .recognizes(&scope_snapshot_for_update)
+                                {
+                                    return;
+                                }
 
                                 if let Err(error) = refresh_result {
                                     interface_for_update.set(Some(format!(
