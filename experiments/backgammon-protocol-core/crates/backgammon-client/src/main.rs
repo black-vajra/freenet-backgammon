@@ -2256,9 +2256,10 @@ mod browser {
                             return;
                         }
 
-                        if let Some(classified) =
-                            classify_response(response, active_game_contract_id)
-                        {
+                        if let Some(classified) = classify_response(
+                            response,
+                            scope_snapshot_for_response.contract_id.as_str(),
+                        ) {
                             let ClassifiedResponse {
                                 contract_status,
                                 subscription_status,
@@ -2351,7 +2352,7 @@ mod browser {
                                 };
 
                                 let plan = match plan_browser_network_action(
-                                    active_game_contract_id,
+                                    scope_snapshot_for_response.contract_id.as_str(),
                                     &state_bytes,
                                     local_player,
                                 ) {
@@ -2441,7 +2442,7 @@ mod browser {
                                                         Some(api) => {
                                                             submit_action_delta(
                                                                 api,
-                                                                active_game_contract_id,
+                                                                scope_snapshot_for_update.contract_id.as_str(),
                                                                 key,
                                                                 delta,
                                                             )
@@ -2482,7 +2483,7 @@ mod browser {
 
                                                         match api.as_mut() {
                                                                 Some(api) => {
-                                                                    request_contract(api, active_game_contract_id)
+                                                                    request_contract(api, scope_snapshot_for_update.contract_id.as_str())
                                                                         .await
                                                                 }
 
@@ -2587,7 +2588,7 @@ mod browser {
 
                                                 match api.as_mut() {
                                                     Some(api) => {
-                                                        submit_action_delta(api, active_game_contract_id, key, delta).await
+                                                        submit_action_delta(api, scope_snapshot_for_update.contract_id.as_str(), key, delta).await
                                                     }
 
                                                     None => Err(format!(
@@ -2623,7 +2624,7 @@ mod browser {
 
                                                         match api.as_mut() {
                                                             Some(api) => {
-                                                                request_contract(api, active_game_contract_id).await
+                                                                request_contract(api, scope_snapshot_for_update.contract_id.as_str()).await
                                                             }
 
                                                             None => Err(format!(
@@ -2702,7 +2703,7 @@ mod browser {
                                             .recognizes(&scope_snapshot_for_request);
 
                                         let game_result = if request_game {
-                                            request_contract(api, active_game_contract_id).await
+                                            request_contract(api, scope_snapshot_for_request.contract_id.as_str()).await
                                         } else {
                                             Ok(())
                                         };
@@ -3009,8 +3010,13 @@ mod browser {
 
                             match api.as_mut() {
                                 Some(api) => {
-                                    submit_action_delta(api, active_game_contract_id, key, delta)
-                                        .await
+                                    submit_action_delta(
+                                        api,
+                                        scope_snapshot_for_update.contract_id.as_str(),
+                                        key,
+                                        delta,
+                                    )
+                                    .await
                                 }
 
                                 None => Err(
@@ -3044,7 +3050,7 @@ mod browser {
                                     let mut api = api_for_update.borrow_mut();
 
                                     match api.as_mut() {
-                                        Some(api) => request_contract(api, active_game_contract_id).await,
+                                        Some(api) => request_contract(api, scope_snapshot_for_update.contract_id.as_str()).await,
 
                                         None => Err(
                                             "Freenet connection closed before pending action verification."
@@ -3707,9 +3713,10 @@ mod browser {
                             return;
                         }
 
-                        if let Some(classified) =
-                            classify_response(response, active_game_contract_id)
-                        {
+                        if let Some(classified) = classify_response(
+                            response,
+                            scope_snapshot_for_response.contract_id.as_str(),
+                        ) {
                             let ClassifiedResponse {
                                 contract_status,
                                 subscription_status,
@@ -3802,7 +3809,7 @@ mod browser {
                                 };
 
                                 let plan = match plan_browser_network_action(
-                                    active_game_contract_id,
+                                    scope_snapshot_for_response.contract_id.as_str(),
                                     &state_bytes,
                                     local_player,
                                 ) {
@@ -3892,7 +3899,7 @@ mod browser {
                                                         Some(api) => {
                                                             submit_action_delta(
                                                                 api,
-                                                                active_game_contract_id,
+                                                                scope_snapshot_for_update.contract_id.as_str(),
                                                                 key,
                                                                 delta,
                                                             )
@@ -3933,7 +3940,7 @@ mod browser {
 
                                                         match api.as_mut() {
                                                                 Some(api) => {
-                                                                    request_contract(api, active_game_contract_id)
+                                                                    request_contract(api, scope_snapshot_for_update.contract_id.as_str())
                                                                         .await
                                                                 }
 
@@ -4038,7 +4045,7 @@ mod browser {
 
                                                 match api.as_mut() {
                                                     Some(api) => {
-                                                        submit_action_delta(api, active_game_contract_id, key, delta).await
+                                                        submit_action_delta(api, scope_snapshot_for_update.contract_id.as_str(), key, delta).await
                                                     }
 
                                                     None => Err(format!(
@@ -4074,7 +4081,7 @@ mod browser {
 
                                                         match api.as_mut() {
                                                             Some(api) => {
-                                                                request_contract(api, active_game_contract_id).await
+                                                                request_contract(api, scope_snapshot_for_update.contract_id.as_str()).await
                                                             }
 
                                                             None => Err(format!(
@@ -4152,7 +4159,7 @@ mod browser {
                                             .recognizes(&scope_snapshot_for_request);
 
                                         let game_result = if request_game {
-                                            request_contract(api, active_game_contract_id).await
+                                            request_contract(api, scope_snapshot_for_request.contract_id.as_str()).await
                                         } else {
                                             Ok(())
                                         };
