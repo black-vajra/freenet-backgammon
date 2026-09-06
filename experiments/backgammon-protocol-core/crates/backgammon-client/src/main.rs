@@ -54,7 +54,7 @@ mod browser {
     use yew::TargetCast;
 
     use crate::accepted_game_projection::{
-        project_accepted_games, resolve_accepted_game_selection,
+        project_accepted_games, resolve_accepted_game_selection, AcceptedGame,
     };
     use crate::active_game_scope::{ActiveGameScope, ActiveGameScopeSnapshot};
     use crate::challenge_offer_planner::{plan_outbound_challenge, OutboundChallengePlannerInput};
@@ -1357,6 +1357,31 @@ mod browser {
         }
     }
 
+    fn ensure_accepted_local_role(contract_id: &str, accepted_role: Player) -> Result<(), String> {
+        match load_local_role(contract_id)? {
+            Some(existing) if existing == accepted_role => Ok(()),
+
+            Some(existing) => Err(format!(
+                concat!(
+                    "Accepted game assigns this browser as {}, but browser storage ",
+                    "is already locked as {} for that contract.",
+                ),
+                player_name(accepted_role),
+                player_name(existing),
+            )),
+
+            None => {
+                if load_pending_action(contract_id)?.is_some() {
+                    return Err(
+                        "Accepted game has a pending action but no stored local role.".to_owned(),
+                    );
+                }
+
+                store_local_role(contract_id, accepted_role)
+            }
+        }
+    }
+
     fn contract_id_for_scope_snapshot<'a>(
         scope: &Rc<RefCell<ActiveGameScope>>,
         snapshot: &'a ActiveGameScopeSnapshot,
@@ -1450,9 +1475,9 @@ mod browser {
     #[function_component(App)]
     fn app() -> Html {
         /*
-         * One behavior-preserving scope for all game transport, durable
-         * pending actions, dice secrets, and role storage. This still targets
-         * the published test contract; accepted-game activation comes later.
+         * The browser begins in the published test-contract compatibility
+         * scope. Explicit accepted-game activation replaces this scope before
+         * reconnecting transport and invalidates all prior async snapshots.
          */
         let active_game_scope = use_mut_ref(|| {
             ActiveGameScope::initial_test(TEST_CONTRACT_ID)
@@ -1492,6 +1517,8 @@ mod browser {
          * current verified authoritative accepted-game projection.
          */
         let selected_accepted_game_id = use_state(|| None::<[u8; 32]>);
+        let accepted_game_activation_status =
+            use_state(|| "Using the initial test contract".to_owned());
 
         /*
          * Verified authoritative lobby state is separate from local profile
@@ -4889,9 +4916,8 @@ mod browser {
 
         /*
          * Accepted games are projected from the complete verified lobby state
-         * without consulting the browser clock. This is a read-only runtime
-         * candidate set; it does not yet select a game, retarget transport, or
-         * replace the fixed test contract.
+         * without consulting the browser clock. Selection remains harmless UI
+         * intent until the user explicitly activates one verified candidate.
          */
         let accepted_games = match (*local_player_id, (*authoritative_lobby_state).as_ref()) {
             (Some(player_id), Some(state)) => {
@@ -4912,6 +4938,93 @@ mod browser {
             (Ok(games), Some(game_id)) => resolve_accepted_game_selection(Some(game_id), games),
 
             (Err(error), Some(_)) => Err(format!("Accepted-game projection failed: {error}")),
+        };
+
+        let selected_for_activation: Result<Option<AcceptedGame>, String> =
+            match &selected_accepted_game {
+                Ok(Some(game)) => Ok(Some((**game).clone())),
+                Ok(None) => Ok(None),
+                Err(error) => Err(error.clone()),
+            };
+
+        let selected_game_is_active = match &selected_accepted_game {
+            Ok(Some(selected)) => {
+                active_game_scope
+                    .borrow()
+                    .accepted_game()
+                    .is_some_and(|active| {
+                        active.game_id == selected.game_id
+                            && active.contract_id == selected.contract_id
+                    })
+            }
+
+            _ => false,
+        };
+
+        let on_activate_accepted_game = {
+            let selected = selected_for_activation.clone();
+            let local_player_id = local_player_id.clone();
+            let active_game_scope = active_game_scope.clone();
+            let local_role = local_role.clone();
+            let controller = controller.clone();
+            let interface_error = interface_error.clone();
+            let pending_confirmation = pending_confirmation.clone();
+            let local_dice_secret = local_dice_secret.clone();
+            let activation_status = accepted_game_activation_status.clone();
+            let reconnect = on_reconnect.clone();
+
+            Callback::from(move |event| {
+                let activation = (|| -> Result<(ActiveGameScope, AcceptedGame), String> {
+                    let player_id = (*local_player_id)
+                        .ok_or_else(|| "Persistent local identity is unavailable.".to_owned())?;
+
+                    let accepted = selected
+                        .clone()?
+                        .ok_or_else(|| "No authoritative accepted game is selected.".to_owned())?;
+
+                    let next_scope = active_game_scope
+                        .borrow()
+                        .activate_accepted(player_id, &accepted)?;
+
+                    ensure_accepted_local_role(next_scope.contract_id(), accepted.local_role)?;
+
+                    Ok((next_scope, accepted))
+                })();
+
+                match activation {
+                    Ok((next_scope, accepted)) => {
+                        *active_game_scope.borrow_mut() = next_scope;
+
+                        controller.set(LocalGameController::new());
+                        pending_confirmation.set(None);
+                        local_dice_secret.borrow_mut().take();
+                        local_role.set(Ok(Some(accepted.local_role)));
+                        interface_error.set(None);
+
+                        activation_status.set(format!(
+                            "Activated game {}; reconnecting to contract {}",
+                            format_player_id(&accepted.game_id),
+                            accepted.contract_id,
+                        ));
+
+                        /*
+                         * Reconnect snapshots the scope when invoked. Because
+                         * the new scope is installed above, the replacement
+                         * callbacks and initial request bind to its epoch and
+                         * contract ID.
+                         */
+                        reconnect.emit(event);
+                    }
+
+                    Err(error) => {
+                        activation_status.set(format!("Activation refused: {error}"));
+
+                        interface_error.set(Some(format!(
+                            "Accepted game could not be activated: {error}"
+                        )));
+                    }
+                }
+            })
         };
 
         let on_clear_accepted_game = {
@@ -5640,6 +5753,25 @@ mod browser {
                                                             type="button"
                                                             class="challenge-player-button"
                                                             onclick={
+                                                                on_activate_accepted_game.clone()
+                                                            }
+                                                            disabled={
+                                                                selected_game_is_active
+                                                            }
+                                                        >
+                                                            {
+                                                                if selected_game_is_active {
+                                                                    "Active game"
+                                                                } else {
+                                                                    "Activate game"
+                                                                }
+                                                            }
+                                                        </button>
+
+                                                        <button
+                                                            type="button"
+                                                            class="challenge-player-button"
+                                                            onclick={
                                                                 on_clear_accepted_game.clone()
                                                             }
                                                         >
@@ -5665,6 +5797,16 @@ mod browser {
                                                     </span>
                                                 },
                                             }
+                                        }
+                                    </dd>
+                                </div>
+
+                                <div>
+                                    <dt>{ "Game activation" }</dt>
+                                    <dd>
+                                        {
+                                            (*accepted_game_activation_status)
+                                                .clone()
                                         }
                                     </dd>
                                 </div>
