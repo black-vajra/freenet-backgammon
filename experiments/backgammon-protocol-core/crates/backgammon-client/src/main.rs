@@ -56,7 +56,7 @@ mod browser {
     use crate::accepted_game_projection::{
         project_accepted_games, resolve_accepted_game_selection,
     };
-    use crate::active_game_scope::ActiveGameScope;
+    use crate::active_game_scope::{ActiveGameScope, ActiveGameScopeSnapshot};
     use crate::challenge_offer_planner::{plan_outbound_challenge, OutboundChallengePlannerInput};
     use crate::challenge_publication_store::{
         load_outbound_challenge_publication, remove_outbound_challenge_publication,
@@ -1357,6 +1357,19 @@ mod browser {
         }
     }
 
+    fn contract_id_for_scope_snapshot<'a>(
+        scope: &Rc<RefCell<ActiveGameScope>>,
+        snapshot: &'a ActiveGameScopeSnapshot,
+    ) -> Result<&'a str, String> {
+        if !scope.borrow().recognizes(snapshot) {
+            return Err(
+                "Active game changed before the browser action could be prepared.".to_owned(),
+            );
+        }
+
+        Ok(snapshot.contract_id.as_str())
+    }
+
     fn player_name(player: Player) -> &'static str {
         match player {
             Player::White => "White",
@@ -1445,7 +1458,8 @@ mod browser {
             ActiveGameScope::initial_test(TEST_CONTRACT_ID)
                 .expect("the fixed test contract ID must be a valid active-game scope")
         });
-        let active_game_contract_id = TEST_CONTRACT_ID;
+        let active_game_scope_snapshot = active_game_scope.borrow().snapshot();
+        let initial_game_contract_id = active_game_scope_snapshot.contract_id.clone();
         let controller = use_state(LocalGameController::new);
         let interface_error = use_state(|| None::<String>);
         let pending_confirmation = use_state(|| None::<PendingConfirmation>);
@@ -1546,7 +1560,7 @@ mod browser {
          * An invalid stored value is retained as an error rather than silently
          * converted into a player role.
          */
-        let local_role = use_state(move || load_local_role(active_game_contract_id));
+        let local_role = use_state(move || load_local_role(initial_game_contract_id.as_str()));
 
         let selected_local_role = match &*local_role {
             Ok(role) => *role,
@@ -2767,7 +2781,8 @@ mod browser {
         let left_table = controller.has_left_table();
         let session_active = controller.is_active();
 
-        let pending_role_check = load_pending_action(active_game_contract_id);
+        let pending_role_check =
+            load_pending_action(active_game_scope_snapshot.contract_id.as_str());
 
         let no_pending_action = matches!(&pending_role_check, Ok(None));
 
@@ -2920,9 +2935,15 @@ mod browser {
         let on_select_white = {
             let local_role = local_role.clone();
             let interface_error = interface_error.clone();
+            let scope_for_role = active_game_scope.clone();
+            let scope_snapshot_for_role = active_game_scope_snapshot.clone();
 
             Callback::from(move |_| {
-                match choose_local_role(active_game_contract_id, Player::White) {
+                let selection =
+                    contract_id_for_scope_snapshot(&scope_for_role, &scope_snapshot_for_role)
+                        .and_then(|contract_id| choose_local_role(contract_id, Player::White));
+
+                match selection {
                     Ok(()) => {
                         interface_error.set(None);
                         local_role.set(Ok(Some(Player::White)));
@@ -2939,9 +2960,15 @@ mod browser {
         let on_select_black = {
             let local_role = local_role.clone();
             let interface_error = interface_error.clone();
+            let scope_for_role = active_game_scope.clone();
+            let scope_snapshot_for_role = active_game_scope_snapshot.clone();
 
             Callback::from(move |_| {
-                match choose_local_role(active_game_contract_id, Player::Black) {
+                let selection =
+                    contract_id_for_scope_snapshot(&scope_for_role, &scope_snapshot_for_role)
+                        .and_then(|contract_id| choose_local_role(contract_id, Player::Black));
+
+                match selection {
                     Ok(()) => {
                         interface_error.set(None);
                         local_role.set(Ok(Some(Player::Black)));
@@ -3098,6 +3125,8 @@ mod browser {
             let latest_authoritative_state = latest_authoritative_state.clone();
             let submit_pending_secretless_action = submit_pending_secretless_action.clone();
             let authoritative_player_role = authoritative_player_role;
+            let scope_for_planning = active_game_scope.clone();
+            let scope_snapshot_for_planning = active_game_scope_snapshot.clone();
 
             Callback::from(move |_| {
                 let prepared = (|| -> Result<
@@ -3120,7 +3149,15 @@ mod browser {
                         .clone()
                         .ok_or_else(|| "No verified authoritative parent state is available.".to_owned())?;
 
-                    match plan_browser_request_roll(active_game_contract_id, &state_bytes, local_player, true)? {
+                    match plan_browser_request_roll(
+                        contract_id_for_scope_snapshot(
+                            &scope_for_planning,
+                            &scope_snapshot_for_planning,
+                        )?,
+                        &state_bytes,
+                        local_player,
+                        true,
+                    )? {
                         RequestRollPlan::Submit {
                             pending,
                             recovered_pending: false,
@@ -3165,6 +3202,8 @@ mod browser {
             let latest_authoritative_state = latest_authoritative_state.clone();
             let submit_pending_secretless_action = submit_pending_secretless_action.clone();
             let authoritative_player_role = authoritative_player_role;
+            let scope_for_planning = active_game_scope.clone();
+            let scope_snapshot_for_planning = active_game_scope_snapshot.clone();
 
             Callback::from(move |_| {
                 let mut next = (*controller).clone();
@@ -3207,7 +3246,10 @@ mod browser {
                         })?;
 
                     match plan_browser_play_turn(
-                        active_game_contract_id,
+                        contract_id_for_scope_snapshot(
+                            &scope_for_planning,
+                            &scope_snapshot_for_planning,
+                        )?,
                         &state_bytes,
                         local_player,
                         Some(&sequence),
@@ -3278,6 +3320,8 @@ mod browser {
             let latest_authoritative_state = latest_authoritative_state.clone();
             let submit_pending_secretless_action = submit_pending_secretless_action.clone();
             let authoritative_player_role = authoritative_player_role;
+            let scope_for_planning = active_game_scope.clone();
+            let scope_snapshot_for_planning = active_game_scope_snapshot.clone();
 
             Callback::from(move |destination: MoveTarget| {
                 let mut next = (*controller).clone();
@@ -3324,7 +3368,10 @@ mod browser {
                                     })?;
 
                             match plan_browser_play_turn(
-                                active_game_contract_id,
+                                contract_id_for_scope_snapshot(
+                                    &scope_for_planning,
+                                    &scope_snapshot_for_planning,
+                                )?,
                                 &state_bytes,
                                 local_player,
                                 Some(&sequence),
