@@ -2137,6 +2137,8 @@ mod browser {
                 let state_for_response = latest_authoritative_state.clone();
                 let scope_for_response = active_game_scope.clone();
                 let scope_snapshot_for_response = scope_for_response.borrow().snapshot();
+                let scope_for_request = active_game_scope.clone();
+                let scope_snapshot_for_request = scope_for_request.borrow().snapshot();
                 let lobby_state_for_response = authoritative_lobby_state.clone();
                 let lobby_key_for_response = latest_lobby_contract_key.clone();
                 let challenge_pending_for_response = challenge_publication_pending.clone();
@@ -2675,10 +2677,17 @@ mod browser {
                         let subscription_for_request = subscription_for_open.clone();
                         let lobby_contract_for_request = lobby_contract_for_open.clone();
                         let lobby_subscription_for_request = lobby_subscription_for_open.clone();
+                        let scope_for_request = scope_for_request.clone();
+                        let scope_snapshot_for_request = scope_snapshot_for_request.clone();
 
                         wasm_bindgen_futures::spawn_local(async move {
-                            contract_for_request.set(ContractProbeStatus::Requesting);
-                            subscription_for_request.set(SubscriptionStatus::Pending);
+                            if scope_for_request
+                                .borrow()
+                                .recognizes(&scope_snapshot_for_request)
+                            {
+                                contract_for_request.set(ContractProbeStatus::Requesting);
+                                subscription_for_request.set(SubscriptionStatus::Pending);
+                            }
 
                             lobby_contract_for_request.set(LobbyContractStatus::Requesting);
                             lobby_subscription_for_request.set(SubscriptionStatus::Pending);
@@ -2688,8 +2697,16 @@ mod browser {
 
                                 match api.as_mut() {
                                     Some(api) => {
-                                        let game_result =
-                                            request_contract(api, active_game_contract_id).await;
+                                        let request_game = scope_for_request
+                                            .borrow()
+                                            .recognizes(&scope_snapshot_for_request);
+
+                                        let game_result = if request_game {
+                                            request_contract(api, active_game_contract_id).await
+                                        } else {
+                                            Ok(())
+                                        };
+
                                         let lobby_result =
                                             request_lobby_contract(api).await;
 
@@ -2709,10 +2726,16 @@ mod browser {
                                 }
                             };
 
-                            if let Err(error) = game_result {
-                                connection_for_request.set(ConnectionStatus::Failed(error.clone()));
-                                contract_for_request.set(ContractProbeStatus::Failed(error));
-                                subscription_for_request.set(SubscriptionStatus::Inactive);
+                            if scope_for_request
+                                .borrow()
+                                .recognizes(&scope_snapshot_for_request)
+                            {
+                                if let Err(error) = game_result {
+                                    connection_for_request
+                                        .set(ConnectionStatus::Failed(error.clone()));
+                                    contract_for_request.set(ContractProbeStatus::Failed(error));
+                                    subscription_for_request.set(SubscriptionStatus::Inactive);
+                                }
                             }
 
                             if let Err(error) = lobby_result {
@@ -3564,6 +3587,8 @@ mod browser {
                 let state_for_response = latest_authoritative_state.clone();
                 let scope_for_response = active_game_scope.clone();
                 let scope_snapshot_for_response = scope_for_response.borrow().snapshot();
+                let scope_for_request = active_game_scope.clone();
+                let scope_snapshot_for_request = scope_for_request.borrow().snapshot();
                 let lobby_state_for_response = authoritative_lobby_state.clone();
                 let lobby_key_for_response = latest_lobby_contract_key.clone();
                 let challenge_pending_for_response = challenge_publication_pending.clone();
@@ -4102,10 +4127,17 @@ mod browser {
                         let subscription_for_request = subscription_for_open.clone();
                         let lobby_contract_for_request = lobby_contract_for_open.clone();
                         let lobby_subscription_for_request = lobby_subscription_for_open.clone();
+                        let scope_for_request = scope_for_request.clone();
+                        let scope_snapshot_for_request = scope_snapshot_for_request.clone();
 
                         wasm_bindgen_futures::spawn_local(async move {
-                            contract_for_request.set(ContractProbeStatus::Requesting);
-                            subscription_for_request.set(SubscriptionStatus::Pending);
+                            if scope_for_request
+                                .borrow()
+                                .recognizes(&scope_snapshot_for_request)
+                            {
+                                contract_for_request.set(ContractProbeStatus::Requesting);
+                                subscription_for_request.set(SubscriptionStatus::Pending);
+                            }
 
                             lobby_contract_for_request.set(LobbyContractStatus::Requesting);
                             lobby_subscription_for_request.set(SubscriptionStatus::Pending);
@@ -4115,8 +4147,16 @@ mod browser {
 
                                 match api.as_mut() {
                                     Some(api) => {
-                                        let game_result =
-                                            request_contract(api, active_game_contract_id).await;
+                                        let request_game = scope_for_request
+                                            .borrow()
+                                            .recognizes(&scope_snapshot_for_request);
+
+                                        let game_result = if request_game {
+                                            request_contract(api, active_game_contract_id).await
+                                        } else {
+                                            Ok(())
+                                        };
+
                                         let lobby_result =
                                             request_lobby_contract(api).await;
 
@@ -4136,10 +4176,16 @@ mod browser {
                                 }
                             };
 
-                            if let Err(error) = game_result {
-                                connection_for_request.set(ConnectionStatus::Failed(error.clone()));
-                                contract_for_request.set(ContractProbeStatus::Failed(error));
-                                subscription_for_request.set(SubscriptionStatus::Inactive);
+                            if scope_for_request
+                                .borrow()
+                                .recognizes(&scope_snapshot_for_request)
+                            {
+                                if let Err(error) = game_result {
+                                    connection_for_request
+                                        .set(ConnectionStatus::Failed(error.clone()));
+                                    contract_for_request.set(ContractProbeStatus::Failed(error));
+                                    subscription_for_request.set(SubscriptionStatus::Inactive);
+                                }
                             }
 
                             if let Err(error) = lobby_result {
