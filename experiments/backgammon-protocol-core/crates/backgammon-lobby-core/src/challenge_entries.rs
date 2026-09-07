@@ -14,9 +14,9 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
-/// Acceptance, decline, and cancellation are the only terminal evidence kinds
-/// in challenge protocol version 1.
-pub const MAX_TERMINAL_EVIDENCE_PER_OFFER: usize = 3;
+/// Acceptance, decline, cancellation, and the two role-bound genesis
+/// signature shares are the authenticated evidence kinds retained per offer.
+pub const MAX_TERMINAL_EVIDENCE_PER_OFFER: usize = 5;
 
 /// Maximum retained challenge offers from one challenger.
 pub const MAX_CHALLENGE_OFFERS_PER_CHALLENGER: usize = 16;
@@ -51,6 +51,8 @@ fn terminal_kind(evidence: &ChallengeTerminalEvidence) -> u8 {
         ChallengeTerminalEvidence::Acceptance(_) => 0,
         ChallengeTerminalEvidence::Decline(_) => 1,
         ChallengeTerminalEvidence::Cancellation(_) => 2,
+        ChallengeTerminalEvidence::WhiteGenesisShare(_) => 3,
+        ChallengeTerminalEvidence::BlackGenesisShare(_) => 4,
     }
 }
 
@@ -59,6 +61,8 @@ fn terminal_signature(evidence: &ChallengeTerminalEvidence) -> &[u8] {
         ChallengeTerminalEvidence::Acceptance(value) => value.signature.as_bytes(),
         ChallengeTerminalEvidence::Decline(value) => value.signature.as_bytes(),
         ChallengeTerminalEvidence::Cancellation(value) => value.signature.as_bytes(),
+        ChallengeTerminalEvidence::WhiteGenesisShare(value)
+        | ChallengeTerminalEvidence::BlackGenesisShare(value) => value.signature.as_bytes(),
     }
 }
 
@@ -146,9 +150,11 @@ impl ChallengeOfferState {
     pub fn evidence_mask(&self) -> u8 {
         self.terminal_evidence.iter().fold(0_u8, |mask, evidence| {
             mask | match evidence {
-                ChallengeTerminalEvidence::Acceptance(_) => 0b001,
-                ChallengeTerminalEvidence::Decline(_) => 0b010,
-                ChallengeTerminalEvidence::Cancellation(_) => 0b100,
+                ChallengeTerminalEvidence::Acceptance(_) => 0b00001,
+                ChallengeTerminalEvidence::Decline(_) => 0b00010,
+                ChallengeTerminalEvidence::Cancellation(_) => 0b00100,
+                ChallengeTerminalEvidence::WhiteGenesisShare(_) => 0b01000,
+                ChallengeTerminalEvidence::BlackGenesisShare(_) => 0b10000,
             }
         })
     }
@@ -649,7 +655,8 @@ mod tests {
     use super::*;
     use backgammon_protocol::{
         accept_challenge, cancel_challenge, decline_challenge, sign_challenge_offer,
-        ChallengeOfferBody, GameConfiguration, GenesisProposal, PlayerDescriptor,
+        sign_genesis_proposal, ChallengeOfferBody, GameConfiguration, GenesisProposal,
+        PlayerDescriptor,
     };
     use ed25519_dalek::SigningKey;
 
@@ -797,6 +804,77 @@ mod tests {
             ciborium::de::from_reader(encoded.as_slice()).unwrap();
 
         assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn genesis_shares_merge_and_synchronize_convergently() {
+        let (offer, white_key, black_key) = fixture(56);
+        let proposal = offer.body.proposal.clone();
+        let acceptance = accept_challenge(&offer, &black_key, CREATED + 1).unwrap();
+        let white_share = sign_genesis_proposal(&proposal, &white_key).unwrap();
+        let black_share = sign_genesis_proposal(&proposal, &black_key).unwrap();
+
+        let white_state = ChallengeOfferState::new(
+            offer.clone(),
+            vec![
+                ChallengeTerminalEvidence::Acceptance(acceptance.clone()),
+                ChallengeTerminalEvidence::WhiteGenesisShare(white_share),
+            ],
+        )
+        .unwrap();
+
+        let black_state = ChallengeOfferState::new(
+            offer,
+            vec![
+                ChallengeTerminalEvidence::BlackGenesisShare(black_share),
+                ChallengeTerminalEvidence::Acceptance(acceptance),
+            ],
+        )
+        .unwrap();
+
+        let mut forward = white_state.clone();
+        forward.merge_from(&black_state).unwrap();
+
+        let mut reverse = black_state;
+        reverse.merge_from(&white_state).unwrap();
+
+        assert_eq!(forward, reverse);
+        assert_eq!(forward.terminal_evidence.len(), 3);
+        assert_eq!(forward.evidence_mask(), 0b11001);
+        assert_eq!(
+            forward.resolution().unwrap(),
+            ChallengeResolution::Accepted {
+                proposal: proposal.clone(),
+            }
+        );
+
+        let mut receiver = ChallengeEntries::new(vec![white_state]).unwrap();
+        let sender = ChallengeEntries::new(vec![forward.clone()]).unwrap();
+
+        let receiver_summary = receiver.retention_summary().unwrap();
+
+        assert_eq!(
+            receiver_summary.offers[0]
+                .terminal_evidence
+                .iter()
+                .map(|evidence| evidence.kind)
+                .collect::<Vec<_>>(),
+            vec![0, 3]
+        );
+
+        let delta = sender
+            .delta_from_summary(&receiver_summary)
+            .unwrap()
+            .expect("Black's missing share must produce a delta");
+
+        assert_eq!(delta.offers, vec![forward]);
+        receiver.apply_challenge_delta(&delta).unwrap();
+        assert_eq!(receiver, sender);
+
+        assert!(sender
+            .delta_from_summary(&receiver.retention_summary().unwrap(),)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

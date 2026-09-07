@@ -3,10 +3,16 @@ use crate::challenge::{
     verify_challenge_decline, verify_challenge_offer, ChallengeAcceptance, ChallengeCancellation,
     ChallengeDecline, SignedChallengeOffer,
 };
-use crate::genesis_handshake::GenesisProposal;
+use crate::genesis_handshake::{
+    verify_genesis_signature_share, GenesisProposal, GenesisSignatureShare,
+};
 use serde::{Deserialize, Serialize};
 
-/// Authenticated terminal evidence received for one exact challenge.
+/// Authenticated evidence received for one exact challenge.
+///
+/// The first three variants retain their established serialized identities.
+/// Genesis-share variants are appended so existing signed offer and acceptance
+/// bodies remain unchanged.
 ///
 /// Transport delivery order is deliberately absent from this representation.
 /// Freenet peers may observe these messages in different orders.
@@ -15,6 +21,8 @@ pub enum ChallengeTerminalEvidence {
     Acceptance(ChallengeAcceptance),
     Decline(ChallengeDecline),
     Cancellation(ChallengeCancellation),
+    WhiteGenesisShare(GenesisSignatureShare),
+    BlackGenesisShare(GenesisSignatureShare),
 }
 
 /// Deterministic local interpretation of all authenticated evidence known for
@@ -55,6 +63,7 @@ pub fn resolve_challenge(
     let mut acceptance: Option<&ChallengeAcceptance> = None;
     let mut saw_decline = false;
     let mut saw_cancellation = false;
+    let mut saw_genesis_share = false;
 
     for item in evidence {
         match item {
@@ -75,10 +84,42 @@ pub fn resolve_challenge(
                 verify_challenge_cancellation(offer, value)?;
                 saw_cancellation = true;
             }
+
+            ChallengeTerminalEvidence::WhiteGenesisShare(value) => {
+                verify_genesis_signature_share(&offer.body.proposal, value)?;
+
+                if value.player_id != offer.body.proposal.configuration.white.id {
+                    return Err("White genesis-share evidence was not signed by White.".to_owned());
+                }
+
+                saw_genesis_share = true;
+            }
+
+            ChallengeTerminalEvidence::BlackGenesisShare(value) => {
+                verify_genesis_signature_share(&offer.body.proposal, value)?;
+
+                if value.player_id != offer.body.proposal.configuration.black.id {
+                    return Err("Black genesis-share evidence was not signed by Black.".to_owned());
+                }
+
+                saw_genesis_share = true;
+            }
         }
     }
 
     let saw_acceptance = acceptance.is_some();
+
+    /*
+     * A genesis share is meaningful only after the recipient has authenticated
+     * acceptance of this exact offer. This checks for acceptance evidence, not
+     * the final resolution, so later cancellation or conflict evidence remains
+     * closed under convergent merge.
+     */
+    if saw_genesis_share && !saw_acceptance {
+        return Err(
+            "Genesis-share evidence requires an authenticated challenge acceptance.".to_owned(),
+        );
+    }
 
     /*
      * A recipient that authenticates both Acceptance and Decline has produced
@@ -141,7 +182,7 @@ mod tests {
         accept_challenge, cancel_challenge, decline_challenge, sign_challenge_offer,
         ChallengeOfferBody,
     };
-    use crate::{GameConfiguration, PlayerDescriptor};
+    use crate::{sign_genesis_proposal, GameConfiguration, PlayerDescriptor};
     use ed25519_dalek::SigningKey;
 
     const CREATED: u64 = 10_000;
@@ -209,10 +250,18 @@ mod tests {
 
     #[test]
     fn terminal_evidence_round_trips_through_cbor() {
-        let (offer, white_key, black_key, _) = fixture();
+        let (offer, white_key, black_key, proposal) = fixture();
         let (acceptance, decline, cancellation) = terminal_evidence(&offer, &white_key, &black_key);
+        let white_share = sign_genesis_proposal(&proposal, &white_key).unwrap();
+        let black_share = sign_genesis_proposal(&proposal, &black_key).unwrap();
 
-        for expected in [acceptance, decline, cancellation] {
+        for expected in [
+            acceptance,
+            decline,
+            cancellation,
+            ChallengeTerminalEvidence::WhiteGenesisShare(white_share),
+            ChallengeTerminalEvidence::BlackGenesisShare(black_share),
+        ] {
             let mut encoded = Vec::new();
             ciborium::ser::into_writer(&expected, &mut encoded).unwrap();
 
@@ -259,6 +308,66 @@ mod tests {
                 .unwrap(),
             ChallengeResolution::Accepted { proposal: expected }
         );
+    }
+
+    #[test]
+    fn accepted_genesis_shares_resolve_in_either_delivery_order() {
+        let (offer, white_key, black_key, proposal) = fixture();
+        let acceptance = accept_challenge(&offer, &black_key, CREATED + 1).unwrap();
+        let white_share = sign_genesis_proposal(&proposal, &white_key).unwrap();
+        let black_share = sign_genesis_proposal(&proposal, &black_key).unwrap();
+
+        for evidence in [
+            vec![
+                ChallengeTerminalEvidence::Acceptance(acceptance.clone()),
+                ChallengeTerminalEvidence::WhiteGenesisShare(white_share.clone()),
+                ChallengeTerminalEvidence::BlackGenesisShare(black_share.clone()),
+            ],
+            vec![
+                ChallengeTerminalEvidence::BlackGenesisShare(black_share.clone()),
+                ChallengeTerminalEvidence::Acceptance(acceptance.clone()),
+                ChallengeTerminalEvidence::WhiteGenesisShare(white_share.clone()),
+            ],
+        ] {
+            assert_eq!(
+                resolve_challenge(&offer, &evidence).unwrap(),
+                ChallengeResolution::Accepted {
+                    proposal: proposal.clone(),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn genesis_share_without_acceptance_is_rejected() {
+        let (offer, white_key, _, proposal) = fixture();
+        let white_share = sign_genesis_proposal(&proposal, &white_key).unwrap();
+
+        let error = resolve_challenge(
+            &offer,
+            &[ChallengeTerminalEvidence::WhiteGenesisShare(white_share)],
+        )
+        .unwrap_err();
+
+        assert!(error.contains("requires an authenticated challenge acceptance"));
+    }
+
+    #[test]
+    fn genesis_share_role_variant_must_match_signer() {
+        let (offer, _, black_key, proposal) = fixture();
+        let acceptance = accept_challenge(&offer, &black_key, CREATED + 1).unwrap();
+        let black_share = sign_genesis_proposal(&proposal, &black_key).unwrap();
+
+        let error = resolve_challenge(
+            &offer,
+            &[
+                ChallengeTerminalEvidence::Acceptance(acceptance),
+                ChallengeTerminalEvidence::WhiteGenesisShare(black_share),
+            ],
+        )
+        .unwrap_err();
+
+        assert!(error.contains("was not signed by White"));
     }
 
     #[test]
