@@ -12,6 +12,7 @@ pub mod commitment_planner;
 pub mod controller;
 pub mod genesis_handshake;
 pub mod genesis_handshake_store;
+pub mod genesis_share_publication_planner;
 pub mod incoming_challenge_acceptance_planner;
 pub mod incoming_challenge_acceptance_store;
 pub mod incoming_challenge_acceptance_transport;
