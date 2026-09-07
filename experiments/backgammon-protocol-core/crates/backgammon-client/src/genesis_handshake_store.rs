@@ -2,11 +2,12 @@ use std::io::Cursor;
 
 use backgammon_protocol::{Action, GameId, PlayerId};
 use ciborium::{de::from_reader, ser::into_writer};
+use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 
 use crate::genesis_handshake::{
-    assemble_authenticated_genesis, verify_genesis_signature_share, GenesisProposal,
-    GenesisSignatureShare,
+    assemble_authenticated_genesis, sign_genesis_proposal, verify_genesis_signature_share,
+    GenesisProposal, GenesisSignatureShare,
 };
 
 /*
@@ -119,6 +120,38 @@ impl StoredGenesisHandshake {
 
         *self = candidate;
         Ok(())
+    }
+
+    /// Ensures that this exact handshake contains the persistent local
+    /// participant's signature share.
+    ///
+    /// A verified existing local share is recovered without signing again.
+    /// The signing key must derive the exact local identity recorded by the
+    /// handshake. The mutation is committed only after full handshake
+    /// verification succeeds.
+    pub fn ensure_local_share(&mut self, signing_key: &SigningKey) -> Result<bool, String> {
+        self.verify()?;
+
+        let signing_player_id = signing_key.verifying_key().to_bytes();
+
+        if signing_player_id != self.local_player_id {
+            return Err(
+                "Genesis signing key does not match the handshake's local identity.".to_owned(),
+            );
+        }
+
+        if self
+            .shares
+            .iter()
+            .any(|share| share.player_id == self.local_player_id)
+        {
+            return Ok(false);
+        }
+
+        let share = sign_genesis_proposal(&self.proposal, signing_key)?;
+        self.add_share(share)?;
+
+        Ok(true)
     }
 
     pub fn authenticated_genesis(&self) -> Result<Option<Action>, String> {
@@ -442,6 +475,35 @@ mod tests {
         assert_eq!(decoded, stored);
         assert_eq!(decoded.shares.len(), 1);
         assert!(decoded.authenticated_genesis().unwrap().is_none());
+    }
+
+    #[test]
+    fn local_share_is_added_once_without_resigning() {
+        let (proposal, white_key, _) = fixture();
+
+        let mut stored =
+            StoredGenesisHandshake::new(proposal, white_key.verifying_key().to_bytes()).unwrap();
+
+        assert_eq!(stored.ensure_local_share(&white_key), Ok(true));
+        assert_eq!(stored.shares.len(), 1);
+
+        let first_share = stored.shares[0].clone();
+
+        assert_eq!(stored.ensure_local_share(&white_key), Ok(false));
+        assert_eq!(stored.shares, vec![first_share]);
+    }
+
+    #[test]
+    fn local_share_rejects_a_different_participant_key_without_mutation() {
+        let (proposal, white_key, black_key) = fixture();
+
+        let mut stored =
+            StoredGenesisHandshake::new(proposal, white_key.verifying_key().to_bytes()).unwrap();
+
+        let before = stored.clone();
+
+        assert!(stored.ensure_local_share(&black_key).is_err());
+        assert_eq!(stored, before);
     }
 
     #[test]

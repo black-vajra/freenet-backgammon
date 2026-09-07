@@ -74,6 +74,9 @@ mod browser {
         confirm_game_contract_publication, submit_game_contract_publication,
         SubmittedGameContractPublication,
     };
+    use crate::genesis_handshake_store::{
+        load_genesis_handshake, store_genesis_handshake, StoredGenesisHandshake,
+    };
     use crate::incoming_challenge_acceptance_planner::{
         finalize_incoming_challenge_acceptance, prepare_incoming_challenge_contract_probe,
         IncomingChallengeContractProbe,
@@ -4974,7 +4977,7 @@ mod browser {
             let reconnect = on_reconnect.clone();
 
             Callback::from(move |event| {
-                let activation = (|| -> Result<(ActiveGameScope, AcceptedGame), String> {
+                let activation = (|| -> Result<(ActiveGameScope, AcceptedGame, bool), String> {
                     let player_id = (*local_player_id)
                         .ok_or_else(|| "Persistent local identity is unavailable.".to_owned())?;
 
@@ -4988,11 +4991,45 @@ mod browser {
 
                     ensure_accepted_local_role(next_scope.contract_id(), accepted.local_role)?;
 
-                    Ok((next_scope, accepted))
+                    let signing_key = load_local_identity()?.ok_or_else(|| {
+                        "Stored local signing identity is unavailable.".to_owned()
+                    })?;
+
+                    if player_id_for_signing_key(&signing_key) != player_id {
+                        return Err(
+                            "Stored signing identity does not match the active PlayerId."
+                                .to_owned(),
+                        );
+                    }
+
+                    let mut handshake = match load_genesis_handshake(&accepted.game_id, &player_id)?
+                    {
+                        Some(stored) => {
+                            if stored.proposal != accepted.accepted_proposal {
+                                return Err(
+                                        "Stored genesis handshake does not match the accepted proposal."
+                                            .to_owned(),
+                                    );
+                            }
+
+                            stored
+                        }
+
+                        None => StoredGenesisHandshake::new(
+                            accepted.accepted_proposal.clone(),
+                            player_id,
+                        )?,
+                    };
+
+                    let local_share_added = handshake.ensure_local_share(&signing_key)?;
+
+                    store_genesis_handshake(&handshake)?;
+
+                    Ok((next_scope, accepted, local_share_added))
                 })();
 
                 match activation {
-                    Ok((next_scope, accepted)) => {
+                    Ok((next_scope, accepted, local_share_added)) => {
                         *active_game_scope.borrow_mut() = next_scope;
 
                         controller.set(LocalGameController::new());
@@ -5001,8 +5038,14 @@ mod browser {
                         local_role.set(Ok(Some(accepted.local_role)));
                         interface_error.set(None);
 
+                        let genesis_share_status = if local_share_added {
+                            "stored"
+                        } else {
+                            "recovered"
+                        };
+
                         activation_status.set(format!(
-                            "Activated game {}; reconnecting to contract {}",
+                            "Activated game {}; local genesis share {genesis_share_status}; reconnecting to contract {}",
                             format_player_id(&accepted.game_id),
                             accepted.contract_id,
                         ));
