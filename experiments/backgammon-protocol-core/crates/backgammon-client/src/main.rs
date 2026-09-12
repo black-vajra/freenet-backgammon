@@ -83,6 +83,9 @@ mod browser {
     use crate::genesis_share_publication_planner::{
         plan_authoritative_genesis_share_ingestion, plan_genesis_share_publication,
     };
+    use crate::genesis_submission_planner::{
+        plan_authenticated_genesis_submission, GenesisSubmissionPlan, GenesisSubmissionPlannerInput,
+    };
     use crate::incoming_challenge_acceptance_planner::{
         finalize_incoming_challenge_acceptance, prepare_incoming_challenge_contract_probe,
         IncomingChallengeContractProbe,
@@ -901,6 +904,7 @@ mod browser {
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum SecretlessNetworkActionKind {
+        Genesis,
         PlayTurn,
         RequestRoll,
     }
@@ -1244,6 +1248,54 @@ mod browser {
                 kind: SecretlessNetworkActionKind::RequestRoll,
             },
         }
+    }
+
+    fn plan_browser_authenticated_genesis_submission(
+        contract_id: &str,
+        authenticated_genesis: &Action,
+        authoritative_state: &[u8],
+    ) -> Result<GenesisSubmissionPlan, String> {
+        let pending = load_pending_action(contract_id)?;
+
+        let plan = plan_authenticated_genesis_submission(GenesisSubmissionPlannerInput {
+            contract_id,
+            authenticated_genesis,
+            authoritative_state,
+            pending: pending.as_ref(),
+        })?;
+
+        match &plan {
+            GenesisSubmissionPlan::Accepted { remove_pending } => {
+                if *remove_pending {
+                    remove_pending_action(contract_id)?;
+                }
+            }
+
+            GenesisSubmissionPlan::Submit {
+                pending,
+                recovered_pending,
+            } => {
+                if !*recovered_pending {
+                    /*
+                     * The existing storage API verifies an exact browser-storage
+                     * read-back before network submission can begin.
+                     */
+                    store_pending_action(pending)?;
+                }
+            }
+        }
+
+        Ok(plan)
+    }
+
+    fn pending_genesis_requires_readiness(contract_id: &str) -> Result<bool, String> {
+        let Some(pending) = load_pending_action(contract_id)? else {
+            return Ok(false);
+        };
+
+        let record = pending.verify()?;
+
+        Ok(matches!(&record.payload, GameActionPayload::CreateGame(_)))
     }
 
     fn plan_browser_network_action(
@@ -2382,6 +2434,7 @@ mod browser {
             let latest_authoritative_state = latest_authoritative_state.clone();
             let latest_lobby_contract_key = latest_lobby_contract_key.clone();
             let active_game_scope = active_game_scope.clone();
+            let authenticated_genesis_readiness = authenticated_genesis_readiness.clone();
             let lobby_contract_status = lobby_contract_status.clone();
             let lobby_subscription_status = lobby_subscription_status.clone();
             let authoritative_lobby_state = authoritative_lobby_state.clone();
@@ -2442,6 +2495,7 @@ mod browser {
                 let state_for_response = latest_authoritative_state.clone();
                 let scope_for_response = active_game_scope.clone();
                 let scope_snapshot_for_response = scope_for_response.borrow().snapshot();
+                let genesis_readiness_for_response = authenticated_genesis_readiness.clone();
                 let scope_for_request = active_game_scope.clone();
                 let scope_snapshot_for_request = scope_for_request.borrow().snapshot();
                 let lobby_state_for_response = authoritative_lobby_state.clone();
@@ -2596,6 +2650,40 @@ mod browser {
                                         }
                                     };
 
+                                let authenticated_genesis = {
+                                    let readiness = genesis_readiness_for_response.borrow();
+
+                                    readiness.as_ref().and_then(|(snapshot, action)| {
+                                        (snapshot == &scope_snapshot_for_response)
+                                            .then(|| action.clone())
+                                    })
+                                };
+
+                                let genesis_plan = match authenticated_genesis.as_ref() {
+                                    None => None,
+
+                                    Some(authenticated_genesis) => {
+                                        match plan_browser_authenticated_genesis_submission(
+                                            scope_snapshot_for_response.contract_id.as_str(),
+                                            authenticated_genesis,
+                                            &state_bytes,
+                                        ) {
+                                            Ok(plan) => Some(plan),
+
+                                            Err(error) => {
+                                                secret_status_for_response.set(format!(
+                                                    "Authenticated genesis recovery failed: {error}"
+                                                ));
+
+                                                contract_for_response
+                                                    .set(ContractProbeStatus::Failed(error));
+
+                                                return;
+                                            }
+                                        }
+                                    }
+                                };
+
                                 /*
                                  * An unchanged parent ledger must not erase a
                                  * local checker preview while a turn is being
@@ -2650,26 +2738,88 @@ mod browser {
                                     }
                                 }
 
-                                let Some(local_player) = authoritative_player else {
-                                    secret_status_for_response
-                                        .set("This browser identity is not an authoritative game participant".to_owned());
-                                    return;
-                                };
+                                if genesis_plan.is_none() {
+                                    match pending_genesis_requires_readiness(
+                                        scope_snapshot_for_response.contract_id.as_str(),
+                                    ) {
+                                        Ok(true) => {
+                                            secret_status_for_response.set(
+                                                "Waiting for authenticated genesis readiness from verified lobby state"
+                                                    .to_owned(),
+                                            );
+                                            return;
+                                        }
 
-                                let plan = match plan_browser_network_action(
-                                    scope_snapshot_for_response.contract_id.as_str(),
-                                    &state_bytes,
-                                    local_player,
+                                        Ok(false) => {}
+
+                                        Err(error) => {
+                                            secret_status_for_response.set(format!(
+                                                "Pending genesis recovery failed: {error}"
+                                            ));
+
+                                            contract_for_response
+                                                .set(ContractProbeStatus::Failed(error));
+
+                                            return;
+                                        }
+                                    }
+                                }
+
+                                if matches!(
+                                    &genesis_plan,
+                                    Some(GenesisSubmissionPlan::Accepted {
+                                        remove_pending: true,
+                                    })
                                 ) {
-                                    Ok(plan) => plan,
-                                    Err(error) => {
-                                        secret_status_for_response
-                                            .set(format!("Recovery failed: {error}"));
+                                    network_action_for_response.borrow_mut().take();
+                                }
 
-                                        contract_for_response
-                                            .set(ContractProbeStatus::Failed(error));
+                                let plan = match genesis_plan {
+                                    Some(GenesisSubmissionPlan::Submit {
+                                        pending,
+                                        recovered_pending,
+                                    }) => {
+                                        secret_status_for_response.set(if recovered_pending {
+                                            "Recovered exact pending authenticated genesis; retrying"
+                                                .to_owned()
+                                        } else {
+                                            "Stored authenticated genesis locally; awaiting network verification"
+                                                .to_owned()
+                                        });
 
-                                        return;
+                                        BrowserNetworkActionPlan::SecretlessSubmit {
+                                            pending,
+                                            recovered_pending,
+                                            kind: SecretlessNetworkActionKind::Genesis,
+                                        }
+                                    }
+
+                                    Some(GenesisSubmissionPlan::Accepted { .. }) | None => {
+                                        let Some(local_player) = authoritative_player else {
+                                            secret_status_for_response.set(
+                                                "This browser identity is not an authoritative game participant"
+                                                    .to_owned(),
+                                            );
+                                            return;
+                                        };
+
+                                        match plan_browser_network_action(
+                                            scope_snapshot_for_response.contract_id.as_str(),
+                                            &state_bytes,
+                                            local_player,
+                                        ) {
+                                            Ok(plan) => plan,
+
+                                            Err(error) => {
+                                                secret_status_for_response
+                                                    .set(format!("Recovery failed: {error}"));
+
+                                                contract_for_response
+                                                    .set(ContractProbeStatus::Failed(error));
+
+                                                return;
+                                            }
+                                        }
                                     }
                                 };
 
@@ -2755,7 +2905,7 @@ mod browser {
                                                         }
 
                                                         None => Err(
-                                                            "Freenet connection closed before the pending turn update."
+                                                            "Freenet connection closed before the pending action update."
                                                                 .to_owned(),
                                                         ),
                                                     }
@@ -2793,7 +2943,7 @@ mod browser {
                                                                 }
 
                                                                 None => Err(
-                                                                    "Freenet connection closed before turn verification."
+                                                                    "Freenet connection closed before action verification."
                                                                         .to_owned(),
                                                                 ),
                                                             }
@@ -2823,9 +2973,9 @@ mod browser {
                                                         ContractProbeStatus::Failed(format!(
                                                             "{}{}",
                                                             if recovered_pending {
-                                                                "Recovered turn retry failed: "
+                                                                "Recovered action retry failed: "
                                                             } else {
-                                                                "Turn submission failed: "
+                                                                "Action submission failed: "
                                                             },
                                                             error,
                                                         )),
@@ -3865,6 +4015,7 @@ mod browser {
             let latest_authoritative_state = latest_authoritative_state.clone();
             let latest_lobby_contract_key = latest_lobby_contract_key.clone();
             let active_game_scope = active_game_scope.clone();
+            let authenticated_genesis_readiness = authenticated_genesis_readiness.clone();
             let lobby_contract_status = lobby_contract_status.clone();
             let lobby_subscription_status = lobby_subscription_status.clone();
             let authoritative_lobby_state = authoritative_lobby_state.clone();
@@ -3931,6 +4082,7 @@ mod browser {
                 let state_for_response = latest_authoritative_state.clone();
                 let scope_for_response = active_game_scope.clone();
                 let scope_snapshot_for_response = scope_for_response.borrow().snapshot();
+                let genesis_readiness_for_response = authenticated_genesis_readiness.clone();
                 let scope_for_request = active_game_scope.clone();
                 let scope_snapshot_for_request = scope_for_request.borrow().snapshot();
                 let lobby_state_for_response = authoritative_lobby_state.clone();
@@ -4086,6 +4238,40 @@ mod browser {
                                         }
                                     };
 
+                                let authenticated_genesis = {
+                                    let readiness = genesis_readiness_for_response.borrow();
+
+                                    readiness.as_ref().and_then(|(snapshot, action)| {
+                                        (snapshot == &scope_snapshot_for_response)
+                                            .then(|| action.clone())
+                                    })
+                                };
+
+                                let genesis_plan = match authenticated_genesis.as_ref() {
+                                    None => None,
+
+                                    Some(authenticated_genesis) => {
+                                        match plan_browser_authenticated_genesis_submission(
+                                            scope_snapshot_for_response.contract_id.as_str(),
+                                            authenticated_genesis,
+                                            &state_bytes,
+                                        ) {
+                                            Ok(plan) => Some(plan),
+
+                                            Err(error) => {
+                                                secret_status_for_response.set(format!(
+                                                    "Authenticated genesis recovery failed: {error}"
+                                                ));
+
+                                                contract_for_response
+                                                    .set(ContractProbeStatus::Failed(error));
+
+                                                return;
+                                            }
+                                        }
+                                    }
+                                };
+
                                 /*
                                  * An unchanged parent ledger must not erase a
                                  * local checker preview while a turn is being
@@ -4140,26 +4326,88 @@ mod browser {
                                     }
                                 }
 
-                                let Some(local_player) = authoritative_player else {
-                                    secret_status_for_response
-                                        .set("This browser identity is not an authoritative game participant".to_owned());
-                                    return;
-                                };
+                                if genesis_plan.is_none() {
+                                    match pending_genesis_requires_readiness(
+                                        scope_snapshot_for_response.contract_id.as_str(),
+                                    ) {
+                                        Ok(true) => {
+                                            secret_status_for_response.set(
+                                                "Waiting for authenticated genesis readiness from verified lobby state"
+                                                    .to_owned(),
+                                            );
+                                            return;
+                                        }
 
-                                let plan = match plan_browser_network_action(
-                                    scope_snapshot_for_response.contract_id.as_str(),
-                                    &state_bytes,
-                                    local_player,
+                                        Ok(false) => {}
+
+                                        Err(error) => {
+                                            secret_status_for_response.set(format!(
+                                                "Pending genesis recovery failed: {error}"
+                                            ));
+
+                                            contract_for_response
+                                                .set(ContractProbeStatus::Failed(error));
+
+                                            return;
+                                        }
+                                    }
+                                }
+
+                                if matches!(
+                                    &genesis_plan,
+                                    Some(GenesisSubmissionPlan::Accepted {
+                                        remove_pending: true,
+                                    })
                                 ) {
-                                    Ok(plan) => plan,
-                                    Err(error) => {
-                                        secret_status_for_response
-                                            .set(format!("Recovery failed: {error}"));
+                                    network_action_for_response.borrow_mut().take();
+                                }
 
-                                        contract_for_response
-                                            .set(ContractProbeStatus::Failed(error));
+                                let plan = match genesis_plan {
+                                    Some(GenesisSubmissionPlan::Submit {
+                                        pending,
+                                        recovered_pending,
+                                    }) => {
+                                        secret_status_for_response.set(if recovered_pending {
+                                            "Recovered exact pending authenticated genesis; retrying"
+                                                .to_owned()
+                                        } else {
+                                            "Stored authenticated genesis locally; awaiting network verification"
+                                                .to_owned()
+                                        });
 
-                                        return;
+                                        BrowserNetworkActionPlan::SecretlessSubmit {
+                                            pending,
+                                            recovered_pending,
+                                            kind: SecretlessNetworkActionKind::Genesis,
+                                        }
+                                    }
+
+                                    Some(GenesisSubmissionPlan::Accepted { .. }) | None => {
+                                        let Some(local_player) = authoritative_player else {
+                                            secret_status_for_response.set(
+                                                "This browser identity is not an authoritative game participant"
+                                                    .to_owned(),
+                                            );
+                                            return;
+                                        };
+
+                                        match plan_browser_network_action(
+                                            scope_snapshot_for_response.contract_id.as_str(),
+                                            &state_bytes,
+                                            local_player,
+                                        ) {
+                                            Ok(plan) => plan,
+
+                                            Err(error) => {
+                                                secret_status_for_response
+                                                    .set(format!("Recovery failed: {error}"));
+
+                                                contract_for_response
+                                                    .set(ContractProbeStatus::Failed(error));
+
+                                                return;
+                                            }
+                                        }
                                     }
                                 };
 
@@ -4245,7 +4493,7 @@ mod browser {
                                                         }
 
                                                         None => Err(
-                                                            "Freenet connection closed before the pending turn update."
+                                                            "Freenet connection closed before the pending action update."
                                                                 .to_owned(),
                                                         ),
                                                     }
@@ -4283,7 +4531,7 @@ mod browser {
                                                                 }
 
                                                                 None => Err(
-                                                                    "Freenet connection closed before turn verification."
+                                                                    "Freenet connection closed before action verification."
                                                                         .to_owned(),
                                                                 ),
                                                             }
@@ -4313,9 +4561,9 @@ mod browser {
                                                         ContractProbeStatus::Failed(format!(
                                                             "{}{}",
                                                             if recovered_pending {
-                                                                "Recovered turn retry failed: "
+                                                                "Recovered action retry failed: "
                                                             } else {
-                                                                "Turn submission failed: "
+                                                                "Action submission failed: "
                                                             },
                                                             error,
                                                         )),
