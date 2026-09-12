@@ -78,6 +78,7 @@ mod browser {
     use crate::genesis_handshake_store::{
         load_genesis_handshake, store_genesis_handshake, StoredGenesisHandshake,
     };
+    use crate::genesis_share_publication_planner::plan_genesis_share_publication;
     use crate::incoming_challenge_acceptance_planner::{
         finalize_incoming_challenge_acceptance, prepare_incoming_challenge_contract_probe,
         IncomingChallengeContractProbe,
@@ -1534,6 +1535,16 @@ mod browser {
         let authoritative_lobby_state = use_state(|| None::<LobbyContractState>);
 
         /*
+         * Genesis-share publication is reconciled from durable signed evidence
+         * against verified authoritative lobby state. The in-flight marker is
+         * scope-specific, so delayed work from an earlier active game cannot
+         * suppress or mutate the current game.
+         */
+        let genesis_share_publication_in_flight = use_mut_ref(|| None::<ActiveGameScopeSnapshot>);
+        let genesis_share_publication_status =
+            use_state(|| "Waiting for an activated accepted game".to_owned());
+
+        /*
          * Outbound challenge publication remains distinct from authoritative
          * lobby state. A durable plan is created before contract publication,
          * and the offer is not advertised until an exact PutResponse is
@@ -2108,6 +2119,203 @@ mod browser {
 
                 || {}
             });
+        }
+
+        let genesis_share_reconciliation = (
+            active_game_scope_snapshot.clone(),
+            *local_player_id,
+            (*authoritative_lobby_state).clone(),
+            matches!(
+                &*lobby_contract_status,
+                LobbyContractStatus::Retrieved { .. }
+            ),
+        );
+
+        {
+            let active_game_scope = active_game_scope.clone();
+            let freenet_api = freenet_api.clone();
+            let latest_lobby_contract_key = latest_lobby_contract_key.clone();
+            let publication_in_flight = genesis_share_publication_in_flight.clone();
+            let publication_status = genesis_share_publication_status.clone();
+
+            use_effect_with(
+                genesis_share_reconciliation,
+                move |(scope_snapshot, player_id, authoritative_state, lobby_ready)| {
+                    if !*lobby_ready {
+                        if publication_in_flight.borrow().as_ref() == Some(scope_snapshot) {
+                            publication_in_flight.borrow_mut().take();
+                        }
+                    } else {
+                        let prepared = (|| -> Result<Option<(ContractKey, Vec<u8>)>, String> {
+                            if !active_game_scope.borrow().recognizes(scope_snapshot) {
+                                return Ok(None);
+                            }
+
+                            let accepted = match active_game_scope.borrow().accepted_game().cloned()
+                            {
+                                Some(accepted) => accepted,
+                                None => return Ok(None),
+                            };
+
+                            let player_id = player_id.ok_or_else(|| {
+                                "Active accepted game has no persistent local identity.".to_owned()
+                            })?;
+
+                            let state = authoritative_state.as_ref().ok_or_else(|| {
+                                "Active accepted game has no verified authoritative lobby state."
+                                    .to_owned()
+                            })?;
+
+                            let handshake = load_genesis_handshake(&accepted.game_id, &player_id)?
+                                .ok_or_else(|| {
+                                    "Active accepted game has no durable genesis handshake."
+                                        .to_owned()
+                                })?;
+
+                            if handshake.proposal != accepted.accepted_proposal {
+                                return Err("Durable genesis handshake does not match the \
+                                 active accepted-game proposal."
+                                    .to_owned());
+                            }
+
+                            let mut matching_offers =
+                                state.challenges.offers.iter().filter(|offer| {
+                                    offer.offer.body.proposal == handshake.proposal
+                                });
+
+                            let authoritative_offer = matching_offers.next().ok_or_else(|| {
+                                "Active accepted challenge is absent from \
+                                 verified authoritative lobby state."
+                                    .to_owned()
+                            })?;
+
+                            if matching_offers.next().is_some() {
+                                return Err("Verified authoritative lobby state contains \
+                                 multiple copies of the active accepted proposal."
+                                    .to_owned());
+                            }
+
+                            let Some(plan) =
+                                plan_genesis_share_publication(authoritative_offer, &handshake)?
+                            else {
+                                if publication_in_flight.borrow().as_ref() == Some(scope_snapshot) {
+                                    publication_in_flight.borrow_mut().take();
+                                }
+
+                                publication_status.set(
+                                    "Local genesis share confirmed in verified \
+                                 authoritative lobby state"
+                                        .to_owned(),
+                                );
+
+                                return Ok(None);
+                            };
+
+                            if publication_in_flight.borrow().as_ref() == Some(scope_snapshot) {
+                                return Ok(None);
+                            }
+
+                            let lobby_key =
+                                latest_lobby_contract_key.borrow().clone().ok_or_else(|| {
+                                    "Verified lobby state did not retain its full \
+                                 contract key."
+                                        .to_owned()
+                                })?;
+
+                            *publication_in_flight.borrow_mut() = Some(scope_snapshot.clone());
+
+                            Ok(Some((lobby_key, plan.encoded_lobby_state_update)))
+                        })();
+
+                        match prepared {
+                            Ok(None) => {}
+
+                            Err(error) => {
+                                if publication_in_flight.borrow().as_ref() == Some(scope_snapshot) {
+                                    publication_in_flight.borrow_mut().take();
+                                }
+
+                                publication_status
+                                    .set(format!("Genesis-share publication unavailable: {error}"));
+                            }
+
+                            Ok(Some((lobby_key, encoded_update))) => {
+                                publication_status
+                                    .set("Publishing durable local genesis share…".to_owned());
+
+                                let api = freenet_api.clone();
+                                let scope = active_game_scope.clone();
+                                let snapshot = scope_snapshot.clone();
+                                let in_flight = publication_in_flight.clone();
+                                let status = publication_status.clone();
+
+                                wasm_bindgen_futures::spawn_local(async move {
+                                    if !scope.borrow().recognizes(&snapshot) {
+                                        if in_flight.borrow().as_ref() == Some(&snapshot) {
+                                            in_flight.borrow_mut().take();
+                                        }
+
+                                        return;
+                                    }
+
+                                    let result = {
+                                        let mut api = api.borrow_mut();
+
+                                        match api.as_mut() {
+                                            Some(api) => {
+                                                match submit_lobby_state_update(
+                                                    api,
+                                                    lobby_key,
+                                                    encoded_update,
+                                                )
+                                                .await
+                                                {
+                                                    Ok(()) => request_lobby_contract(api).await,
+
+                                                    Err(error) => Err(error),
+                                                }
+                                            }
+
+                                            None => Err("Freenet connection closed before \
+                                             genesis-share publication."
+                                                .to_owned()),
+                                        }
+                                    };
+
+                                    if !scope.borrow().recognizes(&snapshot)
+                                        || in_flight.borrow().as_ref() != Some(&snapshot)
+                                    {
+                                        return;
+                                    }
+
+                                    match result {
+                                        Ok(()) => {
+                                            status.set(
+                                                "Local genesis share submitted; \
+                                             awaiting verified authoritative \
+                                             confirmation"
+                                                    .to_owned(),
+                                            );
+                                        }
+
+                                        Err(error) => {
+                                            in_flight.borrow_mut().take();
+
+                                            status.set(format!(
+                                                "Genesis-share publication will \
+                                             retry after the next lobby \
+                                             recovery: {error}"
+                                            ));
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                    }
+
+                    || {}
+                },
+            );
         }
 
         {
@@ -5850,6 +6058,16 @@ mod browser {
                                     <dd>
                                         {
                                             (*accepted_game_activation_status)
+                                                .clone()
+                                        }
+                                    </dd>
+                                </div>
+
+                                <div>
+                                    <dt>{ "Genesis-share exchange" }</dt>
+                                    <dd>
+                                        {
+                                            (*genesis_share_publication_status)
                                                 .clone()
                                         }
                                     </dd>
