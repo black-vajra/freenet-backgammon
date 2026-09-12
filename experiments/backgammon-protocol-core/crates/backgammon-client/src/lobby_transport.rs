@@ -14,9 +14,9 @@ use crate::lobby_codec::decode_verified_lobby_state;
 #[cfg(target_arch = "wasm32")]
 use crate::transport::SubscriptionStatus;
 
-/// Published challenge-capable lobby contract independently retrieved across
-/// two Freenet nodes at the August 2026 publication milestone.
-pub const LOBBY_CONTRACT_ID: &str = "CuzYmHzg94LwEpQP9sXTXhHHsAKB6pYC5uABt42CHR8K";
+/// Published genesis-share-capable lobby contract, verified by exact local
+/// retrieval at the September 2026 publication milestone.
+pub const LOBBY_CONTRACT_ID: &str = "EsQreoxJF78Eb3uqAFHyZJtXuzN1hSi7GXycAYvtv9jX";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LobbyContractStatus {
@@ -368,7 +368,7 @@ mod tests {
     fn published_lobby_contract_id_is_stable() {
         assert_eq!(
             LOBBY_CONTRACT_ID,
-            "CuzYmHzg94LwEpQP9sXTXhHHsAKB6pYC5uABt42CHR8K"
+            "EsQreoxJF78Eb3uqAFHyZJtXuzN1hSi7GXycAYvtv9jX"
         );
     }
 
