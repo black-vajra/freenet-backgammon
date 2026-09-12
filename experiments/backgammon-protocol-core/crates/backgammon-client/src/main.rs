@@ -46,7 +46,8 @@ mod browser {
     use backgammon_core::{GameState, MoveSource, MoveTarget, Player, TurnPhase, TurnSequence};
     use backgammon_lobby_core::LobbyContractState;
     use backgammon_protocol::{
-        replay_game, verify_challenge_offer_at, DiceSecret, GameActionPayload, SignedChallengeOffer,
+        replay_game, verify_challenge_offer_at, Action, DiceSecret, GameActionPayload,
+        SignedChallengeOffer,
     };
     use freenet_stdlib::client_api::{HostResponse, WebApi};
     use freenet_stdlib::prelude::ContractKey;
@@ -78,7 +79,9 @@ mod browser {
     use crate::genesis_handshake_store::{
         load_genesis_handshake, store_genesis_handshake, StoredGenesisHandshake,
     };
-    use crate::genesis_share_publication_planner::plan_genesis_share_publication;
+    use crate::genesis_share_publication_planner::{
+        plan_authoritative_genesis_share_ingestion, plan_genesis_share_publication,
+    };
     use crate::incoming_challenge_acceptance_planner::{
         finalize_incoming_challenge_acceptance, prepare_incoming_challenge_contract_probe,
         IncomingChallengeContractProbe,
@@ -1541,6 +1544,8 @@ mod browser {
          * suppress or mutate the current game.
          */
         let genesis_share_publication_in_flight = use_mut_ref(|| None::<ActiveGameScopeSnapshot>);
+        let authenticated_genesis_readiness =
+            use_mut_ref(|| None::<(ActiveGameScopeSnapshot, Action)>);
         let genesis_share_publication_status =
             use_state(|| "Waiting for an activated accepted game".to_owned());
 
@@ -2136,6 +2141,7 @@ mod browser {
             let freenet_api = freenet_api.clone();
             let latest_lobby_contract_key = latest_lobby_contract_key.clone();
             let publication_in_flight = genesis_share_publication_in_flight.clone();
+            let genesis_readiness = authenticated_genesis_readiness.clone();
             let publication_status = genesis_share_publication_status.clone();
 
             use_effect_with(
@@ -2145,10 +2151,31 @@ mod browser {
                         if publication_in_flight.borrow().as_ref() == Some(scope_snapshot) {
                             publication_in_flight.borrow_mut().take();
                         }
+
+                        if genesis_readiness
+                            .borrow()
+                            .as_ref()
+                            .is_some_and(|(snapshot, _)| snapshot == scope_snapshot)
+                        {
+                            genesis_readiness.borrow_mut().take();
+                        }
                     } else {
                         let prepared = (|| -> Result<Option<(ContractKey, Vec<u8>)>, String> {
                             if !active_game_scope.borrow().recognizes(scope_snapshot) {
                                 return Ok(None);
+                            }
+
+                            /*
+                             * Fail closed for this exact active scope. Readiness
+                             * is restored only after the current authoritative
+                             * evidence is completely verified and ingested.
+                             */
+                            if genesis_readiness
+                                .borrow()
+                                .as_ref()
+                                .is_some_and(|(snapshot, _)| snapshot == scope_snapshot)
+                            {
+                                genesis_readiness.borrow_mut().take();
                             }
 
                             let accepted = match active_game_scope.borrow().accepted_game().cloned()
@@ -2195,6 +2222,27 @@ mod browser {
                                     .to_owned());
                             }
 
+                            let ingestion = plan_authoritative_genesis_share_ingestion(
+                                authoritative_offer,
+                                &handshake,
+                            )?;
+
+                            if ingestion.changed {
+                                /*
+                                 * This existing storage API verifies an exact
+                                 * browser-storage read-back before returning.
+                                 */
+                                store_genesis_handshake(&ingestion.updated_handshake)?;
+                            }
+
+                            let genesis_ready = ingestion.authenticated_genesis.is_some();
+
+                            *genesis_readiness.borrow_mut() = ingestion
+                                .authenticated_genesis
+                                .map(|action| (scope_snapshot.clone(), action));
+
+                            let handshake = ingestion.updated_handshake;
+
                             let Some(plan) =
                                 plan_genesis_share_publication(authoritative_offer, &handshake)?
                             else {
@@ -2202,11 +2250,14 @@ mod browser {
                                     publication_in_flight.borrow_mut().take();
                                 }
 
-                                publication_status.set(
+                                publication_status.set(if genesis_ready {
+                                    "Both genesis shares confirmed; authenticated genesis ready"
+                                        .to_owned()
+                                } else {
                                     "Local genesis share confirmed in verified \
-                                 authoritative lobby state"
-                                        .to_owned(),
-                                );
+                                     authoritative lobby state"
+                                        .to_owned()
+                                });
 
                                 return Ok(None);
                             };
