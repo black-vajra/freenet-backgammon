@@ -239,7 +239,11 @@ mod tests {
     };
     use ed25519_dalek::SigningKey;
 
+    use crate::active_game_scope::ActiveGameScopeSnapshot;
     use crate::game_contract_publication::prepare_game_contract_publication;
+    use crate::genesis_refresh_gate::GenesisRefreshGate;
+    use crate::ledger_codec::decode_verified_replay;
+    use crate::local_identity_store::role_for_player_id;
 
     fn fixture(game_id: [u8; 32], action_id: [u8; 32]) -> (GenesisProposal, Action, String) {
         let white = SigningKey::from_bytes(&[41; 32]);
@@ -340,6 +344,83 @@ mod tests {
                 pending,
                 recovered_pending: true,
             }),
+        );
+    }
+
+    #[test]
+    fn readiness_after_empty_response_recovers_after_disconnect_on_both_clients() {
+        let game_id = [61; 32];
+        let (proposal, action, contract_id) = fixture(game_id, [62; 32]);
+        let scope = ActiveGameScopeSnapshot {
+            epoch: 1,
+            contract_id: contract_id.clone(),
+        };
+        let empty = empty_state(game_id);
+        let mut white_gate = GenesisRefreshGate::default();
+        let mut black_gate = GenesisRefreshGate::default();
+
+        // Both clients have already handled the seed before the lobby confirms
+        // the second share. Each readiness transition requests one new read.
+        for gate in [&mut white_gate, &mut black_gate] {
+            assert!(!gate.claim(&scope, false, true));
+            assert!(gate.claim(&scope, true, true));
+            assert!(!gate.claim(&scope, true, true));
+        }
+
+        // The socket closes before either client can submit CreateGame.
+        white_gate.reset_connection();
+        black_gate.reset_connection();
+        assert!(white_gate.claim(&scope, true, true));
+        assert!(black_gate.claim(&scope, true, true));
+
+        let pending = fresh_pending(game_id, &action, &contract_id);
+        let white_recovery = plan_authenticated_genesis_submission(GenesisSubmissionPlannerInput {
+            contract_id: &contract_id,
+            authenticated_genesis: &action,
+            authoritative_state: &empty,
+            pending: Some(&pending),
+        })
+        .unwrap();
+        assert_eq!(
+            white_recovery,
+            GenesisSubmissionPlan::Submit {
+                pending: pending.clone(),
+                recovered_pending: true,
+            }
+        );
+
+        let accepted = accepted_state(game_id, &action);
+        for stored in [Some(&pending), None] {
+            assert_eq!(
+                plan_authenticated_genesis_submission(GenesisSubmissionPlannerInput {
+                    contract_id: &contract_id,
+                    authenticated_genesis: &action,
+                    authoritative_state: &accepted,
+                    pending: stored,
+                }),
+                Ok(GenesisSubmissionPlan::Accepted {
+                    remove_pending: stored.is_some(),
+                })
+            );
+        }
+
+        let replay = decode_verified_replay(&accepted).unwrap();
+        assert_eq!(replay.configuration, proposal.configuration);
+        assert_eq!(
+            role_for_player_id(&replay.configuration, &proposal.configuration.white.id),
+            Some(backgammon_core::Player::White)
+        );
+        assert_eq!(
+            role_for_player_id(&replay.configuration, &proposal.configuration.black.id),
+            Some(backgammon_core::Player::Black)
+        );
+        assert_eq!(decode_verified_ledger(&empty).unwrap().action_count(), 0);
+        assert_eq!(decode_verified_ledger(&accepted).unwrap().action_count(), 1);
+        assert!(decode_verified_replay(&empty).is_err());
+        assert_eq!(replay.state.active_player, backgammon_core::Player::White);
+        assert_eq!(
+            replay.state.turn_phase,
+            backgammon_core::TurnPhase::AwaitingRoll
         );
     }
 

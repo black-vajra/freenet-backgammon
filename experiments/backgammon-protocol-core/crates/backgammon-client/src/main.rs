@@ -12,6 +12,7 @@ pub mod commitment_planner;
 pub mod controller;
 pub mod genesis_handshake;
 pub mod genesis_handshake_store;
+pub mod genesis_refresh_gate;
 pub mod genesis_share_publication_planner;
 pub mod genesis_submission_planner;
 pub mod incoming_challenge_acceptance_planner;
@@ -80,6 +81,7 @@ mod browser {
     use crate::genesis_handshake_store::{
         load_genesis_handshake, store_genesis_handshake, StoredGenesisHandshake,
     };
+    use crate::genesis_refresh_gate::GenesisRefreshGate;
     use crate::genesis_share_publication_planner::{
         plan_authoritative_genesis_share_ingestion, plan_genesis_share_publication,
     };
@@ -1599,6 +1601,7 @@ mod browser {
         let genesis_share_publication_in_flight = use_mut_ref(|| None::<ActiveGameScopeSnapshot>);
         let authenticated_genesis_readiness =
             use_mut_ref(|| None::<(ActiveGameScopeSnapshot, Action)>);
+        let genesis_refresh_gate = use_mut_ref(GenesisRefreshGate::default);
         let genesis_share_publication_status =
             use_state(|| "Waiting for an activated accepted game".to_owned());
 
@@ -2195,12 +2198,15 @@ mod browser {
             let latest_lobby_contract_key = latest_lobby_contract_key.clone();
             let publication_in_flight = genesis_share_publication_in_flight.clone();
             let genesis_readiness = authenticated_genesis_readiness.clone();
+            let refresh_gate = genesis_refresh_gate.clone();
+            let contract_status = contract_status.clone();
             let publication_status = genesis_share_publication_status.clone();
 
             use_effect_with(
                 genesis_share_reconciliation,
                 move |(scope_snapshot, player_id, authoritative_state, lobby_ready)| {
                     if !*lobby_ready {
+                        refresh_gate.borrow_mut().revoke(scope_snapshot);
                         if publication_in_flight.borrow().as_ref() == Some(scope_snapshot) {
                             publication_in_flight.borrow_mut().take();
                         }
@@ -2290,9 +2296,66 @@ mod browser {
 
                             let genesis_ready = ingestion.authenticated_genesis.is_some();
 
+                            if !genesis_ready {
+                                refresh_gate.borrow_mut().revoke(scope_snapshot);
+                            }
+
                             *genesis_readiness.borrow_mut() = ingestion
                                 .authenticated_genesis
                                 .map(|action| (scope_snapshot.clone(), action));
+
+                            /*
+                             * The empty game response may have preceded the second
+                             * lobby share. Wake the verified game-response path
+                             * once per connection when genesis becomes ready.
+                             */
+                            let should_refresh = refresh_gate.borrow_mut().claim(
+                                scope_snapshot,
+                                genesis_ready,
+                                freenet_api.borrow().is_some(),
+                            );
+
+                            if should_refresh {
+                                let connection_epoch = refresh_gate.borrow().connection_epoch();
+                                let api = freenet_api.clone();
+                                let scope = active_game_scope.clone();
+                                let snapshot = scope_snapshot.clone();
+                                let gate = refresh_gate.clone();
+                                let game_status = contract_status.clone();
+                                game_status.set(ContractProbeStatus::Requesting);
+
+                                wasm_bindgen_futures::spawn_local(async move {
+                                    if !scope.borrow().recognizes(&snapshot)
+                                        || !gate.borrow().owns_request(&snapshot, connection_epoch)
+                                    {
+                                        return;
+                                    }
+
+                                    let result = {
+                                        let mut api = api.borrow_mut();
+                                        match api.as_mut() {
+                                            Some(api) => {
+                                                request_contract(api, snapshot.contract_id.as_str())
+                                                    .await
+                                            }
+                                            None => Err(
+                                                "Freenet connection closed before the authenticated genesis refresh."
+                                                    .to_owned(),
+                                            ),
+                                        }
+                                    };
+
+                                    if !scope.borrow().recognizes(&snapshot)
+                                        || !gate.borrow().owns_request(&snapshot, connection_epoch)
+                                    {
+                                        return;
+                                    }
+
+                                    if let Err(error) = result {
+                                        game_status.set(ContractProbeStatus::Failed(error));
+                                    }
+                                });
+                            }
 
                             let handshake = ingestion.updated_handshake;
 
@@ -2435,6 +2498,7 @@ mod browser {
             let latest_lobby_contract_key = latest_lobby_contract_key.clone();
             let active_game_scope = active_game_scope.clone();
             let authenticated_genesis_readiness = authenticated_genesis_readiness.clone();
+            let genesis_refresh_gate = genesis_refresh_gate.clone();
             let lobby_contract_status = lobby_contract_status.clone();
             let lobby_subscription_status = lobby_subscription_status.clone();
             let authoritative_lobby_state = authoritative_lobby_state.clone();
@@ -2472,6 +2536,7 @@ mod browser {
                 *challenge_recovery_attempted.borrow_mut() = false;
                 *incoming_acceptance_recovery_attempted.borrow_mut() = false;
                 *local_network_action_submitted.borrow_mut() = None;
+                genesis_refresh_gate.borrow_mut().reset_connection();
                 *local_dice_secret.borrow_mut() = None;
                 latest_contract_key.borrow_mut().take();
                 latest_authoritative_state.borrow_mut().take();
@@ -4016,6 +4081,7 @@ mod browser {
             let latest_lobby_contract_key = latest_lobby_contract_key.clone();
             let active_game_scope = active_game_scope.clone();
             let authenticated_genesis_readiness = authenticated_genesis_readiness.clone();
+            let genesis_refresh_gate = genesis_refresh_gate.clone();
             let lobby_contract_status = lobby_contract_status.clone();
             let lobby_subscription_status = lobby_subscription_status.clone();
             let authoritative_lobby_state = authoritative_lobby_state.clone();
@@ -4054,6 +4120,7 @@ mod browser {
                  * The durable pending action itself remains unchanged.
                  */
                 *local_network_action_submitted.borrow_mut() = None;
+                genesis_refresh_gate.borrow_mut().reset_connection();
                 latest_contract_key.borrow_mut().take();
                 latest_authoritative_state.borrow_mut().take();
                 latest_lobby_contract_key.borrow_mut().take();
