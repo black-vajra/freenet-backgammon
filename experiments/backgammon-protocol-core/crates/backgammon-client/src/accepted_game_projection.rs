@@ -23,6 +23,7 @@ pub struct AcceptedGame {
     pub accepted_proposal: GenesisProposal,
     pub peer_id: PlayerId,
     pub local_role: Player,
+    pub offered_at_unix_seconds: u64,
 }
 
 /// Projects verified authoritative challenge records into deterministic
@@ -72,6 +73,7 @@ pub fn project_accepted_games(
                 accepted_proposal: proposal,
                 peer_id,
                 local_role,
+                offered_at_unix_seconds: state.offer.body.created_at_unix_seconds,
             },
         ));
     }
@@ -79,10 +81,17 @@ pub fn project_accepted_games(
     projected.sort_by(|left, right| left.0.cmp(&right.0));
     projected.dedup_by(|left, right| left.0 == right.0 && left.1 == right.1);
 
-    Ok(projected
+    let mut accepted = projected
         .into_iter()
         .map(|(_, accepted_game)| accepted_game)
-        .collect())
+        .collect::<Vec<_>>();
+    accepted.sort_by(|left, right| {
+        right
+            .offered_at_unix_seconds
+            .cmp(&left.offered_at_unix_seconds)
+            .then_with(|| left.game_id.cmp(&right.game_id))
+    });
+    Ok(accepted)
 }
 
 /// Resolves volatile browser selection exclusively against the current
@@ -147,6 +156,7 @@ mod tests {
             challenger_display_name: "Alice",
             recipient_id: recipient.verifying_key().to_bytes(),
             recipient_display_name: "Bob",
+            challenger_role: backgammon_core::Player::White,
             match_length: 3,
             challenge_id: [challenge_id; 32],
             game_id: [game_id; 32],

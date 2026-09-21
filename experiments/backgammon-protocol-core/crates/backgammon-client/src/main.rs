@@ -2,6 +2,7 @@
 mod components;
 mod game_contract_publication;
 
+pub mod accepted_game_history;
 pub mod accepted_game_projection;
 pub mod active_game_scope;
 pub mod challenge;
@@ -37,13 +38,14 @@ pub mod request_roll_planner;
 pub mod reveal_planner;
 pub mod secret_store;
 pub mod transport;
+pub mod verified_history_guard;
 
 #[cfg(test)]
 mod test_support;
 
 #[cfg(target_arch = "wasm32")]
 mod browser {
-    use std::{cell::RefCell, rc::Rc};
+    use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
 
     use backgammon_core::{GameState, MoveSource, MoveTarget, Player, TurnPhase, TurnSequence};
     use backgammon_lobby_core::LobbyContractState;
@@ -51,12 +53,15 @@ mod browser {
         replay_game, verify_challenge_offer_at, Action, DiceSecret, GameActionPayload,
         SignedChallengeOffer,
     };
-    use freenet_stdlib::client_api::{HostResponse, WebApi};
+    use freenet_stdlib::client_api::{ContractResponse, HostResponse, WebApi};
     use freenet_stdlib::prelude::ContractKey;
     use js_sys::Date;
     use yew::prelude::*;
     use yew::TargetCast;
 
+    use crate::accepted_game_history::{
+        classify_accepted_game, AcceptedGameSection, InspectedGameStatus,
+    };
     use crate::accepted_game_projection::{
         project_accepted_games, resolve_accepted_game_selection, AcceptedGame,
     };
@@ -125,9 +130,11 @@ mod browser {
     use crate::reveal_planner::{plan_reveal, RevealPlan, RevealPlannerInput};
     use crate::secret_store::{load_dice_secret, store_dice_secret};
     use crate::transport::{
-        classify_response, connect, request_contract, submit_action_delta, ClassifiedResponse,
-        ConnectionStatus, ContractProbeStatus, SubscriptionStatus, TEST_CONTRACT_ID,
+        classify_response, connect, request_contract, request_contract_snapshot,
+        submit_action_delta, ClassifiedResponse, ConnectionStatus, ContractProbeStatus,
+        SubscriptionStatus, TEST_CONTRACT_ID,
     };
+    use crate::verified_history_guard::{HistoryDecision, VerifiedHistoryGuard};
 
     fn format_player_id(player_id: &[u8; 32]) -> String {
         player_id
@@ -135,6 +142,28 @@ mod browser {
             .map(|byte| format!("{byte:02x}"))
             .collect::<Vec<_>>()
             .join("")
+    }
+
+    fn short_identifier(full: &str) -> String {
+        if full.len() <= 20 {
+            full.to_owned()
+        } else {
+            format!("{}…{}", &full[..8], &full[full.len() - 8..])
+        }
+    }
+
+    fn offered_time(unix_seconds: u64) -> String {
+        Date::new(&wasm_bindgen::JsValue::from_f64(
+            unix_seconds as f64 * 1_000.0,
+        ))
+        .to_iso_string()
+        .as_string()
+        .unwrap_or_else(|| format!("Unix second {unix_seconds}"))
+    }
+
+    fn copy_identifier(full: &str) -> Result<js_sys::Promise, String> {
+        let window = web_sys::window().ok_or_else(|| "Browser window unavailable.".to_owned())?;
+        Ok(window.navigator().clipboard().write_text(full))
     }
 
     /*
@@ -1478,7 +1507,6 @@ mod browser {
     enum PendingConfirmation {
         Resign,
         Leave,
-        NewGame,
     }
 
     impl PendingConfirmation {
@@ -1486,7 +1514,6 @@ mod browser {
             match self {
                 Self::Resign => "Resign this game?",
                 Self::Leave => "Leave the table?",
-                Self::NewGame => "Start a new game?",
             }
         }
 
@@ -1494,7 +1521,6 @@ mod browser {
             match self {
                 Self::Resign => "The active player will resign and the opponent will win.",
                 Self::Leave => "The current local session will end.",
-                Self::NewGame => "The current board, dice, and move history will be discarded.",
             }
         }
 
@@ -1502,7 +1528,6 @@ mod browser {
             match self {
                 Self::Resign => "Resign game",
                 Self::Leave => "Leave table",
-                Self::NewGame => "Start new game",
             }
         }
     }
@@ -1535,6 +1560,54 @@ mod browser {
         Ok(Some((replay.state, history)))
     }
 
+    fn observe_accepted_game_probe(
+        response: &HostResponse,
+        ids: &Rc<RefCell<BTreeMap<String, [u8; 32]>>>,
+        cache: &Rc<RefCell<BTreeMap<[u8; 32], InspectedGameStatus>>>,
+        statuses: &UseStateHandle<BTreeMap<[u8; 32], InspectedGameStatus>>,
+    ) {
+        let (contract_id, status) = match response {
+            HostResponse::ContractResponse(ContractResponse::GetResponse {
+                key, state, ..
+            }) => {
+                let status = match authoritative_game_projection(state.as_ref()) {
+                    Ok(None) => InspectedGameStatus::Empty,
+                    Ok(Some((state, _))) => match state.status {
+                        backgammon_core::GameStatus::InProgress => InspectedGameStatus::InProgress,
+                        backgammon_core::GameStatus::Completed { .. } => {
+                            InspectedGameStatus::Completed
+                        }
+                    },
+                    Err(error) => InspectedGameStatus::Failed(error),
+                };
+                (key.id().encode(), status)
+            }
+            HostResponse::ContractResponse(ContractResponse::NotFound { instance_id }) => {
+                (instance_id.encode(), InspectedGameStatus::MissingContract)
+            }
+            _ => return,
+        };
+        let Some(game_id) = ids.borrow().get(&contract_id).copied() else {
+            return;
+        };
+        let mut next = cache.borrow().clone();
+        if next.get(&game_id) != Some(&status) {
+            next.insert(game_id, status);
+            *cache.borrow_mut() = next.clone();
+            statuses.set(next);
+        }
+    }
+
+    #[derive(Clone, PartialEq, Eq)]
+    struct VerifiedGameView {
+        scope: ActiveGameScopeSnapshot,
+        state: GameState,
+        history: Vec<LocalTurnRecord>,
+        local_role: Option<Player>,
+        action_count: usize,
+        ledger_hash: [u8; 32],
+    }
+
     #[function_component(App)]
     fn app() -> Html {
         /*
@@ -1551,10 +1624,16 @@ mod browser {
         let controller = use_state(LocalGameController::new);
         let interface_error = use_state(|| None::<String>);
         let pending_confirmation = use_state(|| None::<PendingConfirmation>);
+        let new_game_options = use_state(|| false);
+        let suppress_completed_overlay = use_state(|| false);
+        let copy_status = use_state(|| String::new());
         let connection_status = use_state(|| ConnectionStatus::Disconnected);
+        let auto_reconnect_generation = use_state(|| 0_u64);
+        let auto_reconnect_attempted = use_mut_ref(|| false);
         let contract_status = use_state(|| ContractProbeStatus::WaitingForConnection);
         let subscription_status = use_state(|| SubscriptionStatus::Pending);
         let freenet_api = use_mut_ref(|| None::<freenet_stdlib::client_api::WebApi>);
+        let transport_epoch = use_mut_ref(|| 0_u64);
         let local_network_action_submitted = use_mut_ref(|| None::<[u8; 32]>);
         let local_dice_secret = use_mut_ref(|| None::<DiceSecret>);
         let dice_secret_status = use_state(|| "Checking browser storage".to_owned());
@@ -1580,6 +1659,10 @@ mod browser {
          * current verified authoritative accepted-game projection.
          */
         let selected_accepted_game_id = use_state(|| None::<[u8; 32]>);
+        let inspected_game_statuses = use_state(BTreeMap::<[u8; 32], InspectedGameStatus>::new);
+        let inspected_game_status_cache =
+            use_mut_ref(BTreeMap::<[u8; 32], InspectedGameStatus>::new);
+        let history_probe_ids = use_mut_ref(BTreeMap::<String, [u8; 32]>::new);
         let accepted_game_activation_status =
             use_state(|| "Using the initial test contract".to_owned());
 
@@ -1656,6 +1739,9 @@ mod browser {
          */
         let latest_contract_key = use_mut_ref(|| None::<freenet_stdlib::prelude::ContractKey>);
         let latest_authoritative_state = use_mut_ref(|| None::<Vec<u8>>);
+        let verified_game_view = use_state(|| None::<VerifiedGameView>);
+        let verified_history_guard = use_mut_ref(VerifiedHistoryGuard::default);
+        let synchronizing_game_state = use_state(|| false);
         let latest_lobby_contract_key = use_mut_ref(|| None::<ContractKey>);
 
         /*
@@ -1680,16 +1766,22 @@ mod browser {
             None => "Identity unavailable".to_owned(),
         };
 
+        let current_verified_view = (*verified_game_view)
+            .as_ref()
+            .filter(|view| view.scope == active_game_scope_snapshot);
+        let verified_game_created = current_verified_view.is_some();
         let authoritative_identity_role_text = match *local_player_id {
             None => "Identity unavailable".to_owned(),
-            Some(_) => match *authoritative_local_role {
+            Some(_) => match current_verified_view {
                 None => "Waiting for game state".to_owned(),
-                Some(Some(Player::White)) => "White".to_owned(),
-                Some(Some(Player::Black)) => "Black".to_owned(),
-                Some(None) => "Not a participant".to_owned(),
+                Some(view) => match view.local_role {
+                    Some(Player::White) => "White".to_owned(),
+                    Some(Player::Black) => "Black".to_owned(),
+                    None => "Not a participant".to_owned(),
+                },
             },
         };
-        let authoritative_player_role = (*authoritative_local_role).flatten();
+        let authoritative_player_role = current_verified_view.and_then(|view| view.local_role);
 
         {
             let identity_status = local_identity_status.clone();
@@ -2490,6 +2582,7 @@ mod browser {
             let contract_status = contract_status.clone();
             let subscription_status = subscription_status.clone();
             let freenet_api = freenet_api.clone();
+            let transport_epoch = transport_epoch.clone();
             let local_network_action_submitted = local_network_action_submitted.clone();
             let local_dice_secret = local_dice_secret.clone();
             let dice_secret_status = dice_secret_status.clone();
@@ -2499,6 +2592,8 @@ mod browser {
             let active_game_scope = active_game_scope.clone();
             let authenticated_genesis_readiness = authenticated_genesis_readiness.clone();
             let genesis_refresh_gate = genesis_refresh_gate.clone();
+            let auto_reconnect_generation = auto_reconnect_generation.clone();
+            let auto_reconnect_attempted = auto_reconnect_attempted.clone();
             let lobby_contract_status = lobby_contract_status.clone();
             let lobby_subscription_status = lobby_subscription_status.clone();
             let authoritative_lobby_state = authoritative_lobby_state.clone();
@@ -2517,8 +2612,20 @@ mod browser {
             let local_player_id_for_effect = local_player_id.clone();
             let authoritative_local_role_for_effect = authoritative_local_role.clone();
             let controller_for_effect = controller.clone();
+            let history_probe_ids = history_probe_ids.clone();
+            let inspected_game_statuses = inspected_game_statuses.clone();
+            let inspected_game_status_cache = inspected_game_status_cache.clone();
+            let verified_history_guard_for_effect = verified_history_guard.clone();
+            let synchronizing_game_state_for_effect = synchronizing_game_state.clone();
+            let verified_game_view_for_effect = verified_game_view.clone();
 
-            use_effect_with((), move |_| {
+            use_effect_with(*auto_reconnect_generation, move |generation| {
+                let connection_generation = *generation;
+                let connection_epoch = {
+                    let mut epoch = transport_epoch.borrow_mut();
+                    *epoch = epoch.wrapping_add(1);
+                    *epoch
+                };
                 /*
                  * Replacing the role dependency replaces the active transport
                  * closure. Any durable pending action remains in storage.
@@ -2540,10 +2647,16 @@ mod browser {
                 *local_dice_secret.borrow_mut() = None;
                 latest_contract_key.borrow_mut().take();
                 latest_authoritative_state.borrow_mut().take();
+                synchronizing_game_state_for_effect.set(true);
                 latest_lobby_contract_key.borrow_mut().take();
                 authoritative_local_role_for_effect.set(None);
 
                 let status_for_callback = connection_status.clone();
+                let retry_generation = auto_reconnect_generation.clone();
+                let retry_attempted = auto_reconnect_attempted.clone();
+                let response_generation = auto_reconnect_generation.clone();
+                let epoch_for_status = transport_epoch.clone();
+                let epoch_for_response = transport_epoch.clone();
                 let contract_for_response = contract_status.clone();
                 let contract_for_host_error = contract_status.clone();
                 let lobby_contract_for_response = lobby_contract_status.clone();
@@ -2558,6 +2671,12 @@ mod browser {
                 let secret_status_for_response = dice_secret_status.clone();
                 let key_for_response = latest_contract_key.clone();
                 let state_for_response = latest_authoritative_state.clone();
+                let probe_ids_for_response = history_probe_ids.clone();
+                let probe_status_for_response = inspected_game_statuses.clone();
+                let probe_cache_for_response = inspected_game_status_cache.clone();
+                let history_guard_for_response = verified_history_guard_for_effect.clone();
+                let syncing_for_response = synchronizing_game_state_for_effect.clone();
+                let view_for_response = verified_game_view_for_effect.clone();
                 let scope_for_response = active_game_scope.clone();
                 let scope_snapshot_for_response = scope_for_response.borrow().snapshot();
                 let genesis_readiness_for_response = authenticated_genesis_readiness.clone();
@@ -2585,7 +2704,6 @@ mod browser {
                 let incoming_error_for_status = incoming_acceptance_error.clone();
 
                 let api_for_open = freenet_api.clone();
-                let connection_for_open = connection_status.clone();
                 let contract_for_open = contract_status.clone();
                 let subscription_for_open = subscription_status.clone();
                 let lobby_contract_for_open = lobby_contract_status.clone();
@@ -2624,9 +2742,33 @@ mod browser {
                             }
                         }
 
+                        if *retry_generation != connection_generation
+                            || *epoch_for_status.borrow() != connection_epoch
+                        {
+                            return;
+                        }
+                        let should_retry = matches!(
+                            &status,
+                            ConnectionStatus::Disconnected | ConnectionStatus::Failed(_)
+                        ) && !*retry_attempted.borrow();
                         status_for_callback.set(status);
+                        if should_retry {
+                            *retry_attempted.borrow_mut() = true;
+                            retry_generation.set(connection_generation.wrapping_add(1));
+                        }
                     },
                     move |response| {
+                        if *response_generation != connection_generation
+                            || *epoch_for_response.borrow() != connection_epoch
+                        {
+                            return;
+                        }
+                        observe_accepted_game_probe(
+                            &response,
+                            &probe_ids_for_response,
+                            &probe_cache_for_response,
+                            &probe_status_for_response,
+                        );
                         if handle_lobby_response(
                             &response,
                             &lobby_contract_for_response,
@@ -2691,8 +2833,10 @@ mod browser {
                                 authoritative_state,
                             } = classified;
 
-                            if let Some(contract) = contract_status {
-                                contract_for_response.set(contract);
+                            if authoritative_state.is_none() {
+                                if let Some(contract) = contract_status.clone() {
+                                    contract_for_response.set(contract);
+                                }
                             }
 
                             if let Some(subscription) = subscription_status {
@@ -2714,6 +2858,31 @@ mod browser {
                                             return;
                                         }
                                     };
+
+                                let verified_ledger = match decode_verified_ledger(&state_bytes) {
+                                    Ok(ledger) => ledger,
+                                    Err(error) => {
+                                        contract_for_response
+                                            .set(ContractProbeStatus::Failed(error));
+                                        return;
+                                    }
+                                };
+                                match history_guard_for_response.borrow_mut().observe(
+                                    &scope_snapshot_for_response,
+                                    verified_ledger.typed_actions(),
+                                ) {
+                                    HistoryDecision::Stale | HistoryDecision::Divergent => {
+                                        syncing_for_response.set(true);
+                                        contract_for_response.set(ContractProbeStatus::Requesting);
+                                        return;
+                                    }
+                                    HistoryDecision::Advance | HistoryDecision::Unchanged => {
+                                        syncing_for_response.set(false);
+                                        if let Some(contract) = contract_status {
+                                            contract_for_response.set(contract);
+                                        }
+                                    }
+                                }
 
                                 let authenticated_genesis = {
                                     let readiness = genesis_readiness_for_response.borrow();
@@ -2780,6 +2949,18 @@ mod browser {
                                     if let Some((authoritative_state, authoritative_history)) =
                                         authoritative_state
                                     {
+                                        let next_view = VerifiedGameView {
+                                            scope: scope_snapshot_for_response.clone(),
+                                            state: authoritative_state.clone(),
+                                            history: authoritative_history.clone(),
+                                            local_role: authoritative_player,
+                                            action_count: verified_ledger.action_count(),
+                                            ledger_hash: verified_ledger
+                                                .typed_actions()
+                                                .last()
+                                                .expect("nonempty replay has a final action")
+                                                .resulting_state_hash,
+                                        };
                                         let mut next = (*controller_for_response).clone();
 
                                         if let Err(error) = next
@@ -2800,6 +2981,7 @@ mod browser {
                                         }
 
                                         controller_for_response.set(next);
+                                        view_for_response.set(Some(next_view));
                                     }
                                 }
 
@@ -3193,7 +3375,7 @@ mod browser {
                     },
                     move || {
                         let api_for_request = api_for_open.clone();
-                        let connection_for_request = connection_for_open.clone();
+                        let epoch_for_request = transport_epoch.clone();
                         let contract_for_request = contract_for_open.clone();
                         let subscription_for_request = subscription_for_open.clone();
                         let lobby_contract_for_request = lobby_contract_for_open.clone();
@@ -3202,6 +3384,9 @@ mod browser {
                         let scope_snapshot_for_request = scope_snapshot_for_request.clone();
 
                         wasm_bindgen_futures::spawn_local(async move {
+                            if *epoch_for_request.borrow() != connection_epoch {
+                                return;
+                            }
                             if scope_for_request
                                 .borrow()
                                 .recognizes(&scope_snapshot_for_request)
@@ -3247,13 +3432,14 @@ mod browser {
                                 }
                             };
 
+                            if *epoch_for_request.borrow() != connection_epoch {
+                                return;
+                            }
                             if scope_for_request
                                 .borrow()
                                 .recognizes(&scope_snapshot_for_request)
                             {
                                 if let Err(error) = game_result {
-                                    connection_for_request
-                                        .set(ConnectionStatus::Failed(error.clone()));
                                     contract_for_request.set(ContractProbeStatus::Failed(error));
                                     subscription_for_request.set(SubscriptionStatus::Inactive);
                                 }
@@ -3282,10 +3468,43 @@ mod browser {
             });
         }
 
-        let board = BoardView::from(controller.visible_state());
-        let outcome = controller.outcome();
+        let controller_matches_verified_view = current_verified_view.is_some_and(|view| {
+            &view.state == controller.state() && view.history.as_slice() == controller.history()
+        });
+        let board = BoardView::from(match current_verified_view {
+            Some(view) if !controller_matches_verified_view => &view.state,
+            _ => controller.visible_state(),
+        });
+        let visible_history = match current_verified_view {
+            Some(view) if !controller_matches_verified_view => view.history.clone(),
+            _ => controller.history().to_vec(),
+        };
+        let preview_in_progress =
+            controller_matches_verified_view && !controller.selected_moves().is_empty();
+        let remaining_dice = board.dice.map_or_else(Vec::new, |dice| {
+            let mut remaining = dice.values();
+            for checker_move in controller
+                .selected_moves()
+                .iter()
+                .filter(|_| preview_in_progress)
+            {
+                if let Some(index) = remaining.iter().position(|die| *die == checker_move.die) {
+                    remaining.remove(index);
+                }
+            }
+            remaining
+        });
+        let outcome = match current_verified_view {
+            Some(view) if !controller_matches_verified_view => match view.state.status {
+                backgammon_core::GameStatus::InProgress => None,
+                backgammon_core::GameStatus::Completed { winner, points } => {
+                    Some(LocalGameOutcome::Completed { winner, points })
+                }
+            },
+            _ => controller.outcome(),
+        };
         let left_table = controller.has_left_table();
-        let session_active = controller.is_active();
+        let session_active = controller_matches_verified_view && controller.is_active();
 
         let pending_role_check =
             load_pending_action(active_game_scope_snapshot.contract_id.as_str());
@@ -3300,7 +3519,10 @@ mod browser {
         let local_role_has_turn =
             session_active && authoritative_player_role == Some(controller.state().active_player);
 
-        let controls_authoritative_turn = local_role_has_turn && no_pending_action;
+        let controls_authoritative_turn = local_role_has_turn
+            && controller_matches_verified_view
+            && no_pending_action
+            && !*synchronizing_game_state;
 
         /*
          * Dice are produced by the commit-and-reveal action loop. The former
@@ -3321,6 +3543,8 @@ mod browser {
 
         let can_roll = session_active
             && no_pending_action
+            && !*synchronizing_game_state
+            && verified_game_created
             && latest_contract_key.borrow().is_some()
             && authoritative_roll_ready;
 
@@ -3353,16 +3577,34 @@ mod browser {
             "Table left".to_owned()
         } else if outcome.is_some() {
             "Game complete".to_owned()
-        } else if authoritative_must_pass {
-            format!("{active_name} must pass")
-        } else {
+        } else if *synchronizing_game_state {
+            "Synchronizing latest verified game state".to_owned()
+        } else if authoritative_player_role.is_none() {
+            "Waiting for authoritative game creation".to_owned()
+        } else if !no_pending_action && local_role_has_turn {
             match board.turn_phase {
                 TurnPhase::AwaitingRoll => {
-                    format!("{active_name} awaiting fair roll")
+                    format!("{active_name}'s roll is awaiting network confirmation")
                 }
                 TurnPhase::Moving => {
-                    format!("{active_name} is moving")
+                    format!("{active_name}'s move is awaiting network confirmation")
                 }
+            }
+        } else if authoritative_must_pass {
+            format!("{active_name} has no legal move — pass turn")
+        } else {
+            match board.turn_phase {
+                TurnPhase::AwaitingRoll if can_roll => format!("{active_name}'s turn — roll dice"),
+                TurnPhase::AwaitingRoll => {
+                    format!("{active_name}'s turn — waiting for opponent or fair roll")
+                }
+                TurnPhase::Moving => match board.dice {
+                    Some(dice) => format!(
+                        "{active_name} rolled {}–{} — choose your moves",
+                        dice.first, dice.second
+                    ),
+                    None => "Synchronizing latest verified game state".to_owned(),
+                },
             }
         };
 
@@ -3370,6 +3612,8 @@ mod browser {
             "Table left".to_owned()
         } else if outcome.is_some() {
             "Game complete".to_owned()
+        } else if *synchronizing_game_state {
+            "Synchronizing latest verified game state".to_owned()
         } else if authoritative_must_pass {
             format!("Awaiting {active_name} pass")
         } else {
@@ -3382,7 +3626,13 @@ mod browser {
         let control_note = if left_table {
             "The local table session has ended.".to_owned()
         } else if outcome.is_some() {
-            "Begin a new game to play again.".to_owned()
+            "Offer a new challenge to play again. The completed ledger remains available."
+                .to_owned()
+        } else if *synchronizing_game_state {
+            "Synchronizing latest verified game state; moves are temporarily disabled.".to_owned()
+        } else if authoritative_player_role.is_none() {
+            "The game is not yet authoritative. Roll becomes available after verified creation."
+                .to_owned()
         } else if authoritative_must_pass {
             if can_pass {
                 "The roll has no legal move. Pass the turn when ready.".to_owned()
@@ -3946,21 +4196,10 @@ mod browser {
         };
 
         let on_new_game = {
-            let controller = controller.clone();
-            let interface_error = interface_error.clone();
-            let pending_confirmation = pending_confirmation.clone();
+            let new_game_options = new_game_options.clone();
 
             Callback::from(move |_| {
-                if controller.is_active() {
-                    pending_confirmation.set(Some(PendingConfirmation::NewGame));
-                } else {
-                    let mut next = (*controller).clone();
-                    next.new_game();
-
-                    interface_error.set(None);
-                    pending_confirmation.set(None);
-                    controller.set(next);
-                }
+                new_game_options.set(true);
             })
         };
 
@@ -3996,10 +4235,6 @@ mod browser {
                     PendingConfirmation::Resign => next.resign(),
                     PendingConfirmation::Leave => {
                         next.leave_table();
-                        Ok(())
-                    }
-                    PendingConfirmation::NewGame => {
-                        next.new_game();
                         Ok(())
                     }
                 };
@@ -4073,6 +4308,7 @@ mod browser {
             let contract_status = contract_status.clone();
             let subscription_status = subscription_status.clone();
             let freenet_api = freenet_api.clone();
+            let transport_epoch = transport_epoch.clone();
             let local_network_action_submitted = local_network_action_submitted.clone();
             let local_dice_secret = local_dice_secret.clone();
             let dice_secret_status = dice_secret_status.clone();
@@ -4100,8 +4336,19 @@ mod browser {
             let local_player_id_for_reconnect = local_player_id.clone();
             let authoritative_local_role_for_reconnect = authoritative_local_role.clone();
             let controller_for_reconnect = controller.clone();
+            let history_probe_ids = history_probe_ids.clone();
+            let inspected_game_statuses = inspected_game_statuses.clone();
+            let inspected_game_status_cache = inspected_game_status_cache.clone();
+            let verified_history_guard_for_reconnect = verified_history_guard.clone();
+            let synchronizing_game_state_for_reconnect = synchronizing_game_state.clone();
+            let verified_game_view_for_reconnect = verified_game_view.clone();
 
             Callback::from(move |_| {
+                let connection_epoch = {
+                    let mut epoch = transport_epoch.borrow_mut();
+                    *epoch = epoch.wrapping_add(1);
+                    *epoch
+                };
                 freenet_api.borrow_mut().take();
                 submitted_game_contract.borrow_mut().take();
                 pending_incoming_acceptance_probe.borrow_mut().take();
@@ -4123,6 +4370,7 @@ mod browser {
                 genesis_refresh_gate.borrow_mut().reset_connection();
                 latest_contract_key.borrow_mut().take();
                 latest_authoritative_state.borrow_mut().take();
+                synchronizing_game_state_for_reconnect.set(true);
                 latest_lobby_contract_key.borrow_mut().take();
                 authoritative_local_role_for_reconnect.set(None);
 
@@ -4133,6 +4381,8 @@ mod browser {
                 dice_secret_status.set("Checking browser storage".to_owned());
 
                 let status_for_callback = connection_status.clone();
+                let epoch_for_status = transport_epoch.clone();
+                let epoch_for_response = transport_epoch.clone();
                 let contract_for_response = contract_status.clone();
                 let contract_for_host_error = contract_status.clone();
                 let lobby_contract_for_response = lobby_contract_status.clone();
@@ -4147,6 +4397,12 @@ mod browser {
                 let secret_status_for_response = dice_secret_status.clone();
                 let key_for_response = latest_contract_key.clone();
                 let state_for_response = latest_authoritative_state.clone();
+                let probe_ids_for_response = history_probe_ids.clone();
+                let probe_status_for_response = inspected_game_statuses.clone();
+                let probe_cache_for_response = inspected_game_status_cache.clone();
+                let history_guard_for_response = verified_history_guard_for_reconnect.clone();
+                let syncing_for_response = synchronizing_game_state_for_reconnect.clone();
+                let view_for_response = verified_game_view_for_reconnect.clone();
                 let scope_for_response = active_game_scope.clone();
                 let scope_snapshot_for_response = scope_for_response.borrow().snapshot();
                 let genesis_readiness_for_response = authenticated_genesis_readiness.clone();
@@ -4175,7 +4431,7 @@ mod browser {
                 let incoming_error_for_status = incoming_acceptance_error.clone();
 
                 let api_for_open = freenet_api.clone();
-                let connection_for_open = connection_status.clone();
+                let epoch_for_open = transport_epoch.clone();
                 let contract_for_open = contract_status.clone();
                 let subscription_for_open = subscription_status.clone();
                 let lobby_contract_for_open = lobby_contract_status.clone();
@@ -4183,6 +4439,9 @@ mod browser {
 
                 match connect(
                     move |status| {
+                        if *epoch_for_status.borrow() != connection_epoch {
+                            return;
+                        }
                         match &status {
                             ConnectionStatus::Connecting => {
                                 subscription_for_status.set(SubscriptionStatus::Pending);
@@ -4217,6 +4476,15 @@ mod browser {
                         status_for_callback.set(status);
                     },
                     move |response| {
+                        if *epoch_for_response.borrow() != connection_epoch {
+                            return;
+                        }
+                        observe_accepted_game_probe(
+                            &response,
+                            &probe_ids_for_response,
+                            &probe_cache_for_response,
+                            &probe_status_for_response,
+                        );
                         if handle_lobby_response(
                             &response,
                             &lobby_contract_for_response,
@@ -4281,8 +4549,10 @@ mod browser {
                                 authoritative_state,
                             } = classified;
 
-                            if let Some(contract) = contract_status {
-                                contract_for_response.set(contract);
+                            if authoritative_state.is_none() {
+                                if let Some(contract) = contract_status.clone() {
+                                    contract_for_response.set(contract);
+                                }
                             }
 
                             if let Some(subscription) = subscription_status {
@@ -4304,6 +4574,31 @@ mod browser {
                                             return;
                                         }
                                     };
+
+                                let verified_ledger = match decode_verified_ledger(&state_bytes) {
+                                    Ok(ledger) => ledger,
+                                    Err(error) => {
+                                        contract_for_response
+                                            .set(ContractProbeStatus::Failed(error));
+                                        return;
+                                    }
+                                };
+                                match history_guard_for_response.borrow_mut().observe(
+                                    &scope_snapshot_for_response,
+                                    verified_ledger.typed_actions(),
+                                ) {
+                                    HistoryDecision::Stale | HistoryDecision::Divergent => {
+                                        syncing_for_response.set(true);
+                                        contract_for_response.set(ContractProbeStatus::Requesting);
+                                        return;
+                                    }
+                                    HistoryDecision::Advance | HistoryDecision::Unchanged => {
+                                        syncing_for_response.set(false);
+                                        if let Some(contract) = contract_status {
+                                            contract_for_response.set(contract);
+                                        }
+                                    }
+                                }
 
                                 let authenticated_genesis = {
                                     let readiness = genesis_readiness_for_response.borrow();
@@ -4370,6 +4665,18 @@ mod browser {
                                     if let Some((authoritative_state, authoritative_history)) =
                                         authoritative_state
                                     {
+                                        let next_view = VerifiedGameView {
+                                            scope: scope_snapshot_for_response.clone(),
+                                            state: authoritative_state.clone(),
+                                            history: authoritative_history.clone(),
+                                            local_role: authoritative_player,
+                                            action_count: verified_ledger.action_count(),
+                                            ledger_hash: verified_ledger
+                                                .typed_actions()
+                                                .last()
+                                                .expect("nonempty replay has a final action")
+                                                .resulting_state_hash,
+                                        };
                                         let mut next = (*controller_for_response).clone();
 
                                         if let Err(error) = next
@@ -4390,6 +4697,7 @@ mod browser {
                                         }
 
                                         controller_for_response.set(next);
+                                        view_for_response.set(Some(next_view));
                                     }
                                 }
 
@@ -4782,7 +5090,7 @@ mod browser {
                     },
                     move || {
                         let api_for_request = api_for_open.clone();
-                        let connection_for_request = connection_for_open.clone();
+                        let epoch_for_request = epoch_for_open.clone();
                         let contract_for_request = contract_for_open.clone();
                         let subscription_for_request = subscription_for_open.clone();
                         let lobby_contract_for_request = lobby_contract_for_open.clone();
@@ -4791,6 +5099,9 @@ mod browser {
                         let scope_snapshot_for_request = scope_snapshot_for_request.clone();
 
                         wasm_bindgen_futures::spawn_local(async move {
+                            if *epoch_for_request.borrow() != connection_epoch {
+                                return;
+                            }
                             if scope_for_request
                                 .borrow()
                                 .recognizes(&scope_snapshot_for_request)
@@ -4836,13 +5147,14 @@ mod browser {
                                 }
                             };
 
+                            if *epoch_for_request.borrow() != connection_epoch {
+                                return;
+                            }
                             if scope_for_request
                                 .borrow()
                                 .recognizes(&scope_snapshot_for_request)
                             {
                                 if let Err(error) = game_result {
-                                    connection_for_request
-                                        .set(ConnectionStatus::Failed(error.clone()));
                                     contract_for_request.set(ContractProbeStatus::Failed(error));
                                     subscription_for_request.set(SubscriptionStatus::Inactive);
                                 }
@@ -4867,7 +5179,9 @@ mod browser {
             })
         };
 
-        let terminal_overlay = if left_table {
+        let terminal_overlay = if *suppress_completed_overlay || *new_game_options {
+            html! {}
+        } else if left_table {
             html! {
                 <div class="game-overlay" role="dialog" aria-modal="true">
                     <div class="result-card leave-card">
@@ -5140,7 +5454,7 @@ mod browser {
             })
         };
 
-        let on_challenge_player: Callback<([u8; 32], String, u64)> = {
+        let on_challenge_player: Callback<([u8; 32], String, Option<u64>, Player)> = {
             let local_player_id = local_player_id.clone();
             let lobby_display_name = lobby_display_name.clone();
             let latest_lobby_contract_key = latest_lobby_contract_key.clone();
@@ -5151,11 +5465,12 @@ mod browser {
             let submitted_game_contract = submitted_game_contract.clone();
 
             Callback::from(
-                move |(recipient_id, recipient_display_name, recipient_presence_expiry): (
-                    [u8; 32],
-                    String,
-                    u64,
-                )| {
+                move |(
+                    recipient_id,
+                    recipient_display_name,
+                    recipient_presence_expiry,
+                    challenger_role,
+                ): ([u8; 32], String, Option<u64>, Player)| {
                     if *challenge_publication_pending {
                         return;
                     }
@@ -5176,7 +5491,7 @@ mod browser {
 
                         let now = local_observation_unix_seconds()?;
 
-                        if now >= recipient_presence_expiry {
+                        if recipient_presence_expiry.is_some_and(|expires| now >= expires) {
                             return Err(
                                 "The selected opponent's availability has expired; refresh the lobby."
                                     .to_owned(),
@@ -5219,6 +5534,7 @@ mod browser {
                             challenger_display_name: lobby_display_name.as_str(),
                             recipient_id,
                             recipient_display_name: &recipient_display_name,
+                            challenger_role,
                             match_length: 1,
                             challenge_id,
                             game_id,
@@ -5506,6 +5822,67 @@ mod browser {
             _ => Ok(Vec::new()),
         };
 
+        let accepted_probe_list = accepted_games.as_ref().map_or_else(
+            |_| Vec::new(),
+            |games| {
+                games
+                    .iter()
+                    .filter(|game| game.contract_id != active_game_scope_snapshot.contract_id)
+                    .map(|game| (game.game_id, game.contract_id.clone()))
+                    .collect::<Vec<_>>()
+            },
+        );
+        {
+            let api = freenet_api.clone();
+            let probe_ids = history_probe_ids.clone();
+            let statuses = inspected_game_statuses.clone();
+            let cache = inspected_game_status_cache.clone();
+            use_effect_with(
+                (accepted_probe_list, (*connection_status).clone()),
+                move |(games, connection)| {
+                    if matches!(connection, ConnectionStatus::Connected) {
+                        let candidates = games.iter().take(32).cloned().collect::<Vec<_>>();
+                        {
+                            let mut ids = probe_ids.borrow_mut();
+                            ids.clear();
+                            ids.extend(
+                                candidates
+                                    .iter()
+                                    .cloned()
+                                    .map(|(game_id, id)| (id, game_id)),
+                            );
+                        }
+                        let api = api.clone();
+                        let statuses = statuses.clone();
+                        let cache = cache.clone();
+                        wasm_bindgen_futures::spawn_local(async move {
+                            for (game_id, contract_id) in candidates {
+                                let result = {
+                                    let mut api = api.borrow_mut();
+                                    match api.as_mut() {
+                                        Some(api) => {
+                                            request_contract_snapshot(api, &contract_id).await
+                                        }
+                                        None => Err(
+                                            "Connection closed during accepted-game inspection."
+                                                .to_owned(),
+                                        ),
+                                    }
+                                };
+                                if let Err(error) = result {
+                                    let mut next = cache.borrow().clone();
+                                    next.insert(game_id, InspectedGameStatus::Failed(error));
+                                    *cache.borrow_mut() = next.clone();
+                                    statuses.set(next);
+                                }
+                            }
+                        });
+                    }
+                    || {}
+                },
+            );
+        }
+
         /*
          * Never trust the retained game ID by itself. Re-resolve it against
          * the current authoritative candidates before exposing any selected
@@ -5550,6 +5927,8 @@ mod browser {
             let pending_confirmation = pending_confirmation.clone();
             let local_dice_secret = local_dice_secret.clone();
             let activation_status = accepted_game_activation_status.clone();
+            let suppress_completed_overlay = suppress_completed_overlay.clone();
+            let verified_game_view = verified_game_view.clone();
             let reconnect = on_reconnect.clone();
 
             Callback::from(move |event| {
@@ -5609,6 +5988,8 @@ mod browser {
                         *active_game_scope.borrow_mut() = next_scope;
 
                         controller.set(LocalGameController::new());
+                        verified_game_view.set(None);
+                        suppress_completed_overlay.set(false);
                         pending_confirmation.set(None);
                         local_dice_secret.borrow_mut().take();
                         local_role.set(Ok(Some(accepted.local_role)));
@@ -5648,10 +6029,85 @@ mod browser {
 
         let on_clear_accepted_game = {
             let selected_game_id = selected_accepted_game_id.clone();
+            let activation_status = accepted_game_activation_status.clone();
 
             Callback::from(move |_| {
                 selected_game_id.set(None);
+                activation_status
+                    .set("Selection cleared; active contract remains unchanged".to_owned());
             })
+        };
+
+        let rematch_target = if outcome.is_some() {
+            active_game_scope.borrow().accepted_game().map(|accepted| {
+                let peer = match accepted.local_role {
+                    Player::White => &accepted.accepted_proposal.configuration.black,
+                    Player::Black => &accepted.accepted_proposal.configuration.white,
+                };
+                (peer.id, peer.display_name.clone(), accepted.local_role)
+            })
+        } else {
+            None
+        };
+
+        let new_game_overlay = if *new_game_options {
+            let close = {
+                let options = new_game_options.clone();
+                Callback::from(move |_| options.set(false))
+            };
+            let new_opponent = {
+                let options = new_game_options.clone();
+                let suppress = suppress_completed_overlay.clone();
+                Callback::from(move |_| {
+                    options.set(false);
+                    suppress.set(true);
+                })
+            };
+            let rematch_buttons = rematch_target.map_or_else(|| html! {}, |(peer_id, peer_name, old_role)| {
+                let make_button = |proposed_role: Player, label: &'static str| {
+                    let callback = on_challenge_player.clone();
+                    let name = peer_name.clone();
+                    let options = new_game_options.clone();
+                    let suppress = suppress_completed_overlay.clone();
+                    html! {
+                        <button type="button" class="overlay-action"
+                            disabled={
+                                *challenge_publication_pending
+                                    || (*local_player_id).is_none()
+                                    || latest_lobby_contract_key.borrow().is_none()
+                                    || freenet_api.borrow().is_none()
+                            }
+                            onclick={Callback::from(move |_| {
+                                callback.emit((peer_id, name.clone(), None, proposed_role));
+                                options.set(false);
+                                suppress.set(true);
+                            })}>
+                            {format!("{label} — you play {}", player_name(proposed_role))}
+                        </button>
+                    }
+                };
+                html! {
+                    <>
+                        <p>{format!("Offer a new signed game to {}. Colors are fixed in the proposal before acceptance.", peer_name)}</p>
+                        {make_button(old_role, "Rematch, same colors")}
+                        {make_button(old_role.opponent(), "Switch colors")}
+                    </>
+                }
+            });
+            html! {
+                <div class="game-overlay" role="dialog" aria-modal="true">
+                    <div class="result-card leave-card">
+                        <h2>{"Start another network game"}</h2>
+                        {rematch_buttons}
+                        <button type="button" class="overlay-action" onclick={new_opponent}>
+                            {"New opponent — return to matchmaking"}
+                        </button>
+                        <button type="button" onclick={close}>{"Cancel"}</button>
+                    </div>
+                </div>
+            }
+        } else {
+            html! {}
         };
 
         let lobby_network_detail = match lobby_now.as_ref() {
@@ -5710,17 +6166,17 @@ mod browser {
         let lobby_availability_label = if *lobby_presence_submission_pending {
             "Publishing"
         } else if *lobby_available {
-            "Available"
+            "Accepting new challenges"
         } else {
-            "Unavailable"
+            "Not accepting new challenges"
         };
 
         let lobby_availability_action = if *lobby_presence_submission_pending {
             "Publishing presence…"
         } else if *lobby_available {
-            "Go unavailable"
+            "Stop accepting new challenges"
         } else {
-            "Go available"
+            "Accept new challenges"
         };
 
         let lobby_profile_controls_disabled =
@@ -5847,7 +6303,7 @@ mod browser {
 
                         <p class="panel-note">
                             {
-                                "This control publishes signed presence to Freenet. Revisions order updates; this browser's clock only bounds the ten-minute discovery lease."
+                                "This setting controls discovery by new opponents. It does not affect an established game or the local node connection."
                             }
                         </p>
 
@@ -5920,7 +6376,8 @@ mod browser {
                                                     let challenge_target = (
                                                         player.player_id,
                                                         player.display_name.clone(),
-                                                        player.expires_at_unix_seconds,
+                                                        Some(player.expires_at_unix_seconds),
+                                                        Player::White,
                                                     );
 
                                                     let on_challenge = {
@@ -6079,8 +6536,10 @@ mod browser {
                                                                 <span>
                                                                     {
                                                                         format!(
-                                                                            "Match length: {}",
+                                                                            "Match length: {} · You play {} · Challenger plays {}",
                                                                             challenge.match_length,
+                                                                            player_name(challenge.recipient_role),
+                                                                            player_name(challenge.recipient_role.opponent()),
                                                                         )
                                                                     }
                                                                 </span>
@@ -6191,7 +6650,11 @@ mod browser {
                             <strong>{ turn_text }</strong>
 
                             <p class="panel-note">
-                                { controller.status_message().to_owned() }
+                                { if controller_matches_verified_view {
+                                    controller.status_message().to_owned()
+                                } else {
+                                    "Synchronizing latest verified game state".to_owned()
+                                } }
                             </p>
 
                             {
@@ -6206,7 +6669,11 @@ mod browser {
                             }
                         </section>
 
-                        <DiceDisplay dice={board.dice} />
+                        <DiceDisplay
+                            dice={board.dice}
+                            remaining={remaining_dice}
+                            preview={preview_in_progress}
+                        />
 
                         <GameControls
                             can_roll={can_roll}
@@ -6225,18 +6692,31 @@ mod browser {
                     </aside>
 
                     <section class="board-stage" aria-label="Game board">
-                        <Board
-                            board={board}
-                            legal_sources={legal_sources}
-                            selected_source={selected_source}
-                            legal_destinations={legal_destinations}
-                            on_source={on_source}
-                            on_destination={on_destination}
-                        />
+                        {
+                            if verified_game_created {
+                                html! {
+                                    <Board
+                                        board={board}
+                                        legal_sources={legal_sources}
+                                        selected_source={selected_source}
+                                        legal_destinations={legal_destinations}
+                                        on_source={on_source}
+                                        on_destination={on_destination}
+                                    />
+                                }
+                            } else {
+                                html! {
+                                    <div class="panel" role="status">
+                                        <h2>{"Waiting for authoritative game creation"}</h2>
+                                        <p>{"The board becomes playable after a verified CreateGame action appears in this contract."}</p>
+                                    </div>
+                                }
+                            }
+                        }
                     </section>
 
                     <aside class="right-rail">
-                        <MoveHistory history={controller.history().to_vec()} />
+                        <MoveHistory history={visible_history} />
 
                         <section class="panel status-panel" aria-labelledby="status-heading">
                             <h2 id="status-heading">{ "Connection" }</h2>
@@ -6381,6 +6861,16 @@ mod browser {
                                                             {
                                                                 if selected_game_is_active {
                                                                     "Active game"
+                                                                } else if matches!(
+                                                                    inspected_game_statuses.get(&game.game_id),
+                                                                    Some(InspectedGameStatus::InProgress)
+                                                                ) {
+                                                                    "Resume game"
+                                                                } else if matches!(
+                                                                    inspected_game_statuses.get(&game.game_id),
+                                                                    Some(InspectedGameStatus::Completed)
+                                                                ) {
+                                                                    "Inspect archive"
                                                                 } else {
                                                                     "Activate game"
                                                                 }
@@ -6440,123 +6930,109 @@ mod browser {
                                     </dd>
                                 </div>
 
-                                <div>
+                                <div class="accepted-games-row">
                                     <dt>{ "Accepted games" }</dt>
-                                    <dd>
+                                    <dd class="accepted-games-container">
                                         {
                                             match &accepted_games {
-                                                Ok(games) if games.is_empty() => html! {
-                                                    <span>{ "0 verified" }</span>
-                                                },
-
                                                 Ok(games) => html! {
                                                     <>
-                                                        <span>
-                                                            {
-                                                                format!(
-                                                                    "{} verified",
-                                                                    games.len()
-                                                                )
-                                                            }
-                                                        </span>
-
-                                                        <ul
-                                                            class="available-player-list"
-                                                        >
-                                                            {
-                                                                for games.iter().map(
-                                                                    |game| {
-                                                                        let game_id =
-                                                                            game.game_id;
-
-                                                                        let is_selected =
-                                                                            matches!(
-                                                                                &selected_accepted_game,
-                                                                                Ok(Some(selected))
-                                                                                    if selected.game_id
-                                                                                        == game_id
-                                                                            );
-
-                                                                        let on_select = {
-                                                                            let selected_game_id =
-                                                                                selected_accepted_game_id
-                                                                                    .clone();
-
-                                                                            Callback::from(
-                                                                                move |_| {
-                                                                                    selected_game_id
-                                                                                        .set(
-                                                                                            Some(
-                                                                                                game_id
-                                                                                            )
-                                                                                        );
-                                                                                },
-                                                                            )
-                                                                        };
-
-                                                                        html! {
-                                                                            <li>
-                                                                                <strong>
-                                                                                    {
-                                                                                        format_player_id(
-                                                                                            &game.game_id
-                                                                                        )
+                                                        <span>{format!("{} verified accepted records, newest offers first", games.len())}</span>
+                                                        {
+                                                            for AcceptedGameSection::ALL.into_iter().map(|section| {
+                                                                let active_id = active_game_scope.borrow()
+                                                                    .accepted_game().map(|game| game.game_id);
+                                                                let selected_id = *selected_accepted_game_id;
+                                                                let activation_failed = accepted_game_activation_status
+                                                                    .starts_with("Activation refused:");
+                                                                let entries = games.iter().filter(|game| {
+                                                                    classify_accepted_game(
+                                                                        game.game_id,
+                                                                        active_id,
+                                                                        selected_id,
+                                                                        outcome.is_some(),
+                                                                        activation_failed,
+                                                                        inspected_game_statuses.get(&game.game_id),
+                                                                    ) == section
+                                                                }).collect::<Vec<_>>();
+                                                                html! {
+                                                                    <section class={classes!(
+                                                                        "accepted-game-section",
+                                                                        (section == AcceptedGameSection::CompletedArchive)
+                                                                            .then_some("completed-archive"),
+                                                                    )}>
+                                                                        <h3>{format!("{} ({})", section.label(), entries.len())}</h3>
+                                                                        <ul class="accepted-game-list">
+                                                                            {
+                                                                                for entries.into_iter().map(|game| {
+                                                                                    let game_id = game.game_id;
+                                                                                    let is_selected = selected_id == Some(game_id);
+                                                                                    let is_active = active_id == Some(game_id);
+                                                                                    let game_id_full = format_player_id(&game_id);
+                                                                                    let peer_id_full = format_player_id(&game.peer_id);
+                                                                                    let contract_full = game.contract_id.clone();
+                                                                                    let inspection = inspected_game_statuses.get(&game_id)
+                                                                                        .map(|status| match status {
+                                                                                            InspectedGameStatus::Empty => "Verified empty ledger".to_owned(),
+                                                                                            InspectedGameStatus::InProgress => "Verified game in progress".to_owned(),
+                                                                                            InspectedGameStatus::Completed => "Verified complete".to_owned(),
+                                                                                            InspectedGameStatus::MissingContract => "Contract not found".to_owned(),
+                                                                                            InspectedGameStatus::Failed(error) => format!("Inspection pending: {error}"),
+                                                                                        }).unwrap_or_else(|| "Awaiting contract inspection".to_owned());
+                                                                                    let on_select = {
+                                                                                        let selected = selected_accepted_game_id.clone();
+                                                                                        let activation_status = accepted_game_activation_status.clone();
+                                                                                        Callback::from(move |_| {
+                                                                                            selected.set(Some(game_id));
+                                                                                            activation_status.set("Accepted game selected for inspection or activation".to_owned());
+                                                                                        })
+                                                                                    };
+                                                                                    let make_copy = |value: String, label: &'static str| {
+                                                                                        let status = copy_status.clone();
+                                                                                        Callback::from(move |_| {
+                                                                                            match copy_identifier(&value) {
+                                                                                                Ok(promise) => {
+                                                                                                    let status = status.clone();
+                                                                                                    wasm_bindgen_futures::spawn_local(async move {
+                                                                                                        if wasm_bindgen_futures::JsFuture::from(promise).await.is_ok() {
+                                                                                                            status.set(format!("Copied {label}"));
+                                                                                                        } else {
+                                                                                                            status.set(format!("Could not copy {label}"));
+                                                                                                        }
+                                                                                                    });
+                                                                                                }
+                                                                                                Err(error) => status.set(error),
+                                                                                            }
+                                                                                        })
+                                                                                    };
+                                                                                    html! {
+                                                                                        <li>
+                                                                                            <strong>{format!("{} · {}", short_identifier(&peer_id_full), player_name(game.local_role))}</strong>
+                                                                                            <span>{format!("Offered {}", offered_time(game.offered_at_unix_seconds))}</span>
+                                                                                            <span>{inspection}</span>
+                                                                                            <span title={game_id_full.clone()}>{format!("Game {}", short_identifier(&game_id_full))}</span>
+                                                                                            <span title={contract_full.clone()}>{format!("Contract {}", short_identifier(&contract_full))}</span>
+                                                                                            <button type="button" onclick={make_copy(game_id_full, "game ID")}>{"Copy game ID"}</button>
+                                                                                            <button type="button" onclick={make_copy(contract_full, "contract ID")}>{"Copy contract ID"}</button>
+                                                                                            <button type="button" class="challenge-player-button"
+                                                                                                onclick={on_select} disabled={is_selected || is_active}>
+                                                                                                {if is_active { "Current" } else if is_selected { "Selected" } else { "Select / inspect" }}
+                                                                                            </button>
+                                                                                        </li>
                                                                                     }
-                                                                                </strong>
-
-                                                                                <span>
-                                                                                    {
-                                                                                        format!(
-                                                                                            "Peer: {} · Role: {} · Contract: {}",
-                                                                                            format_player_id(
-                                                                                                &game.peer_id
-                                                                                            ),
-                                                                                            player_name(
-                                                                                                game.local_role
-                                                                                            ),
-                                                                                            game.contract_id,
-                                                                                        )
-                                                                                    }
-                                                                                </span>
-
-                                                                                <button
-                                                                                    type="button"
-                                                                                    class="challenge-player-button"
-                                                                                    onclick={
-                                                                                        on_select
-                                                                                    }
-                                                                                    disabled={
-                                                                                        is_selected
-                                                                                    }
-                                                                                >
-                                                                                    {
-                                                                                        if is_selected {
-                                                                                            "Selected"
-                                                                                        } else {
-                                                                                            "Select game"
-                                                                                        }
-                                                                                    }
-                                                                                </button>
-                                                                            </li>
-                                                                        }
-                                                                    }
-                                                                )
-                                                            }
-                                                        </ul>
+                                                                                })
+                                                                            }
+                                                                        </ul>
+                                                                    </section>
+                                                                }
+                                                            })
+                                                        }
+                                                        <p class="panel-note">{"Historical contracts are inspected independently; completion is shown only after verified replay."}</p>
+                                                        <p class="panel-note" role="status">{(*copy_status).clone()}</p>
                                                     </>
                                                 },
-
                                                 Err(error) => html! {
-                                                    <span
-                                                        class="interface-error"
-                                                        role="alert"
-                                                    >
-                                                        {
-                                                            format!(
-                                                                "Projection unavailable: {error}"
-                                                            )
-                                                        }
-                                                    </span>
+                                                    <span class="interface-error" role="alert">{format!("Projection unavailable: {error}")}</span>
                                                 },
                                             }
                                         }
@@ -6569,28 +7045,63 @@ mod browser {
                                 </div>
 
                                 <div>
-                                    <dt>{ "Freenet" }</dt>
+                                    <dt>{ "Local node WebSocket" }</dt>
                                     <dd>{ connection_status.label() }</dd>
                                 </div>
 
                                 <div>
-                                    <dt>{ "Network detail" }</dt>
+                                    <dt>{ "WebSocket detail" }</dt>
                                     <dd>{ connection_status.detail() }</dd>
                                 </div>
 
                                 <div>
-                                    <dt>{ "Contract" }</dt>
+                                    <dt>{ "Game retrieval" }</dt>
                                     <dd>{ contract_status.contract_label() }</dd>
                                 </div>
 
                                 <div>
-                                    <dt>{ "Subscription" }</dt>
+                                    <dt>{ "Game subscription" }</dt>
                                     <dd>{ subscription_status.label() }</dd>
                                 </div>
 
                                 <div>
                                     <dt>{ "State check" }</dt>
                                     <dd>{ contract_status.state_label() }</dd>
+                                </div>
+
+                                <div>
+                                    <dt>{ "Lobby retrieval" }</dt>
+                                    <dd>{ lobby_contract_status.label() }</dd>
+                                </div>
+
+                                <div>
+                                    <dt>{ "Lobby subscription" }</dt>
+                                    <dd>{ lobby_subscription_status.label() }</dd>
+                                </div>
+
+                                <div>
+                                    <dt>{ "Latest verified action" }</dt>
+                                    <dd>{
+                                        current_verified_view
+                                            .map_or_else(|| "None yet".to_owned(), |view| view.action_count.to_string())
+                                    }</dd>
+                                </div>
+
+                                <div>
+                                    <dt>{ "Verified ledger hash" }</dt>
+                                    <dd>{current_verified_view.map_or_else(
+                                        || "None yet".to_owned(),
+                                        |view| short_identifier(&format_player_id(&view.ledger_hash)),
+                                    )}</dd>
+                                </div>
+
+                                <div>
+                                    <dt>{ "Recovery" }</dt>
+                                    <dd>{ if *synchronizing_game_state {
+                                        "Synchronizing latest verified game state"
+                                    } else {
+                                        "Latest verified view displayed"
+                                    } }</dd>
                                 </div>
 
                                 <div>
@@ -6609,6 +7120,7 @@ mod browser {
 
                 { terminal_overlay }
                 { confirmation_overlay }
+                { new_game_overlay }
             </main>
         }
     }

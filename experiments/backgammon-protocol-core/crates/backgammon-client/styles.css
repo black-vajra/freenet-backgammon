@@ -1043,6 +1043,58 @@ h2 {
     list-style: none;
 }
 
+.status-list .accepted-games-row {
+    display: block;
+}
+
+.status-list .accepted-games-container {
+    display: block;
+    margin-top: 0.5rem;
+    text-align: left;
+    overflow-wrap: normal;
+    word-break: normal;
+}
+
+.accepted-game-section {
+    margin-top: 0.8rem;
+    padding-top: 0.5rem;
+    border-top: 1px solid rgba(222, 179, 114, 0.2);
+}
+
+.accepted-game-section h3 {
+    margin: 0 0 0.4rem;
+    font-size: 0.85rem;
+}
+
+.accepted-game-list {
+    display: grid;
+    gap: 0.45rem;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+}
+
+.accepted-game-list li {
+    display: grid;
+    gap: 0.2rem;
+    min-width: 0;
+    padding: 0.55rem;
+    border-radius: 0.5rem;
+    background: rgba(35, 20, 14, 0.5);
+}
+
+.accepted-game-list li span {
+    overflow-wrap: anywhere;
+    font-size: 0.72rem;
+    font-weight: 400;
+}
+
+.accepted-game-section.completed-archive .accepted-game-list {
+    max-height: 15rem;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+}
+
 .available-player-list li {
     display: grid;
     gap: 0.18rem;

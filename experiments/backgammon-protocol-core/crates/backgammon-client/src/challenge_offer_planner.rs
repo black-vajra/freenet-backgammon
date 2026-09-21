@@ -29,6 +29,7 @@ pub struct OutboundChallengePlannerInput<'a> {
     pub challenger_display_name: &'a str,
     pub recipient_id: PlayerId,
     pub recipient_display_name: &'a str,
+    pub challenger_role: backgammon_core::Player,
     pub match_length: u16,
     pub challenge_id: ChallengeId,
     pub game_id: GameId,
@@ -67,9 +68,8 @@ fn verify_independent_identifiers(
 
 /// Builds one authenticated challenge and all deterministic publication bytes.
 ///
-/// The challenger is White and the selected recipient is Black for the first
-/// playable challenge workflow. Color selection can be added later without
-/// changing the authenticated wire format.
+/// The signed proposal fixes colors before the recipient accepts. A rematch
+/// may reverse them without changing the authenticated wire format.
 pub fn plan_outbound_challenge(
     input: OutboundChallengePlannerInput<'_>,
 ) -> Result<OutboundChallengePublicationPlan, String> {
@@ -101,18 +101,25 @@ pub fn plan_outbound_challenge(
         ));
     }
 
+    let challenger = PlayerDescriptor {
+        id: challenger_id,
+        display_name: input.challenger_display_name.to_owned(),
+    };
+    let recipient = PlayerDescriptor {
+        id: input.recipient_id,
+        display_name: input.recipient_display_name.to_owned(),
+    };
+    let (white, black) = match input.challenger_role {
+        backgammon_core::Player::White => (challenger, recipient),
+        backgammon_core::Player::Black => (recipient, challenger),
+    };
+
     let proposal = GenesisProposal::new(
         input.game_id,
         input.genesis_action_id,
         GameConfiguration {
-            white: PlayerDescriptor {
-                id: challenger_id,
-                display_name: input.challenger_display_name.to_owned(),
-            },
-            black: PlayerDescriptor {
-                id: input.recipient_id,
-                display_name: input.recipient_display_name.to_owned(),
-            },
+            white,
+            black,
             match_length: input.match_length,
         },
     );
@@ -186,6 +193,7 @@ mod tests {
             challenger_display_name: "Alice",
             recipient_id,
             recipient_display_name: "Bob",
+            challenger_role: backgammon_core::Player::White,
             match_length: 5,
             challenge_id,
             game_id,
@@ -231,6 +239,33 @@ mod tests {
         assert_eq!(decoded.challenges.offers.len(), 1);
         assert_eq!(decoded.challenges.offers[0].offer, plan.signed_offer,);
         assert!(decoded.challenges.offers[0].terminal_evidence.is_empty());
+    }
+
+    #[test]
+    fn switched_rematch_colors_are_signed_before_recipient_accepts() {
+        let challenger = challenger();
+        let recipient = recipient();
+        let mut proposal = input(
+            &challenger,
+            recipient.verifying_key().to_bytes(),
+            [14; 32],
+            [15; 32],
+            [16; 32],
+        );
+        proposal.challenger_role = backgammon_core::Player::Black;
+        let plan = plan_outbound_challenge(proposal).unwrap();
+        let configuration = &plan.signed_offer.body.proposal.configuration;
+        assert_eq!(configuration.white.id, recipient.verifying_key().to_bytes());
+        assert_eq!(
+            configuration.black.id,
+            challenger.verifying_key().to_bytes()
+        );
+        assert_eq!(
+            plan.signed_offer.body.recipient_id().unwrap(),
+            configuration.white.id
+        );
+        assert_eq!(configuration.white.display_name, "Bob");
+        assert_eq!(configuration.black.display_name, "Alice");
     }
 
     #[test]

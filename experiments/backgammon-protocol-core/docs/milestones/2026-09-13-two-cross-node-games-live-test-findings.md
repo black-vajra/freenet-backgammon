@@ -12,6 +12,31 @@ interface defects that must be corrected before public distribution. This
 document separates observed facts from proposed diagnoses; exact source-level
 causes still require verification.
 
+## Repair checkpoint — 2026-09-21
+
+The source-level repair pass for the findings below is complete and awaits the
+fresh-lobby and two-node live validation described in the clean testing policy.
+The authenticated-genesis reconnect repair was committed separately as
+`63d82474b6ef647db13d2595553e7f2af60ef231`. The subsequent combined repair
+checkpoint passed 522 native tests across the client, game contract, game core,
+lobby contract, lobby core, and protocol crates. The browser client also passed
+`cargo check -p backgammon-client --target wasm32-unknown-unknown`.
+
+The combined checkpoint adds monotonic verified-history guarding, including the
+deterministic 33-to-31-to-34 regression; one immutable verified game view for
+board, dice, turn, legal-move, and history rendering; explicitly labeled local
+move previews with consumed dice; separate transport, request, subscription,
+and synchronization states; one bounded automatic reconnect attempt plus manual
+reconnect; independently fetched accepted-game status and history sections;
+short identifiers and copy controls; scrollable completed history; signed
+same-color and switched-color rematch proposals; non-destructive new-opponent
+navigation; and corrected availability and turn wording.
+
+This checkpoint has not yet been declared live-verified. The next step remains
+publishing a fresh canonical empty lobby, confirming it independently through
+both nodes, exercising activation and interrupted creation recovery, and then
+playing the next complete cross-node game.
+
 ## Test environment
 
 Both machines ran the same locally patched Freenet build:

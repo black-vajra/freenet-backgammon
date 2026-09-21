@@ -4,6 +4,8 @@ use yew::prelude::*;
 #[derive(Properties, PartialEq)]
 pub struct DiceDisplayProps {
     pub dice: Option<Dice>,
+    pub remaining: Vec<u8>,
+    pub preview: bool,
 }
 
 #[function_component(DiceDisplay)]
@@ -32,13 +34,26 @@ pub fn dice_display(props: &DiceDisplayProps) -> Html {
 
             <p class="panel-note">
                 {
-                    if values.is_some() {
+                    if props.preview {
+                        "Local move preview — awaiting authoritative confirmation"
+                    } else if values.is_some() {
                         "Current verified roll"
                     } else {
                         "Awaiting roll"
                     }
                 }
             </p>
+            {
+                props.dice.map_or_else(|| html! {}, |_| html! {
+                    <p class="panel-note">
+                        { format!("Dice remaining: {}", if props.remaining.is_empty() {
+                            "none".to_owned()
+                        } else {
+                            props.remaining.iter().map(u8::to_string).collect::<Vec<_>>().join(", ")
+                        }) }
+                    </p>
+                })
+            }
         </section>
     }
 }

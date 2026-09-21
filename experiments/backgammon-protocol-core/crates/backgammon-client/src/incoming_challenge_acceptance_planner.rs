@@ -220,6 +220,7 @@ mod tests {
             challenger_display_name: "Alice",
             recipient_id: recipient.verifying_key().to_bytes(),
             recipient_display_name: "Bob",
+            challenger_role: backgammon_core::Player::White,
             match_length: 3,
             challenge_id: [41_u8; 32],
             game_id: [42_u8; 32],

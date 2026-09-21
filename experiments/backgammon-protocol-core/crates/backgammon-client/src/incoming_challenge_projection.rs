@@ -19,6 +19,7 @@ pub struct IncomingChallenge {
     pub challenger_display_name: String,
     pub game_id: GameId,
     pub match_length: u16,
+    pub recipient_role: backgammon_core::Player,
     pub created_at_unix_seconds: u64,
     pub expires_at_unix_seconds: u64,
 }
@@ -42,6 +43,11 @@ fn project_candidate(
 
     let challenger_id = state.offer.body.challenger_id;
     let configuration = &state.offer.body.proposal.configuration;
+    let recipient_role = if configuration.white.id == local_player_id {
+        backgammon_core::Player::White
+    } else {
+        backgammon_core::Player::Black
+    };
 
     let challenger_display_name = if configuration.white.id == challenger_id {
         configuration.white.display_name.clone()
@@ -62,6 +68,7 @@ fn project_candidate(
             challenger_display_name,
             game_id: state.offer.body.proposal.game_id,
             match_length: configuration.match_length,
+            recipient_role,
             created_at_unix_seconds: state.offer.body.created_at_unix_seconds,
             expires_at_unix_seconds: state.offer.body.expires_at_unix_seconds,
         },
@@ -169,6 +176,7 @@ mod tests {
             challenger_display_name: "Alice",
             recipient_id: recipient.verifying_key().to_bytes(),
             recipient_display_name: "Bob",
+            challenger_role: backgammon_core::Player::White,
             match_length: 3,
             challenge_id: [challenge_id; 32],
             game_id: [game_id; 32],

@@ -205,6 +205,31 @@ pub async fn request_contract(
     .map_err(|error| format!("Could not request the test ledger: {error:?}"))
 }
 
+/// Reads an accepted game's terminal status without retaining a subscription
+/// to every historical contract in the lobby.
+#[cfg(target_arch = "wasm32")]
+pub async fn request_contract_snapshot(
+    api: &mut freenet_stdlib::client_api::WebApi,
+    contract_id: &str,
+) -> Result<(), String> {
+    use freenet_stdlib::client_api::{ClientRequest, ContractRequest};
+    use freenet_stdlib::prelude::ContractInstanceId;
+
+    let key = ContractInstanceId::try_from(contract_id.to_owned())
+        .map_err(|error| format!("Invalid historical contract ID: {error}"))?;
+    if key.encode() != contract_id {
+        return Err("Historical contract ID is not canonically encoded.".to_owned());
+    }
+    api.send(ClientRequest::ContractOp(ContractRequest::Get {
+        key,
+        return_contract_code: false,
+        subscribe: false,
+        blocking_subscribe: false,
+    }))
+    .await
+    .map_err(|error| format!("Could not inspect accepted game: {error:?}"))
+}
+
 #[cfg(target_arch = "wasm32")]
 pub async fn submit_action_delta(
     api: &mut freenet_stdlib::client_api::WebApi,
