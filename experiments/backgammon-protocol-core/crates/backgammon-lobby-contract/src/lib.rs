@@ -4,7 +4,7 @@
 
 pub use backgammon_lobby_core::*;
 
-use ciborium::{de::from_reader, ser::into_writer};
+use ciborium::{de::from_reader, ser::into_writer, value::Value};
 use freenet_scaffold::ComposableState;
 use freenet_stdlib::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -65,7 +65,29 @@ fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, ContractError> {
 }
 
 fn decode_parameters(parameters: Parameters<'_>) -> Result<(), ContractError> {
-    decode(parameters.as_ref())
+    let bytes = parameters.as_ref();
+    let mut cursor = std::io::Cursor::new(bytes);
+    let value: Value =
+        from_reader(&mut cursor).map_err(|error| ContractError::Deser(error.to_string()))?;
+    if cursor.position() != bytes.len() as u64 {
+        return Err(ContractError::InvalidState);
+    }
+
+    match value {
+        // Keep old lobby instances valid after deploying this contract code.
+        Value::Null => Ok(()),
+        Value::Text(label) => {
+            let nonce = label.strip_prefix("backgammon-lobby-v1:");
+            if nonce.is_some_and(|nonce| {
+                nonce.len() == 32 && nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
+            }) {
+                Ok(())
+            } else {
+                Err(ContractError::InvalidState)
+            }
+        }
+        _ => Err(ContractError::InvalidState),
+    }
 }
 
 #[contract]
@@ -251,6 +273,27 @@ mod tests {
 
     fn contract_parameters() -> Parameters<'static> {
         Parameters::from(encoded(&()))
+    }
+
+    #[test]
+    fn lobby_instance_parameters_accept_legacy_and_unique_instances() {
+        assert!(decode_parameters(contract_parameters()).is_ok());
+        let label = format!("backgammon-lobby-v1:{}", "a1".repeat(16));
+        assert!(decode_parameters(Parameters::from(encoded(&label))).is_ok());
+    }
+
+    #[test]
+    fn lobby_instance_parameters_reject_malformed_or_ambiguous_instances() {
+        for label in [
+            "backgammon-lobby-v1:short",
+            "backgammon-lobby-v1:0000000000000000000000000000000g",
+            "other-lobby-v1:00000000000000000000000000000000",
+        ] {
+            assert!(decode_parameters(Parameters::from(encoded(&label))).is_err());
+        }
+        let mut padded = encoded(&());
+        padded.push(0xf6);
+        assert!(decode_parameters(Parameters::from(padded)).is_err());
     }
 
     fn encoded<T: Serialize>(value: &T) -> Vec<u8> {
