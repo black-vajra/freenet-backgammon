@@ -6718,7 +6718,7 @@ mod browser {
                     <aside class="right-rail">
                         <MoveHistory history={visible_history} />
 
-                        <section class="panel status-panel" aria-labelledby="status-heading">
+                        <section class="panel status-panel" aria-labelledby="status-heading" tabindex="0">
                             <h2 id="status-heading">{ "Connection" }</h2>
 
                             <div

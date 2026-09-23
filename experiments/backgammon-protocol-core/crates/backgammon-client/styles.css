@@ -223,6 +223,31 @@ h2 {
     word-break: break-word;
 }
 
+.status-panel {
+    max-height: min(70vh, 42rem);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    scrollbar-gutter: stable;
+}
+
+.status-panel:focus-visible {
+    outline: 2px solid #e1b56c;
+    outline-offset: 2px;
+}
+
+.status-list > div {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0.15rem;
+    padding-bottom: 0.45rem;
+    border-bottom: 1px solid rgba(222, 179, 114, 0.15);
+}
+
+.status-list > div > dd {
+    text-align: left;
+    word-break: normal;
+}
+
 .turn-panel strong {
     display: block;
     margin-top: 0.65rem;
