@@ -6201,7 +6201,7 @@ mod browser {
             <main class="app-shell">
                 <header class="app-header">
                     <div>
-                        <p class="mode-label">{ "LOCAL TWO-PLAYER MODE" }</p>
+                        <p class="mode-label">{ "FREENET NETWORK PLAY" }</p>
                         <h1>{ "Freenet Backgammon" }</h1>
                     </div>
 
