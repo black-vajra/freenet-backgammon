@@ -28,8 +28,8 @@ pub mod lobby_profile_store;
 pub mod lobby_projection;
 pub mod lobby_transport;
 pub mod local_identity_store;
-pub mod local_state_transport;
 pub mod local_role_store;
+pub mod local_state_transport;
 pub mod pending_action;
 pub mod pending_action_store;
 pub mod play_turn_planner;
@@ -119,6 +119,11 @@ mod browser {
         role_for_player_id,
     };
     use crate::local_role_store::{load_local_role, store_local_role};
+    use crate::local_state_transport::{
+        classify_local_state_delegate_response, delegate_handle_from_wasm,
+        fetch_local_state_delegate_wasm, register_local_state_delegate, request_identity,
+        LocalStateDelegateHandle, LocalStateDelegateResponse,
+    };
     use crate::pending_action_store::{
         load_pending_action, remove_pending_action, store_pending_action,
     };
@@ -1642,6 +1647,9 @@ mod browser {
         /* Passive cryptographic identity; not yet used for role selection. */
         let local_identity_status = use_state(|| "Checking local identity".to_owned());
         let local_player_id = use_state(|| None::<[u8; 32]>);
+        let local_state_delegate = use_mut_ref(|| None::<LocalStateDelegateHandle>);
+        let local_state_delegate_status =
+            use_state(|| "Freenet local-state delegate not checked".to_owned());
 
         /*
          * Lobby profile state tracks this browser's latest successfully
@@ -2620,6 +2628,8 @@ mod browser {
             let synchronizing_game_state_for_effect = synchronizing_game_state.clone();
             let verified_game_view_for_effect = verified_game_view.clone();
 
+            let local_state_delegate_status_for_effect = local_state_delegate_status.clone();
+
             use_effect_with(*auto_reconnect_generation, move |generation| {
                 let connection_generation = *generation;
                 let connection_epoch = {
@@ -2697,6 +2707,9 @@ mod browser {
                 let player_id_for_response = local_player_id_for_effect.clone();
                 let authoritative_role_for_response = authoritative_local_role_for_effect.clone();
                 let controller_for_response = controller_for_effect.clone();
+                let local_state_delegate_for_response = local_state_delegate.clone();
+                let local_state_status_for_response =
+                    local_state_delegate_status_for_effect.clone();
 
                 let incoming_probe_for_status = pending_incoming_acceptance_probe.clone();
                 let incoming_read_for_status = retrieved_incoming_acceptance_read.clone();
@@ -2705,6 +2718,8 @@ mod browser {
                 let incoming_error_for_status = incoming_acceptance_error.clone();
 
                 let api_for_open = freenet_api.clone();
+                let local_state_delegate_for_open = local_state_delegate.clone();
+                let local_state_status_for_open = local_state_delegate_status_for_effect.clone();
                 let contract_for_open = contract_status.clone();
                 let subscription_for_open = subscription_status.clone();
                 let lobby_contract_for_open = lobby_contract_status.clone();
@@ -2814,6 +2829,92 @@ mod browser {
                             &challenge_error_for_response,
                         ) {
                             return;
+                        }
+
+                        let local_state_handle = local_state_delegate_for_response.borrow().clone();
+
+                        if let Some(handle) = local_state_handle {
+                            match classify_local_state_delegate_response(&response, &handle.key) {
+                                Ok(Some(LocalStateDelegateResponse::Registered)) => {
+                                    local_state_status_for_response.set(
+                                        "Freenet local-state delegate registered; requesting identity"
+                                            .to_owned(),
+                                    );
+
+                                    let api = api_for_response.clone();
+                                    let status = local_state_status_for_response.clone();
+
+                                    wasm_bindgen_futures::spawn_local(async move {
+                                        let result = {
+                                            let mut api = api.borrow_mut();
+
+                                            match api.as_mut() {
+                                                Some(api) => request_identity(api, &handle).await,
+                                                None => Err(
+                                                    "Freenet connection closed before identity request"
+                                                        .to_owned(),
+                                                ),
+                                            }
+                                        };
+
+                                        if let Err(error) = result {
+                                            status.set(format!(
+                                                "Freenet local-state identity request failed: {error}"
+                                            ));
+                                        }
+                                    });
+
+                                    return;
+                                }
+
+                                Ok(Some(LocalStateDelegateResponse::Identity(Some(_)))) => {
+                                    local_state_status_for_response.set(
+                                        "Freenet local-state delegate returned a stored identity"
+                                            .to_owned(),
+                                    );
+                                    return;
+                                }
+
+                                Ok(Some(LocalStateDelegateResponse::Identity(None))) => {
+                                    local_state_status_for_response.set(
+                                        "Freenet local-state delegate is working; no identity is stored yet"
+                                            .to_owned(),
+                                    );
+                                    return;
+                                }
+
+                                Ok(Some(LocalStateDelegateResponse::IdentityStored)) => {
+                                    local_state_status_for_response.set(
+                                        "Freenet local-state delegate confirmed identity storage"
+                                            .to_owned(),
+                                    );
+                                    return;
+                                }
+
+                                Ok(Some(LocalStateDelegateResponse::IdentityCleared)) => {
+                                    local_state_status_for_response.set(
+                                        "Freenet local-state delegate confirmed identity removal"
+                                            .to_owned(),
+                                    );
+                                    return;
+                                }
+
+                                Ok(Some(LocalStateDelegateResponse::Error(error))) => {
+                                    local_state_status_for_response.set(format!(
+                                        "Freenet local-state delegate error: {error}"
+                                    ));
+                                    return;
+                                }
+
+                                Ok(None) => {}
+
+                                Err(error) => {
+                                    local_state_status_for_response.set(format!(
+                                        "Invalid Freenet local-state delegate response: {error}"
+                                    ));
+                                    return;
+                                }
+                            }
                         }
 
                         if !scope_for_response
@@ -3383,11 +3484,56 @@ mod browser {
                         let lobby_subscription_for_request = lobby_subscription_for_open.clone();
                         let scope_for_request = scope_for_request.clone();
                         let scope_snapshot_for_request = scope_snapshot_for_request.clone();
+                        let local_state_delegate_for_request =
+                            local_state_delegate_for_open.clone();
+                        let local_state_status_for_request = local_state_status_for_open.clone();
 
                         wasm_bindgen_futures::spawn_local(async move {
                             if *epoch_for_request.borrow() != connection_epoch {
                                 return;
                             }
+
+                            local_state_status_for_request
+                                .set("Loading Freenet local-state delegate".to_owned());
+
+                            match fetch_local_state_delegate_wasm()
+                                .await
+                                .and_then(delegate_handle_from_wasm)
+                            {
+                                Ok((container, handle)) => {
+                                    *local_state_delegate_for_request.borrow_mut() = Some(handle);
+
+                                    local_state_status_for_request
+                                        .set("Registering Freenet local-state delegate".to_owned());
+
+                                    let registration = {
+                                        let mut api = api_for_request.borrow_mut();
+
+                                        match api.as_mut() {
+                                            Some(api) => {
+                                                register_local_state_delegate(api, container).await
+                                            }
+                                            None => Err(
+                                                "Freenet WebSocket opened without an active API handle."
+                                                    .to_owned(),
+                                            ),
+                                        }
+                                    };
+
+                                    if let Err(error) = registration {
+                                        local_state_status_for_request.set(format!(
+                                            "Freenet local-state delegate registration failed: {error}"
+                                        ));
+                                    }
+                                }
+
+                                Err(error) => {
+                                    local_state_status_for_request.set(format!(
+                                        "Freenet local-state delegate could not be prepared: {error}"
+                                    ));
+                                }
+                            }
+
                             if scope_for_request
                                 .borrow()
                                 .recognizes(&scope_snapshot_for_request)
@@ -7043,6 +7189,11 @@ mod browser {
                                 <div>
                                     <dt>{ "Player ID" }</dt>
                                     <dd>{ local_player_id_text }</dd>
+                                </div>
+
+                                <div>
+                                    <dt>{ "Freenet local-state" }</dt>
+                                    <dd>{ (*local_state_delegate_status).clone() }</dd>
                                 </div>
 
                                 <div>

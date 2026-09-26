@@ -1,9 +1,7 @@
 use backgammon_protocol::{
     decode_local_state_response, encode_local_state_request, LocalStateRequest, LocalStateResponse,
 };
-use freenet_stdlib::client_api::{
-    ClientRequest, DelegateRequest, HostResponse, WebApi,
-};
+use freenet_stdlib::client_api::{ClientRequest, DelegateRequest, HostResponse, WebApi};
 use freenet_stdlib::prelude::{
     ApplicationMessage, Delegate, DelegateCode, DelegateContainer, DelegateKey,
     DelegateWasmAPIVersion, InboundDelegateMsg, OutboundDelegateMsg, Parameters,
@@ -19,6 +17,7 @@ pub struct LocalStateDelegateHandle {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LocalStateDelegateResponse {
+    Registered,
     Identity(Option<[u8; 32]>),
     IdentityStored,
     IdentityCleared,
@@ -47,8 +46,7 @@ pub fn delegate_handle_from_wasm(
     let parameters = Parameters::from(Vec::<u8>::new()).into_owned();
     let delegate = Delegate::from((&code, &parameters));
 
-    let container =
-        DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(delegate));
+    let container = DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(delegate));
 
     let handle = LocalStateDelegateHandle {
         key: container.key().clone(),
@@ -63,14 +61,11 @@ pub async fn fetch_local_state_delegate_wasm() -> Result<Vec<u8>, String> {
     use wasm_bindgen::JsCast;
     use wasm_bindgen_futures::JsFuture;
 
-    let window =
-        web_sys::window().ok_or_else(|| "browser window is unavailable".to_owned())?;
+    let window = web_sys::window().ok_or_else(|| "browser window is unavailable".to_owned())?;
 
-    let response_value = JsFuture::from(
-        window.fetch_with_str(LOCAL_STATE_DELEGATE_WASM_URL),
-    )
-    .await
-    .map_err(|error| format!("failed to fetch local-state delegate WASM: {error:?}"))?;
+    let response_value = JsFuture::from(window.fetch_with_str(LOCAL_STATE_DELEGATE_WASM_URL))
+        .await
+        .map_err(|error| format!("failed to fetch local-state delegate WASM: {error:?}"))?;
 
     let response: web_sys::Response = response_value
         .dyn_into()
@@ -172,6 +167,10 @@ pub fn classify_local_state_delegate_response(
         return Ok(None);
     }
 
+    if values.is_empty() {
+        return Ok(Some(LocalStateDelegateResponse::Registered));
+    }
+
     let mut application_response = None;
 
     for value in values {
@@ -180,9 +179,7 @@ pub fn classify_local_state_delegate_response(
         };
 
         if application_response.is_some() {
-            return Err(
-                "local-state delegate returned multiple application responses".to_owned(),
-            );
+            return Err("local-state delegate returned multiple application responses".to_owned());
         }
 
         let decoded = decode_local_state_response(&message.payload)?;
@@ -191,9 +188,7 @@ pub fn classify_local_state_delegate_response(
 
     application_response
         .map(Some)
-        .ok_or_else(|| {
-            "local-state delegate response contained no application message".to_owned()
-        })
+        .ok_or_else(|| "local-state delegate response contained no application message".to_owned())
 }
 
 #[cfg(test)]
@@ -220,5 +215,36 @@ mod tests {
     #[test]
     fn empty_delegate_code_is_rejected() {
         assert!(delegate_handle_from_wasm(Vec::new()).is_err());
+    }
+
+    #[test]
+    fn empty_matching_delegate_response_is_registration_acknowledgement() {
+        let (_, handle) = delegate_handle_from_wasm(vec![0, 97, 115, 109]).unwrap();
+
+        let response = HostResponse::DelegateResponse {
+            key: handle.key.clone(),
+            values: Vec::new(),
+        };
+
+        assert_eq!(
+            classify_local_state_delegate_response(&response, &handle.key).unwrap(),
+            Some(LocalStateDelegateResponse::Registered)
+        );
+    }
+
+    #[test]
+    fn response_for_different_delegate_is_ignored() {
+        let (_, expected) = delegate_handle_from_wasm(vec![0, 97, 115, 109]).unwrap();
+        let (_, other) = delegate_handle_from_wasm(vec![0, 97, 115, 110]).unwrap();
+
+        let response = HostResponse::DelegateResponse {
+            key: other.key,
+            values: Vec::new(),
+        };
+
+        assert_eq!(
+            classify_local_state_delegate_response(&response, &expected.key).unwrap(),
+            None
+        );
     }
 }
