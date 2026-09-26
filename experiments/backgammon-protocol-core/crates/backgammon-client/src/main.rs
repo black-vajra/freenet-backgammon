@@ -28,6 +28,7 @@ pub mod lobby_profile_store;
 pub mod lobby_projection;
 pub mod lobby_transport;
 pub mod local_identity_store;
+pub mod local_state_transport;
 pub mod local_role_store;
 pub mod pending_action;
 pub mod pending_action_store;

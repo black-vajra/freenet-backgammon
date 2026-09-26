@@ -105,6 +105,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "backgammon-local-state-delegate"
+version = "0.1.0"
+dependencies = [
+ "backgammon-protocol",
+ "freenet-stdlib",
+]
+
+[[package]]
 name = "backgammon-protocol"
 version = "0.1.0"
 dependencies = [

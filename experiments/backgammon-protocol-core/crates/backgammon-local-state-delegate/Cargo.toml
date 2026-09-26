@@ -1,0 +1,18 @@
+[package]
+name = "backgammon-local-state-delegate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+backgammon-protocol = { path = "../backgammon-protocol" }
+freenet-stdlib.workspace = true
+
+[features]
+default = ["freenet-main-delegate"]
+freenet-main-delegate = []
+trace = ["freenet-stdlib/trace"]
