@@ -7,6 +7,7 @@ members = [
     "crates/backgammon-lobby-core",
     "crates/backgammon-lobby-contract",
     "crates/backgammon-local-state-delegate",
+    "crates/backgammon-profile-delegate",
     "crates/backgammon-client",
 ]
 

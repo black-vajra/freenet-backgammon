@@ -34,6 +34,7 @@ pub mod pending_action;
 pub mod pending_action_store;
 pub mod play_turn_planner;
 pub mod presence_revision_store;
+pub mod profile_state_transport;
 pub mod projection;
 pub mod request_roll_planner;
 pub mod reveal_planner;
@@ -52,7 +53,8 @@ mod browser {
     use backgammon_lobby_core::LobbyContractState;
     use backgammon_protocol::{
         replay_game, verify_challenge_offer_at, Action, DiceSecret, GameActionPayload,
-        SignedChallengeOffer,
+        ProfileStateAction, ProfileStateRequest, ProfileStateResult, SignedChallengeOffer,
+        PROFILE_STATE_PROTOCOL_VERSION,
     };
     use freenet_stdlib::client_api::{ContractResponse, HostResponse, WebApi};
     use freenet_stdlib::prelude::ContractKey;
@@ -107,8 +109,8 @@ mod browser {
     };
     use crate::incoming_challenge_projection::project_incoming_challenges;
     use crate::ledger_codec::{decode_verified_ledger, decode_verified_replay};
+    use crate::lobby::validate_display_name;
     use crate::lobby_presence_planner::{plan_lobby_presence, LobbyPresencePlannerInput};
-    use crate::lobby_profile_store::{load_lobby_display_name, store_lobby_display_name};
     use crate::lobby_projection::project_available_players;
     use crate::lobby_transport::{
         classify_lobby_response, request_lobby_contract, submit_lobby_state_update,
@@ -122,14 +124,16 @@ mod browser {
     use crate::local_state_transport::{
         classify_local_state_delegate_response, delegate_handle_from_wasm,
         fetch_local_state_delegate_wasm, register_local_state_delegate, request_identity,
-        store_identity,
-        LocalStateDelegateHandle, LocalStateDelegateResponse,
+        store_identity, LocalStateDelegateHandle, LocalStateDelegateResponse,
     };
     use crate::pending_action_store::{
         load_pending_action, remove_pending_action, store_pending_action,
     };
     use crate::play_turn_planner::{plan_play_turn, PlayTurnPlan, PlayTurnPlannerInput};
     use crate::presence_revision_store::reserve_next_presence_revision;
+    use crate::profile_state_transport::{
+        classify_profile_delegate_response, fetch_profile_delegate_wasm, send_profile_request,
+    };
     use crate::projection::BoardView;
     use crate::request_roll_planner::{
         plan_request_roll, RequestRollPlan, RequestRollPlannerInput,
@@ -1620,6 +1624,32 @@ mod browser {
         Failed,
     }
 
+    #[derive(Clone)]
+    enum ProfilePhase {
+        AwaitingRegistration,
+        AwaitingRead {
+            player_id: [u8; 32],
+            request_id: [u8; 32],
+        },
+        Ready {
+            player_id: [u8; 32],
+            name: Option<String>,
+        },
+        AwaitingStore {
+            player_id: [u8; 32],
+            request_id: [u8; 32],
+            name: String,
+        },
+        AwaitingReadback {
+            player_id: [u8; 32],
+            request_id: [u8; 32],
+            name: String,
+        },
+        Failed,
+    }
+
+    fn no_op() {}
+
     #[function_component(App)]
     fn app() -> Html {
         /*
@@ -1656,6 +1686,10 @@ mod browser {
         let delegate_identity_phase = use_mut_ref(|| DelegateIdentityPhase::AwaitingRegistration);
         let local_state_delegate_status =
             use_state(|| "Freenet local-state delegate not checked".to_owned());
+        let profile_delegate = use_mut_ref(|| None::<LocalStateDelegateHandle>);
+        let profile_registered = use_state(|| false);
+        let profile_phase = use_mut_ref(|| ProfilePhase::AwaitingRegistration);
+        let profile_delegate_status = use_state(|| "Profile delegate not checked".to_owned());
 
         /*
          * Lobby profile state tracks this browser's latest successfully
@@ -1803,39 +1837,86 @@ mod browser {
             let lobby_available = lobby_available.clone();
             let lobby_profile_status = lobby_profile_status.clone();
             let lobby_profile_error = lobby_profile_error.clone();
+            let profile_phase = profile_phase.clone();
+            let profile_delegate = profile_delegate.clone();
+            let freenet_api = freenet_api.clone();
+            let transport_epoch = transport_epoch.clone();
 
-            use_effect_with(*local_player_id, move |player_id| {
-                lobby_available.set(false);
-                lobby_profile_error.set(None);
+            use_effect_with(
+                (*local_player_id, *profile_registered),
+                move |(player_id, registered)| {
+                    lobby_available.set(false);
+                    lobby_profile_error.set(None);
+                    lobby_display_name.set(String::new());
 
-                match *player_id {
-                    None => {
-                        lobby_display_name.set(String::new());
-                        lobby_profile_status.set("Waiting for local identity".to_owned());
+                    match *player_id {
+                        None => {
+                            lobby_profile_status.set("Waiting for local identity".to_owned());
+                        }
+                        Some(_) if !*registered => {
+                            lobby_profile_status
+                                .set("Waiting for Freenet profile delegate".to_owned());
+                        }
+                        Some(player_id) => {
+                            let Some(handle) = profile_delegate.borrow().clone() else {
+                                lobby_profile_status.set("Profile delegate unavailable".to_owned());
+                                return no_op as fn();
+                            };
+                            let request_id = match secure_random_32("profile read request ID") {
+                                Ok(request_id) => request_id,
+                                Err(error) => {
+                                    *profile_phase.borrow_mut() = ProfilePhase::Failed;
+                                    lobby_profile_error.set(Some(error));
+                                    return no_op as fn();
+                                }
+                            };
+                            *profile_phase.borrow_mut() = ProfilePhase::AwaitingRead {
+                                player_id,
+                                request_id,
+                            };
+                            lobby_profile_status.set("Reading Freenet profile".to_owned());
+                            let epoch_snapshot = *transport_epoch.borrow();
+                            wasm_bindgen_futures::spawn_local(async move {
+                                if *transport_epoch.borrow() != epoch_snapshot {
+                                    return;
+                                }
+                                let result = {
+                                    let mut api = freenet_api.borrow_mut();
+                                    match api.as_mut() {
+                                        Some(api) => {
+                                            send_profile_request(
+                                                api,
+                                                &handle,
+                                                ProfileStateRequest {
+                                                    version: PROFILE_STATE_PROTOCOL_VERSION,
+                                                    request_id,
+                                                    player_id,
+                                                    action: ProfileStateAction::Get,
+                                                },
+                                            )
+                                            .await
+                                        }
+                                        None => {
+                                            Err("Freenet connection closed before profile read"
+                                                .to_owned())
+                                        }
+                                    }
+                                };
+                                if let Err(error) = result {
+                                    if *transport_epoch.borrow() != epoch_snapshot {
+                                        return;
+                                    }
+                                    *profile_phase.borrow_mut() = ProfilePhase::Failed;
+                                    lobby_profile_error.set(Some(error));
+                                    lobby_profile_status.set("Profile unavailable".to_owned());
+                                }
+                            });
+                        }
                     }
 
-                    Some(player_id) => match load_lobby_display_name(&player_id) {
-                        Ok(Some(display_name)) => {
-                            lobby_display_name.set(display_name);
-                            lobby_profile_status.set("Saved display name loaded".to_owned());
-                        }
-
-                        Ok(None) => {
-                            lobby_display_name.set(String::new());
-                            lobby_profile_status.set("Choose a public display name".to_owned());
-                        }
-
-                        Err(error) => {
-                            lobby_display_name.set(String::new());
-                            lobby_profile_error
-                                .set(Some(format!("Lobby profile storage error: {error}")));
-                            lobby_profile_status.set("Lobby profile unavailable".to_owned());
-                        }
-                    },
-                }
-
-                || {}
-            });
+                    no_op as fn()
+                },
+            );
         }
 
         {
@@ -2615,6 +2696,13 @@ mod browser {
             let local_state_delegate_status_for_effect = local_state_delegate_status.clone();
             let delegate_identity_phase_for_effect = delegate_identity_phase.clone();
             let local_identity_status_for_effect = local_identity_status.clone();
+            let profile_delegate_for_effect = profile_delegate.clone();
+            let profile_registered_for_effect = profile_registered.clone();
+            let profile_phase_for_effect = profile_phase.clone();
+            let profile_status_for_effect = profile_delegate_status.clone();
+            let lobby_name_for_effect = lobby_display_name.clone();
+            let lobby_profile_status_for_effect = lobby_profile_status.clone();
+            let lobby_profile_error_for_effect = lobby_profile_error.clone();
 
             use_effect_with(*auto_reconnect_generation, move |generation| {
                 let connection_generation = *generation;
@@ -2634,6 +2722,9 @@ mod browser {
                 *delegate_identity_phase_for_effect.borrow_mut() =
                     DelegateIdentityPhase::AwaitingRegistration;
                 local_state_delegate.borrow_mut().take();
+                profile_delegate_for_effect.borrow_mut().take();
+                *profile_phase_for_effect.borrow_mut() = ProfilePhase::AwaitingRegistration;
+                profile_registered_for_effect.set(false);
                 submitted_game_contract.borrow_mut().take();
                 pending_incoming_acceptance_probe.borrow_mut().take();
                 retrieved_incoming_acceptance_read.borrow_mut().take();
@@ -2704,6 +2795,13 @@ mod browser {
                     local_state_delegate_status_for_effect.clone();
                 let identity_phase_for_response = delegate_identity_phase_for_effect.clone();
                 let identity_status_for_response = local_identity_status_for_effect.clone();
+                let profile_delegate_for_response = profile_delegate_for_effect.clone();
+                let profile_registered_for_response = profile_registered_for_effect.clone();
+                let profile_phase_for_response = profile_phase_for_effect.clone();
+                let profile_status_for_response = profile_status_for_effect.clone();
+                let lobby_name_for_response = lobby_name_for_effect.clone();
+                let lobby_profile_status_for_response = lobby_profile_status_for_effect.clone();
+                let lobby_profile_error_for_response = lobby_profile_error_for_effect.clone();
 
                 let incoming_probe_for_status = pending_incoming_acceptance_probe.clone();
                 let incoming_read_for_status = retrieved_incoming_acceptance_read.clone();
@@ -2716,6 +2814,9 @@ mod browser {
                 let local_state_status_for_open = local_state_delegate_status_for_effect.clone();
                 let identity_phase_for_open = delegate_identity_phase_for_effect.clone();
                 let identity_status_for_open = local_identity_status_for_effect.clone();
+                let profile_delegate_for_open = profile_delegate_for_effect.clone();
+                let profile_status_for_open = profile_status_for_effect.clone();
+                let profile_phase_for_open = profile_phase_for_effect.clone();
                 let identity_phase_for_status = delegate_identity_phase_for_effect.clone();
                 let identity_status_for_status = local_identity_status_for_effect.clone();
                 let player_id_for_status = local_player_id_for_effect.clone();
@@ -2762,11 +2863,15 @@ mod browser {
                         {
                             return;
                         }
-                        if matches!(&status, ConnectionStatus::Disconnected | ConnectionStatus::Failed(_)) {
+                        if matches!(
+                            &status,
+                            ConnectionStatus::Disconnected | ConnectionStatus::Failed(_)
+                        ) {
                             clear_cached_identity();
                             player_id_for_status.set(None);
                             *identity_phase_for_status.borrow_mut() = DelegateIdentityPhase::Failed;
-                            identity_status_for_status.set("Freenet identity unavailable while disconnected".to_owned());
+                            identity_status_for_status
+                                .set("Freenet identity unavailable while disconnected".to_owned());
                         }
                         let should_retry = matches!(
                             &status,
@@ -2862,7 +2967,9 @@ mod browser {
                                     let epoch = epoch_for_response.clone();
 
                                     wasm_bindgen_futures::spawn_local(async move {
-                                        if *epoch.borrow() != connection_epoch { return; }
+                                        if *epoch.borrow() != connection_epoch {
+                                            return;
+                                        }
                                         let result = {
                                             let mut api = api.borrow_mut();
 
@@ -2876,11 +2983,14 @@ mod browser {
                                         };
 
                                         if let Err(error) = result {
-                                            if *epoch.borrow() != connection_epoch { return; }
+                                            if *epoch.borrow() != connection_epoch {
+                                                return;
+                                            }
                                             *phase.borrow_mut() = DelegateIdentityPhase::Failed;
                                             clear_cached_identity();
                                             player_id.set(None);
-                                            identity_status.set("Freenet identity unavailable".to_owned());
+                                            identity_status
+                                                .set("Freenet identity unavailable".to_owned());
                                             status.set(format!(
                                                 "Freenet local-state identity request failed: {error}"
                                             ));
@@ -2893,53 +3003,78 @@ mod browser {
                                 Ok(Some(LocalStateDelegateResponse::Identity(Some(seed)))) => {
                                     let verified = match &*identity_phase_for_response.borrow() {
                                         DelegateIdentityPhase::AwaitingIdentity => true,
-                                        DelegateIdentityPhase::AwaitingReadback(candidate) =>
-                                            verify_identity_readback(candidate, &seed).is_ok(),
+                                        DelegateIdentityPhase::AwaitingReadback(candidate) => {
+                                            verify_identity_readback(candidate, &seed).is_ok()
+                                        }
                                         _ => return,
                                     };
                                     if !verified {
-                                        *identity_phase_for_response.borrow_mut() = DelegateIdentityPhase::Failed;
+                                        *identity_phase_for_response.borrow_mut() =
+                                            DelegateIdentityPhase::Failed;
                                         clear_cached_identity();
                                         player_id_for_response.set(None);
-                                        identity_status_for_response.set("Freenet identity readback mismatch".to_owned());
-                                        local_state_status_for_response.set("Freenet identity readback mismatch".to_owned());
+                                        identity_status_for_response
+                                            .set("Freenet identity readback mismatch".to_owned());
+                                        local_state_status_for_response
+                                            .set("Freenet identity readback mismatch".to_owned());
                                         return;
                                     }
                                     let player_id = cache_identity(seed);
-                                    *identity_phase_for_response.borrow_mut() = DelegateIdentityPhase::Ready;
+                                    *identity_phase_for_response.borrow_mut() =
+                                        DelegateIdentityPhase::Ready;
                                     player_id_for_response.set(Some(player_id));
-                                    identity_status_for_response.set("Freenet identity ready".to_owned());
-                                    local_state_status_for_response.set("Freenet identity verified".to_owned());
+                                    identity_status_for_response
+                                        .set("Freenet identity ready".to_owned());
+                                    local_state_status_for_response
+                                        .set("Freenet identity verified".to_owned());
                                     return;
                                 }
 
                                 Ok(Some(LocalStateDelegateResponse::Identity(None))) => {
-                                    if matches!(*identity_phase_for_response.borrow(), DelegateIdentityPhase::AwaitingReadback(_)) {
-                                        *identity_phase_for_response.borrow_mut() = DelegateIdentityPhase::Failed;
-                                        identity_status_for_response.set("Freenet identity unavailable".to_owned());
-                                        local_state_status_for_response.set("Stored Freenet identity was absent on readback".to_owned());
+                                    if matches!(
+                                        *identity_phase_for_response.borrow(),
+                                        DelegateIdentityPhase::AwaitingReadback(_)
+                                    ) {
+                                        *identity_phase_for_response.borrow_mut() =
+                                            DelegateIdentityPhase::Failed;
+                                        identity_status_for_response
+                                            .set("Freenet identity unavailable".to_owned());
+                                        local_state_status_for_response.set(
+                                            "Stored Freenet identity was absent on readback"
+                                                .to_owned(),
+                                        );
                                         return;
                                     }
-                                    if !matches!(*identity_phase_for_response.borrow(), DelegateIdentityPhase::AwaitingIdentity) {
+                                    if !matches!(
+                                        *identity_phase_for_response.borrow(),
+                                        DelegateIdentityPhase::AwaitingIdentity
+                                    ) {
                                         return;
                                     }
                                     let candidate = match secure_random_32("local identity seed") {
                                         Ok(candidate) => candidate,
                                         Err(error) => {
-                                            *identity_phase_for_response.borrow_mut() = DelegateIdentityPhase::Failed;
-                                            identity_status_for_response.set(format!("Freenet identity unavailable: {error}"));
+                                            *identity_phase_for_response.borrow_mut() =
+                                                DelegateIdentityPhase::Failed;
+                                            identity_status_for_response.set(format!(
+                                                "Freenet identity unavailable: {error}"
+                                            ));
                                             return;
                                         }
                                     };
-                                    *identity_phase_for_response.borrow_mut() = DelegateIdentityPhase::AwaitingStore(candidate);
-                                    local_state_status_for_response.set("Storing new Freenet identity".to_owned());
+                                    *identity_phase_for_response.borrow_mut() =
+                                        DelegateIdentityPhase::AwaitingStore(candidate);
+                                    local_state_status_for_response
+                                        .set("Storing new Freenet identity".to_owned());
                                     let api = api_for_response.clone();
                                     let status = local_state_status_for_response.clone();
                                     let identity_status = identity_status_for_response.clone();
                                     let phase = identity_phase_for_response.clone();
                                     let epoch = epoch_for_response.clone();
                                     wasm_bindgen_futures::spawn_local(async move {
-                                        if *epoch.borrow() != connection_epoch { return; }
+                                        if *epoch.borrow() != connection_epoch {
+                                            return;
+                                        }
                                         let result = {
                                             let mut api = api.borrow_mut();
                                             match api.as_mut() {
@@ -2948,10 +3083,15 @@ mod browser {
                                             }
                                         };
                                         if let Err(error) = result {
-                                            if *epoch.borrow() != connection_epoch { return; }
+                                            if *epoch.borrow() != connection_epoch {
+                                                return;
+                                            }
                                             *phase.borrow_mut() = DelegateIdentityPhase::Failed;
-                                            identity_status.set("Freenet identity unavailable".to_owned());
-                                            status.set(format!("Freenet identity storage failed: {error}"));
+                                            identity_status
+                                                .set("Freenet identity unavailable".to_owned());
+                                            status.set(format!(
+                                                "Freenet identity storage failed: {error}"
+                                            ));
                                         }
                                     });
                                     return;
@@ -2959,18 +3099,24 @@ mod browser {
 
                                 Ok(Some(LocalStateDelegateResponse::IdentityStored)) => {
                                     let candidate = match &*identity_phase_for_response.borrow() {
-                                        DelegateIdentityPhase::AwaitingStore(candidate) => *candidate,
+                                        DelegateIdentityPhase::AwaitingStore(candidate) => {
+                                            *candidate
+                                        }
                                         _ => return,
                                     };
-                                    *identity_phase_for_response.borrow_mut() = DelegateIdentityPhase::AwaitingReadback(candidate);
-                                    local_state_status_for_response.set("Verifying stored Freenet identity".to_owned());
+                                    *identity_phase_for_response.borrow_mut() =
+                                        DelegateIdentityPhase::AwaitingReadback(candidate);
+                                    local_state_status_for_response
+                                        .set("Verifying stored Freenet identity".to_owned());
                                     let api = api_for_response.clone();
                                     let status = local_state_status_for_response.clone();
                                     let identity_status = identity_status_for_response.clone();
                                     let phase = identity_phase_for_response.clone();
                                     let epoch = epoch_for_response.clone();
                                     wasm_bindgen_futures::spawn_local(async move {
-                                        if *epoch.borrow() != connection_epoch { return; }
+                                        if *epoch.borrow() != connection_epoch {
+                                            return;
+                                        }
                                         let result = {
                                             let mut api = api.borrow_mut();
                                             match api.as_mut() {
@@ -2979,29 +3125,39 @@ mod browser {
                                             }
                                         };
                                         if let Err(error) = result {
-                                            if *epoch.borrow() != connection_epoch { return; }
+                                            if *epoch.borrow() != connection_epoch {
+                                                return;
+                                            }
                                             *phase.borrow_mut() = DelegateIdentityPhase::Failed;
-                                            identity_status.set("Freenet identity unavailable".to_owned());
-                                            status.set(format!("Freenet identity readback failed: {error}"));
+                                            identity_status
+                                                .set("Freenet identity unavailable".to_owned());
+                                            status.set(format!(
+                                                "Freenet identity readback failed: {error}"
+                                            ));
                                         }
                                     });
                                     return;
                                 }
 
                                 Ok(Some(LocalStateDelegateResponse::IdentityCleared)) => {
-                                    *identity_phase_for_response.borrow_mut() = DelegateIdentityPhase::Failed;
+                                    *identity_phase_for_response.borrow_mut() =
+                                        DelegateIdentityPhase::Failed;
                                     clear_cached_identity();
                                     player_id_for_response.set(None);
-                                    identity_status_for_response.set("Freenet identity unavailable".to_owned());
-                                    local_state_status_for_response.set("Freenet identity was cleared".to_owned());
+                                    identity_status_for_response
+                                        .set("Freenet identity unavailable".to_owned());
+                                    local_state_status_for_response
+                                        .set("Freenet identity was cleared".to_owned());
                                     return;
                                 }
 
                                 Ok(Some(LocalStateDelegateResponse::Error(error))) => {
-                                    *identity_phase_for_response.borrow_mut() = DelegateIdentityPhase::Failed;
+                                    *identity_phase_for_response.borrow_mut() =
+                                        DelegateIdentityPhase::Failed;
                                     clear_cached_identity();
                                     player_id_for_response.set(None);
-                                    identity_status_for_response.set("Freenet identity unavailable".to_owned());
+                                    identity_status_for_response
+                                        .set("Freenet identity unavailable".to_owned());
                                     local_state_status_for_response.set(format!(
                                         "Freenet local-state delegate error: {error}"
                                     ));
@@ -3011,13 +3167,173 @@ mod browser {
                                 Ok(None) => {}
 
                                 Err(error) => {
-                                    *identity_phase_for_response.borrow_mut() = DelegateIdentityPhase::Failed;
+                                    *identity_phase_for_response.borrow_mut() =
+                                        DelegateIdentityPhase::Failed;
                                     clear_cached_identity();
                                     player_id_for_response.set(None);
-                                    identity_status_for_response.set("Freenet identity unavailable".to_owned());
+                                    identity_status_for_response
+                                        .set("Freenet identity unavailable".to_owned());
                                     local_state_status_for_response.set(format!(
                                         "Invalid Freenet local-state delegate response: {error}"
                                     ));
+                                    return;
+                                }
+                            }
+                        }
+
+                        if let Some(handle) = profile_delegate_for_response.borrow().clone() {
+                            match classify_profile_delegate_response(&response, &handle.key) {
+                                Ok(Some(None)) => {
+                                    if matches!(
+                                        *profile_phase_for_response.borrow(),
+                                        ProfilePhase::AwaitingRegistration
+                                    ) {
+                                        profile_status_for_response
+                                            .set("Profile delegate registered".to_owned());
+                                        profile_registered_for_response.set(true);
+                                    }
+                                    return;
+                                }
+                                Ok(Some(Some(message))) => {
+                                    let phase = profile_phase_for_response.borrow().clone();
+                                    let matches_request = match &phase {
+                                        ProfilePhase::AwaitingRead {
+                                            player_id,
+                                            request_id,
+                                        }
+                                        | ProfilePhase::AwaitingStore {
+                                            player_id,
+                                            request_id,
+                                            ..
+                                        }
+                                        | ProfilePhase::AwaitingReadback {
+                                            player_id,
+                                            request_id,
+                                            ..
+                                        } => {
+                                            *player_id == message.player_id
+                                                && *request_id == message.request_id
+                                        }
+                                        _ => false,
+                                    };
+                                    if !matches_request {
+                                        return;
+                                    }
+                                    match (phase, message.result) {
+                                        (
+                                            ProfilePhase::AwaitingRead { player_id, .. },
+                                            ProfileStateResult::DisplayName(name),
+                                        ) => {
+                                            *profile_phase_for_response.borrow_mut() =
+                                                ProfilePhase::Ready {
+                                                    player_id,
+                                                    name: name.clone(),
+                                                };
+                                            lobby_name_for_response.set(name.unwrap_or_default());
+                                            lobby_profile_status_for_response
+                                                .set("Freenet profile loaded".to_owned());
+                                            profile_status_for_response.set(
+                                                "Profile read from Freenet local state".to_owned(),
+                                            );
+                                        }
+                                        (
+                                            ProfilePhase::AwaitingStore {
+                                                player_id, name, ..
+                                            },
+                                            ProfileStateResult::Stored,
+                                        ) => {
+                                            let request_id = match secure_random_32(
+                                                "profile readback request ID",
+                                            ) {
+                                                Ok(request_id) => request_id,
+                                                Err(error) => {
+                                                    *profile_phase_for_response.borrow_mut() =
+                                                        ProfilePhase::Failed;
+                                                    lobby_profile_error_for_response
+                                                        .set(Some(error));
+                                                    return;
+                                                }
+                                            };
+                                            *profile_phase_for_response.borrow_mut() =
+                                                ProfilePhase::AwaitingReadback {
+                                                    player_id,
+                                                    request_id,
+                                                    name,
+                                                };
+                                            lobby_profile_status_for_response
+                                                .set("Verifying Freenet profile".to_owned());
+                                            let api = api_for_response.clone();
+                                            let epoch = epoch_for_response.clone();
+                                            let phase = profile_phase_for_response.clone();
+                                            let error = lobby_profile_error_for_response.clone();
+                                            wasm_bindgen_futures::spawn_local(async move {
+                                                if *epoch.borrow() != connection_epoch {
+                                                    return;
+                                                }
+                                                let result = {
+                                                    let mut api = api.borrow_mut();
+                                                    match api.as_mut() {
+                                                        Some(api) => send_profile_request(api, &handle, ProfileStateRequest {
+                                                            version: PROFILE_STATE_PROTOCOL_VERSION, request_id, player_id,
+                                                            action: ProfileStateAction::Get,
+                                                        }).await,
+                                                        None => Err("Freenet connection closed before profile readback".to_owned()),
+                                                    }
+                                                };
+                                                if let Err(failure) = result {
+                                                    if *epoch.borrow() != connection_epoch {
+                                                        return;
+                                                    }
+                                                    *phase.borrow_mut() = ProfilePhase::Failed;
+                                                    error.set(Some(failure));
+                                                }
+                                            });
+                                        }
+                                        (
+                                            ProfilePhase::AwaitingReadback {
+                                                player_id,
+                                                name: expected,
+                                                ..
+                                            },
+                                            ProfileStateResult::DisplayName(Some(actual)),
+                                        ) if actual == expected => {
+                                            *profile_phase_for_response.borrow_mut() =
+                                                ProfilePhase::Ready {
+                                                    player_id,
+                                                    name: Some(expected.clone()),
+                                                };
+                                            if *lobby_name_for_response == expected {
+                                                lobby_profile_status_for_response.set(
+                                                    "Display name saved in Freenet local state"
+                                                        .to_owned(),
+                                                );
+                                            }
+                                            profile_status_for_response
+                                                .set("Profile storage verified".to_owned());
+                                        }
+                                        (_, ProfileStateResult::Error(error)) => {
+                                            *profile_phase_for_response.borrow_mut() =
+                                                ProfilePhase::Failed;
+                                            lobby_profile_error_for_response.set(Some(format!(
+                                                "Profile delegate error: {error}"
+                                            )));
+                                            lobby_profile_status_for_response
+                                                .set("Profile unavailable".to_owned());
+                                        }
+                                        _ => {
+                                            *profile_phase_for_response.borrow_mut() =
+                                                ProfilePhase::Failed;
+                                            lobby_profile_error_for_response.set(Some("Profile delegate returned an unexpected or mismatched value".to_owned()));
+                                            lobby_profile_status_for_response
+                                                .set("Profile verification failed".to_owned());
+                                        }
+                                    }
+                                    return;
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    *profile_phase_for_response.borrow_mut() = ProfilePhase::Failed;
+                                    lobby_profile_error_for_response.set(Some(error));
                                     return;
                                 }
                             }
@@ -3595,6 +3911,9 @@ mod browser {
                         let local_state_status_for_request = local_state_status_for_open.clone();
                         let identity_phase_for_request = identity_phase_for_open.clone();
                         let identity_status_for_request = identity_status_for_open.clone();
+                        let profile_delegate_for_request = profile_delegate_for_open.clone();
+                        let profile_status_for_request = profile_status_for_open.clone();
+                        let profile_phase_for_request = profile_phase_for_open.clone();
 
                         wasm_bindgen_futures::spawn_local(async move {
                             if *epoch_for_request.borrow() != connection_epoch {
@@ -3609,7 +3928,9 @@ mod browser {
                                 .and_then(delegate_handle_from_wasm)
                             {
                                 Ok((container, handle)) => {
-                                    if *epoch_for_request.borrow() != connection_epoch { return; }
+                                    if *epoch_for_request.borrow() != connection_epoch {
+                                        return;
+                                    }
                                     *local_state_delegate_for_request.borrow_mut() = Some(handle);
 
                                     local_state_status_for_request
@@ -3630,9 +3951,13 @@ mod browser {
                                     };
 
                                     if let Err(error) = registration {
-                                        if *epoch_for_request.borrow() != connection_epoch { return; }
-                                        *identity_phase_for_request.borrow_mut() = DelegateIdentityPhase::Failed;
-                                        identity_status_for_request.set("Freenet identity unavailable".to_owned());
+                                        if *epoch_for_request.borrow() != connection_epoch {
+                                            return;
+                                        }
+                                        *identity_phase_for_request.borrow_mut() =
+                                            DelegateIdentityPhase::Failed;
+                                        identity_status_for_request
+                                            .set("Freenet identity unavailable".to_owned());
                                         local_state_status_for_request.set(format!(
                                             "Freenet local-state delegate registration failed: {error}"
                                         ));
@@ -3640,12 +3965,59 @@ mod browser {
                                 }
 
                                 Err(error) => {
-                                    if *epoch_for_request.borrow() != connection_epoch { return; }
-                                    *identity_phase_for_request.borrow_mut() = DelegateIdentityPhase::Failed;
-                                    identity_status_for_request.set("Freenet identity unavailable".to_owned());
+                                    if *epoch_for_request.borrow() != connection_epoch {
+                                        return;
+                                    }
+                                    *identity_phase_for_request.borrow_mut() =
+                                        DelegateIdentityPhase::Failed;
+                                    identity_status_for_request
+                                        .set("Freenet identity unavailable".to_owned());
                                     local_state_status_for_request.set(format!(
                                         "Freenet local-state delegate could not be prepared: {error}"
                                     ));
+                                }
+                            }
+
+                            if *epoch_for_request.borrow() != connection_epoch {
+                                return;
+                            }
+                            profile_status_for_request
+                                .set("Loading Freenet profile delegate".to_owned());
+                            match fetch_profile_delegate_wasm()
+                                .await
+                                .and_then(delegate_handle_from_wasm)
+                            {
+                                Ok((container, handle)) => {
+                                    if *epoch_for_request.borrow() != connection_epoch {
+                                        return;
+                                    }
+                                    *profile_delegate_for_request.borrow_mut() = Some(handle);
+                                    profile_status_for_request
+                                        .set("Registering Freenet profile delegate".to_owned());
+                                    let registration = {
+                                        let mut api = api_for_request.borrow_mut();
+                                        match api.as_mut() {
+                                            Some(api) => register_local_state_delegate(api, container).await,
+                                            None => Err("Freenet connection closed before profile registration".to_owned()),
+                                        }
+                                    };
+                                    if let Err(error) = registration {
+                                        if *epoch_for_request.borrow() != connection_epoch {
+                                            return;
+                                        }
+                                        *profile_phase_for_request.borrow_mut() =
+                                            ProfilePhase::Failed;
+                                        profile_status_for_request
+                                            .set(format!("Profile registration failed: {error}"));
+                                    }
+                                }
+                                Err(error) => {
+                                    if *epoch_for_request.borrow() != connection_epoch {
+                                        return;
+                                    }
+                                    *profile_phase_for_request.borrow_mut() = ProfilePhase::Failed;
+                                    profile_status_for_request
+                                        .set(format!("Profile delegate unavailable: {error}"));
                                 }
                             }
 
@@ -5546,29 +5918,89 @@ mod browser {
             let lobby_display_name = lobby_display_name.clone();
             let lobby_profile_status = lobby_profile_status.clone();
             let lobby_profile_error = lobby_profile_error.clone();
+            let profile_phase = profile_phase.clone();
+            let profile_delegate = profile_delegate.clone();
+            let freenet_api = freenet_api.clone();
+            let transport_epoch = transport_epoch.clone();
 
             Callback::from(move |_| {
                 let Some(player_id) = *local_player_id else {
                     lobby_profile_error.set(Some("Local identity is not ready yet.".to_owned()));
                     return;
                 };
-
-                match store_lobby_display_name(&player_id, lobby_display_name.as_str()) {
-                    Ok(()) => {
-                        lobby_profile_error.set(None);
-                        lobby_profile_status.set("Display name saved locally".to_owned());
-                    }
-
+                if !matches!(&*profile_phase.borrow(), ProfilePhase::Ready { player_id: current, .. } if *current == player_id)
+                {
+                    lobby_profile_error.set(Some("Freenet profile is not ready.".to_owned()));
+                    return;
+                }
+                let name = (*lobby_display_name).clone();
+                if let Err(error) = validate_display_name(&name) {
+                    lobby_profile_error.set(Some(error));
+                    return;
+                }
+                let Some(handle) = profile_delegate.borrow().clone() else {
+                    lobby_profile_error.set(Some("Profile delegate is not registered.".to_owned()));
+                    return;
+                };
+                let request_id = match secure_random_32("profile store request ID") {
+                    Ok(id) => id,
                     Err(error) => {
                         lobby_profile_error.set(Some(error));
+                        return;
                     }
-                }
+                };
+                *profile_phase.borrow_mut() = ProfilePhase::AwaitingStore {
+                    player_id,
+                    request_id,
+                    name: name.clone(),
+                };
+                lobby_profile_error.set(None);
+                lobby_profile_status.set("Saving Freenet profile".to_owned());
+                let api = freenet_api.clone();
+                let epoch = transport_epoch.clone();
+                let phase = profile_phase.clone();
+                let error = lobby_profile_error.clone();
+                let status = lobby_profile_status.clone();
+                let epoch_snapshot = *epoch.borrow();
+                wasm_bindgen_futures::spawn_local(async move {
+                    if *epoch.borrow() != epoch_snapshot {
+                        return;
+                    }
+                    let result = {
+                        let mut api = api.borrow_mut();
+                        match api.as_mut() {
+                            Some(api) => {
+                                send_profile_request(
+                                    api,
+                                    &handle,
+                                    ProfileStateRequest {
+                                        version: PROFILE_STATE_PROTOCOL_VERSION,
+                                        request_id,
+                                        player_id,
+                                        action: ProfileStateAction::Store(name),
+                                    },
+                                )
+                                .await
+                            }
+                            None => Err("Freenet connection closed before profile save".to_owned()),
+                        }
+                    };
+                    if let Err(failure) = result {
+                        if *epoch.borrow() != epoch_snapshot {
+                            return;
+                        }
+                        *phase.borrow_mut() = ProfilePhase::Failed;
+                        error.set(Some(failure));
+                        status.set("Profile save failed".to_owned());
+                    }
+                });
             })
         };
 
         let on_toggle_lobby_availability = {
             let local_player_id = local_player_id.clone();
             let lobby_display_name = lobby_display_name.clone();
+            let profile_phase = profile_phase.clone();
             let lobby_available = lobby_available.clone();
             let lobby_presence_submission_pending = lobby_presence_submission_pending.clone();
             let lobby_profile_status = lobby_profile_status.clone();
@@ -5587,7 +6019,12 @@ mod browser {
                     let player_id = (*local_player_id)
                         .ok_or_else(|| "Local identity is not ready yet.".to_owned())?;
 
-                    store_lobby_display_name(&player_id, lobby_display_name.as_str())?;
+                    if !matches!(&*profile_phase.borrow(), ProfilePhase::Ready {
+                        player_id: current, name: Some(saved),
+                    } if *current == player_id && saved == lobby_display_name.as_str())
+                    {
+                        return Err("Save and verify this display name in Freenet before publishing presence.".to_owned());
+                    }
 
                     let signing_key = load_cached_identity()?;
 
@@ -6437,11 +6874,18 @@ mod browser {
             "Accept new challenges"
         };
 
-        let lobby_profile_controls_disabled =
-            (*local_player_id).is_none() || *lobby_available || *lobby_presence_submission_pending;
+        let lobby_profile_controls_disabled = (*local_player_id).is_none()
+            || *lobby_available
+            || *lobby_presence_submission_pending
+            || !matches!(&*profile_phase.borrow(), ProfilePhase::Ready { player_id, .. }
+                    if Some(*player_id) == *local_player_id);
 
         let lobby_availability_disabled = (*local_player_id).is_none()
             || *lobby_presence_submission_pending
+            || (!*lobby_available
+                && !matches!(&*profile_phase.borrow(), ProfilePhase::Ready {
+                player_id, name: Some(saved),
+            } if Some(*player_id) == *local_player_id && saved == lobby_display_name.as_str()))
             || latest_lobby_contract_key.borrow().is_none();
 
         let challenge_controls_disabled = *challenge_publication_pending
@@ -7305,6 +7749,11 @@ mod browser {
                                 <div>
                                     <dt>{ "Freenet local-state" }</dt>
                                     <dd>{ (*local_state_delegate_status).clone() }</dd>
+                                </div>
+
+                                <div>
+                                    <dt>{ "Freenet profile" }</dt>
+                                    <dd>{ (*profile_delegate_status).clone() }</dd>
                                 </div>
 
                                 <div>

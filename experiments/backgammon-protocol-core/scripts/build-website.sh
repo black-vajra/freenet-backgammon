@@ -3,17 +3,20 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CLIENT="$ROOT/crates/backgammon-client"
-DELEGATE_WASM="$ROOT/target/wasm32-unknown-unknown/release/backgammon_local_state_delegate.wasm"
+DELEGATE_WASM="$ROOT/crates/backgammon-local-state-delegate/pinned/identity-v1.wasm"
+DELEGATE_SHA256="d16d376df4f64d8b127b0bdab68eecb24b3d0a1c811202ead560312d17cdf87c"
 ASSET="$CLIENT/assets/backgammon-local-state-delegate.wasm"
+PROFILE_WASM="$ROOT/crates/backgammon-profile-delegate/pinned/profile-v1.wasm"
+PROFILE_SHA256="d292f0ba6b1259fad0557a5cfbc9f075eff2570e31a0c90a9dedd57b5a3dc1a8"
+PROFILE_ASSET="$CLIENT/assets/backgammon-profile-delegate.wasm"
 OUT="${1:-/tmp/freenet-backgammon-website}"
 
 cd "$ROOT"
 
-echo "== Building local-state delegate =="
-cargo build \
-  --release \
-  --target wasm32-unknown-unknown \
-  -p backgammon-local-state-delegate
+# The delegate key depends on its exact WASM bytes. Rebuilding it could
+# disconnect existing users from their persisted signing identities.
+echo "== Verifying pinned identity delegate =="
+printf '%s  %s\n' "$DELEGATE_SHA256" "$DELEGATE_WASM" | sha256sum --check
 
 echo "== Installing delegate website asset =="
 mkdir -p "$CLIENT/assets"
@@ -21,6 +24,10 @@ cp "$DELEGATE_WASM" "$ASSET"
 
 echo "== Verifying copied delegate =="
 sha256sum "$DELEGATE_WASM" "$ASSET"
+
+echo "== Verifying pinned profile delegate =="
+printf '%s  %s\n' "$PROFILE_SHA256" "$PROFILE_WASM" | sha256sum --check
+cp "$PROFILE_WASM" "$PROFILE_ASSET"
 
 echo "== Building website =="
 rm -rf "$OUT"
@@ -57,6 +64,9 @@ echo "== Verifying packaged delegate =="
 sha256sum \
   "$ASSET" \
   "$OUT/backgammon-local-state-delegate.wasm"
+
+echo "== Verifying packaged profile delegate =="
+sha256sum "$PROFILE_ASSET" "$OUT/backgammon-profile-delegate.wasm"
 
 echo
 echo "Website build complete:"
