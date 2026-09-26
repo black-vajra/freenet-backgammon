@@ -2,6 +2,31 @@ use backgammon_core::Player;
 use backgammon_protocol::{GameConfiguration, PlayerId};
 use ed25519_dalek::SigningKey;
 
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static SIGNING_KEY_CACHE: std::cell::RefCell<Option<SigningKey>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn cache_identity(seed: [u8; 32]) -> PlayerId {
+    let signing_key = signing_key_from_seed(seed);
+    let player_id = player_id_for_signing_key(&signing_key);
+    SIGNING_KEY_CACHE.with(|cache| *cache.borrow_mut() = Some(signing_key));
+    player_id
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn clear_cached_identity() {
+    SIGNING_KEY_CACHE.with(|cache| cache.borrow_mut().take());
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn load_cached_identity() -> Result<SigningKey, String> {
+    SIGNING_KEY_CACHE.with(|cache| {
+        cache.borrow().clone().ok_or_else(|| "Verified Freenet signing identity is unavailable.".to_owned())
+    })
+}
+
 const STORAGE_KEY: &str = "freenet-backgammon.local-identity.v1";
 const ENCODED_SEED_BYTES: usize = 64;
 
@@ -11,6 +36,14 @@ pub fn signing_key_from_seed(seed: [u8; 32]) -> SigningKey {
 
 pub fn player_id_for_signing_key(signing_key: &SigningKey) -> PlayerId {
     signing_key.verifying_key().to_bytes()
+}
+
+pub fn verify_identity_readback(candidate: &[u8; 32], returned: &[u8; 32]) -> Result<(), String> {
+    if candidate == returned {
+        Ok(())
+    } else {
+        Err("Stored Freenet identity failed exact readback verification.".to_owned())
+    }
 }
 
 pub fn role_for_player_id(
@@ -161,6 +194,15 @@ fn browser_storage() -> Result<web_sys::Storage, String> {
 mod tests {
     use super::*;
     use backgammon_protocol::PlayerDescriptor;
+
+    #[test]
+    fn delegate_identity_readback_requires_exact_seed() {
+        let candidate = [7_u8; 32];
+        assert!(verify_identity_readback(&candidate, &candidate).is_ok());
+        let mut different = candidate;
+        different[31] ^= 1;
+        assert!(verify_identity_readback(&candidate, &different).is_err());
+    }
 
     fn descriptor(seed_byte: u8, display_name: &str) -> PlayerDescriptor {
         let signing_key = signing_key_from_seed([seed_byte; 32]);
