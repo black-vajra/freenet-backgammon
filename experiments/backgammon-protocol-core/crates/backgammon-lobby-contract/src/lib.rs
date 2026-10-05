@@ -124,7 +124,13 @@ impl ContractInterface for Contract {
         for update in data {
             match update {
                 UpdateData::Delta(bytes) => {
-                    updates.push(DecodedUpdate::Delta(decode(bytes.as_ref())?));
+                    // get_state_delta serializes Option<LobbyContractStateDelta>:
+                    // Some is a map, while None is CBOR null (no changes).
+                    if let Some(delta) =
+                        decode::<Option<LobbyContractStateDelta>>(bytes.as_ref())?
+                    {
+                        updates.push(DecodedUpdate::Delta(delta));
+                    }
                 }
 
                 UpdateData::State(bytes) => {
@@ -269,6 +275,49 @@ mod tests {
     #[derive(Serialize)]
     struct LegacyLobbyContractStateDelta {
         lobby: Option<LobbyState>,
+    }
+
+    #[test]
+    fn contract_no_change_delta_round_trip_preserves_state() {
+        let alice = key(91);
+        let current = LobbyContractState {
+            challenges: ChallengeEntries::default(),
+            lobby: LobbyEntries(state(signed(&alice, "Alice", true, 2))),
+        };
+        let summary =
+            Contract::summarize_state(contract_parameters(), contract_state(&current)).unwrap();
+        let delta =
+            Contract::get_state_delta(contract_parameters(), contract_state(&current), summary)
+                .unwrap();
+        assert_eq!(delta.as_ref(), &[0xf6], "no changes must encode as CBOR null");
+        let modification = Contract::update_state(
+            contract_parameters(),
+            contract_state(&current),
+            vec![UpdateData::Delta(delta)],
+        )
+        .unwrap();
+        assert_eq!(modification.unwrap_valid().as_ref(), encoded(&current).as_slice());
+    }
+
+    #[test]
+    fn contract_no_change_delta_does_not_skip_following_update() {
+        let current = LobbyContractState::default();
+        let alice = key(92);
+        let incoming = LobbyContractState {
+            challenges: ChallengeEntries::default(),
+            lobby: LobbyEntries(state(signed(&alice, "Alice", true, 2))),
+        };
+        let modification = Contract::update_state(
+            contract_parameters(),
+            contract_state(&current),
+            vec![
+                UpdateData::Delta(StateDelta::from(vec![0xf6])),
+                UpdateData::State(contract_state(&incoming)),
+            ],
+        )
+        .unwrap();
+        let result: LobbyContractState = decode(modification.unwrap_valid().as_ref()).unwrap();
+        assert_eq!(result, incoming);
     }
 
     fn contract_parameters() -> Parameters<'static> {

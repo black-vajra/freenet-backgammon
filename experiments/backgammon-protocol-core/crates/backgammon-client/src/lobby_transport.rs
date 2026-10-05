@@ -16,7 +16,7 @@ use crate::transport::SubscriptionStatus;
 
 /// Fresh genesis-share-capable lobby published for the September 2026
 /// two-node acceptance game.
-pub const LOBBY_CONTRACT_ID: &str = "3VFp4EQi3EBgmcsHMDCqJCFx3ybvXeahYAyt8c9TmEFa";
+pub const LOBBY_CONTRACT_ID: &str = "2bEh8hDrjQvoGs3dK5WiYezd1BdYgZTbNmZskvFTPwHa";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LobbyContractStatus {
@@ -368,7 +368,7 @@ mod tests {
     fn published_lobby_contract_id_is_stable() {
         assert_eq!(
             LOBBY_CONTRACT_ID,
-            "3VFp4EQi3EBgmcsHMDCqJCFx3ybvXeahYAyt8c9TmEFa"
+            "2bEh8hDrjQvoGs3dK5WiYezd1BdYgZTbNmZskvFTPwHa"
         );
     }
 

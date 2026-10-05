@@ -49,6 +49,7 @@ dependencies = [
  "ciborium",
  "ed25519-dalek",
  "freenet-stdlib",
+ "futures-channel",
  "gloo-timers",
  "js-sys",
  "serde",
@@ -80,6 +81,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "backgammon-durable-state-delegate"
+version = "0.1.0"
+dependencies = [
+ "backgammon-protocol",
+ "freenet-stdlib",
+]
+
+[[package]]
 name = "backgammon-lobby-contract"
 version = "0.1.0"
 dependencies = [
@@ -106,6 +115,14 @@ dependencies = [
 
 [[package]]
 name = "backgammon-local-state-delegate"
+version = "0.1.0"
+dependencies = [
+ "backgammon-protocol",
+ "freenet-stdlib",
+]
+
+[[package]]
+name = "backgammon-presence-revision-delegate"
 version = "0.1.0"
 dependencies = [
  "backgammon-protocol",

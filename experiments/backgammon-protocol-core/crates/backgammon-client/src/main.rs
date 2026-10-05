@@ -34,6 +34,9 @@ pub mod pending_action;
 pub mod pending_action_store;
 pub mod play_turn_planner;
 pub mod presence_revision_store;
+pub mod presence_revision_transport;
+pub mod durable_state_transport;
+pub mod durable_recovery_gate;
 pub mod profile_state_transport;
 pub mod projection;
 pub mod request_roll_planner;
@@ -54,7 +57,9 @@ mod browser {
     use backgammon_protocol::{
         replay_game, verify_challenge_offer_at, Action, DiceSecret, GameActionPayload,
         ProfileStateAction, ProfileStateRequest, ProfileStateResult, SignedChallengeOffer,
-        PROFILE_STATE_PROTOCOL_VERSION,
+        PresenceRevisionAction, PresenceRevisionRequest, PresenceRevisionResult,
+        PRESENCE_REVISION_PROTOCOL_VERSION, PROFILE_STATE_PROTOCOL_VERSION,
+        DurableAction, DurableRequest, DurableResult, DurableSlot, DURABLE_STATE_VERSION,
     };
     use freenet_stdlib::client_api::{ContractResponse, HostResponse, WebApi};
     use freenet_stdlib::prelude::ContractKey;
@@ -71,8 +76,6 @@ mod browser {
     use crate::active_game_scope::{ActiveGameScope, ActiveGameScopeSnapshot};
     use crate::challenge_offer_planner::{plan_outbound_challenge, OutboundChallengePlannerInput};
     use crate::challenge_publication_store::{
-        load_outbound_challenge_publication, remove_outbound_challenge_publication,
-        store_new_outbound_challenge_publication, update_outbound_challenge_publication,
         OutboundChallengePublicationStage, StoredOutboundChallengePublication,
     };
     use crate::commitment_planner::{plan_commitment, CommitmentPlan, CommitmentPlannerInput};
@@ -82,13 +85,19 @@ mod browser {
     use crate::components::history::MoveHistory;
     use crate::components::player_panel::PlayerPanel;
     use crate::controller::{LocalGameController, LocalGameOutcome, LocalTurnRecord};
+    use crate::durable_state_transport::{
+        classify_durable_state_response, fetch_durable_state_delegate_wasm,
+        send_durable_state_request, DurableReplyRouter,
+    };
+    use crate::durable_recovery_gate::{
+        claim_recovery_publication, confirmed_cleanup_readback, is_current_connection,
+        DurableRecoveryReadiness,
+    };
     use crate::game_contract_publication::{
         confirm_game_contract_publication, submit_game_contract_publication,
         SubmittedGameContractPublication,
     };
-    use crate::genesis_handshake_store::{
-        load_genesis_handshake, store_genesis_handshake, StoredGenesisHandshake,
-    };
+    use crate::genesis_handshake_store::StoredGenesisHandshake;
     use crate::genesis_refresh_gate::GenesisRefreshGate;
     use crate::genesis_share_publication_planner::{
         plan_authoritative_genesis_share_ingestion, plan_genesis_share_publication,
@@ -100,10 +109,7 @@ mod browser {
         finalize_incoming_challenge_acceptance, prepare_incoming_challenge_contract_probe,
         IncomingChallengeContractProbe,
     };
-    use crate::incoming_challenge_acceptance_store::{
-        load_incoming_challenge_acceptance, remove_incoming_challenge_acceptance,
-        store_new_incoming_challenge_acceptance, StoredIncomingChallengeAcceptance,
-    };
+    use crate::incoming_challenge_acceptance_store::StoredIncomingChallengeAcceptance;
     use crate::incoming_challenge_acceptance_transport::{
         classify_incoming_challenge_contract_response, IncomingChallengeContractRead,
     };
@@ -120,17 +126,16 @@ mod browser {
         cache_identity, clear_cached_identity, load_cached_identity, player_id_for_signing_key,
         role_for_player_id, verify_identity_readback,
     };
-    use crate::local_role_store::{load_local_role, store_local_role};
     use crate::local_state_transport::{
         classify_local_state_delegate_response, delegate_handle_from_wasm,
         fetch_local_state_delegate_wasm, register_local_state_delegate, request_identity,
         store_identity, LocalStateDelegateHandle, LocalStateDelegateResponse,
     };
-    use crate::pending_action_store::{
-        load_pending_action, remove_pending_action, store_pending_action,
-    };
     use crate::play_turn_planner::{plan_play_turn, PlayTurnPlan, PlayTurnPlannerInput};
-    use crate::presence_revision_store::reserve_next_presence_revision;
+    use crate::presence_revision_transport::{
+        classify_presence_revision_response, fetch_presence_revision_delegate_wasm,
+        send_presence_revision_request,
+    };
     use crate::profile_state_transport::{
         classify_profile_delegate_response, fetch_profile_delegate_wasm, send_profile_request,
     };
@@ -139,13 +144,303 @@ mod browser {
         plan_request_roll, RequestRollPlan, RequestRollPlannerInput,
     };
     use crate::reveal_planner::{plan_reveal, RevealPlan, RevealPlannerInput};
-    use crate::secret_store::{load_dice_secret, store_dice_secret};
     use crate::transport::{
         classify_response, connect, request_contract, request_contract_snapshot,
         submit_action_delta, ClassifiedResponse, ConnectionStatus, ContractProbeStatus,
         SubscriptionStatus, TEST_CONTRACT_ID,
     };
     use crate::verified_history_guard::{HistoryDecision, VerifiedHistoryGuard};
+
+    // Register the response before the asynchronous send. Release the API
+    // borrow before awaiting the delegate reply, so the WebSocket callback can
+    // dispatch it. Dropping the router on reconnect fails all pending calls.
+    macro_rules! durable_rpc {
+        ($api_handle:expr, $reply_router:expr, $delegate_handle:expr, $request:expr) => {{
+            let request = $request;
+            let api_handle = ($api_handle).clone();
+            let reply_router = ($reply_router).clone();
+            let delegate_handle = ($delegate_handle).clone();
+            async move {
+                let receiver = reply_router.borrow_mut().register(&request)?;
+                let send_result = {
+                    let mut api = api_handle.borrow_mut();
+                    match api.as_mut() {
+                        Some(api) => send_durable_state_request(api, &delegate_handle, &request).await,
+                        None => Err("Freenet connection closed before durable state request".to_owned()),
+                    }
+                };
+                match send_result {
+                    Err(error) => {
+                        reply_router.borrow_mut().cancel(&request.request_id);
+                        Err(error)
+                    }
+                    Ok(()) => receiver.await.map_err(|_| {
+                        "Durable state reply was interrupted by reconnect".to_owned()
+                    })?,
+                }
+            }
+        }};
+    }
+
+    async fn durable_call(
+        api_handle: &Rc<RefCell<Option<WebApi>>>,
+        reply_router: &Rc<RefCell<DurableReplyRouter>>,
+        delegate_handle: &LocalStateDelegateHandle,
+        request: DurableRequest,
+    ) -> Result<DurableResult, String> {
+        let receiver = reply_router.borrow_mut().register(&request)?;
+        let send_result = {
+            let mut api = api_handle.borrow_mut();
+            match api.as_mut() {
+                Some(api) => send_durable_state_request(api, delegate_handle, &request).await,
+                None => Err("Freenet connection closed before durable state request".to_owned()),
+            }
+        };
+        if let Err(error) = send_result {
+            reply_router.borrow_mut().cancel(&request.request_id);
+            return Err(error);
+        }
+        receiver.await.map_err(|_| "Durable state reply was interrupted by reconnect".to_owned())?
+    }
+
+    async fn load_durable_genesis_handshake(
+        api: &Rc<RefCell<Option<WebApi>>>,
+        router: &Rc<RefCell<DurableReplyRouter>>,
+        handle: &LocalStateDelegateHandle,
+        game_id: &[u8; 32],
+        player_id: &[u8; 32],
+    ) -> Result<(Option<StoredGenesisHandshake>, Option<Vec<u8>>), String> {
+        let request = DurableRequest {
+            version: DURABLE_STATE_VERSION,
+            request_id: secure_random_32("genesis handshake read ID")?,
+            scope: *game_id,
+            slot: DurableSlot::GenesisHandshake,
+            action: DurableAction::Get,
+        };
+        match durable_call(api, router, handle, request).await? {
+            DurableResult::Value(None) => Ok((None, None)),
+            DurableResult::Value(Some(bytes)) => {
+                let record = StoredGenesisHandshake::decode(&bytes)?;
+                if record.game_id() != *game_id || record.local_player_id != *player_id {
+                    return Err("Stored genesis handshake belongs to another game or identity".to_owned());
+                }
+                Ok((Some(record), Some(bytes)))
+            }
+            DurableResult::Error(problem) => Err(problem),
+            _ => Err("Unexpected genesis handshake read reply".to_owned()),
+        }
+    }
+
+    async fn load_durable_pending_action(
+        api: &Rc<RefCell<Option<WebApi>>>,
+        router: &Rc<RefCell<DurableReplyRouter>>,
+        handle: &LocalStateDelegateHandle,
+        contract_id: &str,
+    ) -> Result<Option<(crate::pending_action::PendingAction, Vec<u8>)>, String> {
+        let request = DurableRequest {
+            version: DURABLE_STATE_VERSION,
+            request_id: secure_random_32("pending action read ID")?,
+            scope: backgammon_protocol::contract_durable_scope(contract_id),
+            slot: DurableSlot::PendingAction,
+            action: DurableAction::Get,
+        };
+        match durable_call(api, router, handle, request).await? {
+            DurableResult::Value(None) => Ok(None),
+            DurableResult::Value(Some(bytes)) => {
+                let pending = crate::pending_action::PendingAction::decode(&bytes)?;
+                if pending.contract_id != contract_id {
+                    return Err("Durable pending action belongs to another contract".to_owned());
+                }
+                pending.verify()?;
+                Ok(Some((pending, bytes)))
+            }
+            DurableResult::Error(problem) => Err(problem),
+            _ => Err("Unexpected durable pending action reply".to_owned()),
+        }
+    }
+
+    async fn create_durable_pending_action(
+        api: &Rc<RefCell<Option<WebApi>>>,
+        router: &Rc<RefCell<DurableReplyRouter>>,
+        handle: &LocalStateDelegateHandle,
+        pending: &crate::pending_action::PendingAction,
+    ) -> Result<(), String> {
+        pending.verify()?;
+        let bytes = pending.encode()?;
+        let scope = backgammon_protocol::contract_durable_scope(&pending.contract_id);
+        let create = DurableRequest {
+            version: DURABLE_STATE_VERSION,
+            request_id: secure_random_32("pending action create ID")?,
+            scope,
+            slot: DurableSlot::PendingAction,
+            action: DurableAction::Create(bytes.clone()),
+        };
+        match durable_call(api, router, handle, create).await? {
+            DurableResult::Stored => {},
+            DurableResult::Conflict => return Err("A different durable action is already pending".to_owned()),
+            DurableResult::Error(problem) => return Err(problem),
+            _ => return Err("Unexpected pending action create reply".to_owned()),
+        }
+        let readback = DurableRequest {
+            version: DURABLE_STATE_VERSION,
+            request_id: secure_random_32("pending action readback ID")?,
+            scope,
+            slot: DurableSlot::PendingAction,
+            action: DurableAction::Get,
+        };
+        match durable_call(api, router, handle, readback).await? {
+            DurableResult::Value(Some(value)) if value == bytes => Ok(()),
+            DurableResult::Error(problem) => Err(problem),
+            _ => Err("Durable pending action readback differed from its signed delta".to_owned()),
+        }
+    }
+
+    async fn delete_durable_pending_action(
+        api: &Rc<RefCell<Option<WebApi>>>,
+        router: &Rc<RefCell<DurableReplyRouter>>,
+        handle: &LocalStateDelegateHandle,
+        contract_id: &str,
+        expected: Vec<u8>,
+    ) -> Result<(), String> {
+        let scope = backgammon_protocol::contract_durable_scope(contract_id);
+        let delete = DurableRequest {
+            version: DURABLE_STATE_VERSION,
+            request_id: secure_random_32("pending action exact delete ID")?,
+            scope,
+            slot: DurableSlot::PendingAction,
+            action: DurableAction::Delete { expected },
+        };
+        match durable_call(api, router, handle, delete).await? {
+            DurableResult::Deleted => {},
+            DurableResult::Error(problem) => return Err(problem),
+            _ => return Err("Exact pending action deletion was rejected".to_owned()),
+        }
+        if load_durable_pending_action(api, router, handle, contract_id).await?.is_some() {
+            return Err("Pending action remained after verified deletion".to_owned());
+        }
+        Ok(())
+    }
+
+    async fn plan_durable_authenticated_genesis_submission(
+        api: &Rc<RefCell<Option<WebApi>>>,
+        router: &Rc<RefCell<DurableReplyRouter>>,
+        handle: &LocalStateDelegateHandle,
+        contract_id: &str,
+        authenticated_genesis: &Action,
+        authoritative_state: &[u8],
+    ) -> Result<GenesisSubmissionPlan, String> {
+        let previous = load_durable_pending_action(api, router, handle, contract_id).await?;
+        let plan = plan_authenticated_genesis_submission(GenesisSubmissionPlannerInput {
+            contract_id,
+            authenticated_genesis,
+            authoritative_state,
+            pending: previous.as_ref().map(|(record, _)| record),
+        })?;
+        match &plan {
+            GenesisSubmissionPlan::Accepted { remove_pending: true } => {
+                let (_, exact_bytes) = previous.ok_or_else(||
+                    "Accepted genesis had no exact pending record".to_owned())?;
+                delete_durable_pending_action(api, router, handle, contract_id, exact_bytes).await?;
+            }
+            GenesisSubmissionPlan::Submit { pending, recovered_pending: false } => {
+                create_durable_pending_action(api, router, handle, pending).await?;
+            }
+            _ => {},
+        }
+        Ok(plan)
+    }
+
+    async fn load_durable_dice_secret(
+        api: &Rc<RefCell<Option<WebApi>>>,
+        router: &Rc<RefCell<DurableReplyRouter>>,
+        handle: &LocalStateDelegateHandle,
+        game_id: &[u8; 32],
+        turn: u32,
+        player: Player,
+    ) -> Result<Option<DiceSecret>, String> {
+        let request = DurableRequest {
+            version: DURABLE_STATE_VERSION,
+            request_id: secure_random_32("dice secret read ID")?,
+            scope: backgammon_protocol::dice_secret_durable_scope(game_id, turn, player),
+            slot: DurableSlot::DiceSecret,
+            action: DurableAction::Get,
+        };
+        match durable_call(api, router, handle, request).await? {
+            DurableResult::Value(None) => Ok(None),
+            DurableResult::Value(Some(bytes)) => bytes.try_into().map(Some)
+                .map_err(|_| "Stored dice secret has invalid length".to_owned()),
+            DurableResult::Error(problem) => Err(problem),
+            _ => Err("Unexpected dice secret read reply".to_owned()),
+        }
+    }
+
+    async fn create_durable_dice_secret(
+        api: &Rc<RefCell<Option<WebApi>>>,
+        router: &Rc<RefCell<DurableReplyRouter>>,
+        handle: &LocalStateDelegateHandle,
+        game_id: &[u8; 32],
+        turn: u32,
+        player: Player,
+        secret: &DiceSecret,
+    ) -> Result<(), String> {
+        let scope = backgammon_protocol::dice_secret_durable_scope(game_id, turn, player);
+        let request = DurableRequest {
+            version: DURABLE_STATE_VERSION,
+            request_id: secure_random_32("dice secret create ID")?,
+            scope,
+            slot: DurableSlot::DiceSecret,
+            action: DurableAction::Create(secret.to_vec()),
+        };
+        match durable_call(api, router, handle, request).await? {
+            DurableResult::Stored => {},
+            DurableResult::Conflict => return Err("A different dice secret already occupies this turn".to_owned()),
+            DurableResult::Error(problem) => return Err(problem),
+            _ => return Err("Unexpected dice secret create reply".to_owned()),
+        }
+        if load_durable_dice_secret(api, router, handle, game_id, turn, player).await? != Some(*secret) {
+            return Err("Durable dice secret failed exact readback".to_owned());
+        }
+        Ok(())
+    }
+
+    async fn save_durable_genesis_handshake(
+        api: &Rc<RefCell<Option<WebApi>>>,
+        router: &Rc<RefCell<DurableReplyRouter>>,
+        handle: &LocalStateDelegateHandle,
+        previous: Option<Vec<u8>>,
+        record: &StoredGenesisHandshake,
+    ) -> Result<(), String> {
+        let bytes = record.encode()?;
+        if previous.as_ref() == Some(&bytes) { return Ok(()); }
+        let action = match previous {
+            Some(expected) => DurableAction::Replace { expected, replacement: bytes.clone() },
+            None => DurableAction::Create(bytes.clone()),
+        };
+        let write = DurableRequest {
+            version: DURABLE_STATE_VERSION,
+            request_id: secure_random_32("genesis handshake write ID")?,
+            scope: record.game_id(),
+            slot: DurableSlot::GenesisHandshake,
+            action,
+        };
+        match durable_call(api, router, handle, write).await? {
+            DurableResult::Stored => {},
+            DurableResult::Error(problem) => return Err(problem),
+            _ => return Err("Genesis handshake conditional write was rejected".to_owned()),
+        }
+        let readback = DurableRequest {
+            version: DURABLE_STATE_VERSION,
+            request_id: secure_random_32("genesis handshake readback ID")?,
+            scope: record.game_id(),
+            slot: DurableSlot::GenesisHandshake,
+            action: DurableAction::Get,
+        };
+        match durable_call(api, router, handle, readback).await? {
+            DurableResult::Value(Some(value)) if value == bytes => Ok(()),
+            DurableResult::Error(problem) => Err(problem),
+            _ => Err("Genesis handshake readback differed from signed evidence".to_owned()),
+        }
+    }
 
     fn format_player_id(player_id: &[u8; 32]) -> String {
         player_id
@@ -198,60 +493,130 @@ mod browser {
         Ok(seconds as u64)
     }
 
+    // Call only after checking this exact record against verified lobby state.
+    // Keep delegate compare-and-delete semantics; reconcile a duplicate deletion
+    // by reading again instead of treating every Conflict as a storage failure.
+    async fn cleanup_confirmed_lobby_record(
+        api: &Rc<RefCell<Option<WebApi>>>,
+        router: &Rc<RefCell<DurableReplyRouter>>,
+        handle: &LocalStateDelegateHandle,
+        epoch: &Rc<RefCell<u64>>,
+        epoch_snapshot: u64,
+        player_id: [u8; 32],
+        slot: DurableSlot,
+        expected: Vec<u8>,
+    ) -> Result<bool, String> {
+        if !is_current_connection(epoch_snapshot, *epoch.borrow()) {
+            return Err("Connection changed before confirmed durable cleanup".to_owned());
+        }
+        let delete = DurableRequest {
+            version: DURABLE_STATE_VERSION,
+            request_id: secure_random_32("confirmed lobby exact delete ID")?,
+            scope: player_id,
+            slot,
+            action: DurableAction::Delete { expected: expected.clone() },
+        };
+        let result = durable_call(api, router, handle, delete).await?;
+        if !is_current_connection(epoch_snapshot, *epoch.borrow()) {
+            return Err("Connection changed during confirmed durable cleanup".to_owned());
+        }
+        match result {
+            DurableResult::Deleted | DurableResult::Conflict => {},
+            DurableResult::Error(problem) => return Err(problem),
+            _ => return Err("Unexpected confirmed durable cleanup reply".to_owned()),
+        }
+        let readback = DurableRequest {
+            version: DURABLE_STATE_VERSION,
+            request_id: secure_random_32("confirmed lobby cleanup readback ID")?,
+            scope: player_id,
+            slot,
+            action: DurableAction::Get,
+        };
+        let result = durable_call(api, router, handle, readback).await?;
+        if !is_current_connection(epoch_snapshot, *epoch.borrow()) {
+            return Err("Connection changed during confirmed cleanup readback".to_owned());
+        }
+        match result {
+            DurableResult::Value(current) => {
+                confirmed_cleanup_readback(&expected, current.as_deref())
+            }
+            DurableResult::Error(problem) => Err(problem),
+            _ => Err("Unexpected confirmed cleanup readback reply".to_owned()),
+        }
+    }
+
     /// Removes durable outbound publication state only after the exact signed
     /// offer appears in a complete, independently verified lobby state.
     fn observe_authoritative_challenge_publication(
         state: &LobbyContractState,
         local_player_id_handle: &UseStateHandle<Option<[u8; 32]>>,
+        api_handle: &Rc<RefCell<Option<WebApi>>>,
+        durable_handle: &Rc<RefCell<Option<LocalStateDelegateHandle>>>,
+        reply_router: &Rc<RefCell<DurableReplyRouter>>,
+        epoch_handle: &Rc<RefCell<u64>>,
         pending_handle: &UseStateHandle<bool>,
         status_handle: &UseStateHandle<String>,
         error_handle: &UseStateHandle<Option<String>>,
     ) {
-        let Some(local_player_id) = **local_player_id_handle else {
-            return;
-        };
-
-        let observation = (|| {
-            let Some(stored) = load_outbound_challenge_publication(&local_player_id)? else {
-                return Ok(false);
-            };
-
-            if stored.stage != OutboundChallengePublicationStage::AwaitingLobbyConfirmation {
-                return Ok(false);
+        let Some(player_id) = **local_player_id_handle else { return; };
+        let state = state.clone();
+        let api = api_handle.clone();
+        let delegate = durable_handle.clone();
+        let router = reply_router.clone();
+        let epoch = epoch_handle.clone();
+        let epoch_snapshot = *epoch.borrow();
+        let pending = pending_handle.clone();
+        let status = status_handle.clone();
+        let error_handle = error_handle.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let observation = async {
+                let handle = delegate.borrow().clone().ok_or_else(||
+                    "Durable state delegate unavailable during lobby observation".to_owned())?;
+                let get = DurableRequest {
+                    version: DURABLE_STATE_VERSION,
+                    request_id: secure_random_32("challenge lobby observation request ID")?,
+                    scope: player_id,
+                    slot: DurableSlot::OutboundChallenge,
+                    action: DurableAction::Get,
+                };
+                let bytes = match durable_call(&api, &router, &handle, get).await? {
+                    DurableResult::Value(Some(bytes)) => bytes,
+                    DurableResult::Value(None) => return Ok(false),
+                    DurableResult::Error(error) => return Err(error),
+                    _ => return Err("Unexpected durable lobby observation response".to_owned()),
+                };
+                let stored = StoredOutboundChallengePublication::decode(&bytes)?;
+                if stored.local_player_id != player_id {
+                    return Err("Lobby observation found another identity's challenge".to_owned());
+                }
+                if stored.stage != OutboundChallengePublicationStage::AwaitingLobbyConfirmation
+                    || !stored.is_exact_offer_authoritative(&state)?
+                {
+                    return Ok(false);
+                }
+                if *epoch.borrow() != epoch_snapshot {
+                    return Err("Connection changed before challenge confirmation".to_owned());
+                }
+                cleanup_confirmed_lobby_record(
+                    &api, &router, &handle, &epoch, epoch_snapshot,
+                    player_id, DurableSlot::OutboundChallenge, bytes,
+                ).await
+            }.await;
+            if *epoch.borrow() != epoch_snapshot { return; }
+            match observation {
+                Ok(true) => {
+                    pending.set(false);
+                    status.set("Challenge advertised and confirmed in verified authoritative lobby state".to_owned());
+                    error_handle.set(None);
+                }
+                Ok(false) => {}
+                Err(problem) => {
+                    pending.set(true);
+                    status.set("Challenge publication confirmation requires recovery".to_owned());
+                    error_handle.set(Some(problem));
+                }
             }
-
-            if !stored.is_exact_offer_authoritative(state)? {
-                return Ok(false);
-            }
-
-            remove_outbound_challenge_publication(&local_player_id, &stored.challenge_id())?;
-
-            Ok(true)
-        })();
-
-        match observation {
-            Ok(true) => {
-                pending_handle.set(false);
-                status_handle.set(
-                    "Challenge advertised and confirmed in verified authoritative lobby state"
-                        .to_owned(),
-                );
-                error_handle.set(None);
-            }
-
-            Ok(false) => {}
-
-            Err(error) => {
-                /*
-                 * Retain the pending state and surface the error. Storage removal
-                 * itself verifies that the exact identity-scoped record vanished.
-                 */
-                pending_handle.set(true);
-                status_handle
-                    .set("Challenge publication confirmation requires recovery".to_owned());
-                error_handle.set(Some(error));
-            }
-        }
+        });
     }
 
     /// Removes durable incoming acceptance evidence only after the exact
@@ -260,51 +625,71 @@ mod browser {
     fn observe_authoritative_incoming_challenge_acceptance(
         state: &LobbyContractState,
         local_player_id_handle: &UseStateHandle<Option<[u8; 32]>>,
+        api_handle: &Rc<RefCell<Option<WebApi>>>,
+        durable_handle: &Rc<RefCell<Option<LocalStateDelegateHandle>>>,
+        reply_router: &Rc<RefCell<DurableReplyRouter>>,
+        epoch_handle: &Rc<RefCell<u64>>,
         pending_handle: &UseStateHandle<bool>,
         status_handle: &UseStateHandle<String>,
         error_handle: &UseStateHandle<Option<String>>,
     ) {
-        let Some(local_player_id) = **local_player_id_handle else {
-            return;
-        };
-
-        let observation = (|| {
-            let Some(stored) = load_incoming_challenge_acceptance(&local_player_id)? else {
-                return Ok(false);
-            };
-
-            if !stored.is_exact_acceptance_authoritative(state)? {
-                return Ok(false);
+        let Some(player_id) = **local_player_id_handle else { return; };
+        let state = state.clone();
+        let api = api_handle.clone();
+        let delegate = durable_handle.clone();
+        let router = reply_router.clone();
+        let epoch = epoch_handle.clone();
+        let epoch_snapshot = *epoch.borrow();
+        let pending = pending_handle.clone();
+        let status = status_handle.clone();
+        let error_handle = error_handle.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let observation = async {
+                let handle = delegate.borrow().clone().ok_or_else(||
+                    "Durable state delegate unavailable during acceptance observation".to_owned())?;
+                let get = DurableRequest {
+                    version: DURABLE_STATE_VERSION,
+                    request_id: secure_random_32("acceptance lobby observation request ID")?,
+                    scope: player_id,
+                    slot: DurableSlot::IncomingAcceptance,
+                    action: DurableAction::Get,
+                };
+                let bytes = match durable_call(&api, &router, &handle, get).await? {
+                    DurableResult::Value(Some(bytes)) => bytes,
+                    DurableResult::Value(None) => return Ok(false),
+                    DurableResult::Error(error) => return Err(error),
+                    _ => return Err("Unexpected durable acceptance observation reply".to_owned()),
+                };
+                let stored = StoredIncomingChallengeAcceptance::decode(&bytes)?;
+                if stored.local_player_id != player_id {
+                    return Err("Stored acceptance belongs to another identity".to_owned());
+                }
+                if !stored.is_exact_acceptance_authoritative(&state)? {
+                    return Ok(false);
+                }
+                if *epoch.borrow() != epoch_snapshot {
+                    return Err("Connection changed before acceptance confirmation".to_owned());
+                }
+                cleanup_confirmed_lobby_record(
+                    &api, &router, &handle, &epoch, epoch_snapshot,
+                    player_id, DurableSlot::IncomingAcceptance, bytes,
+                ).await
+            }.await;
+            if *epoch.borrow() != epoch_snapshot { return; }
+            match observation {
+                Ok(true) => {
+                    pending.set(false);
+                    status.set("Challenge acceptance confirmed in verified authoritative lobby state".to_owned());
+                    error_handle.set(None);
+                }
+                Ok(false) => {}
+                Err(problem) => {
+                    pending.set(true);
+                    status.set("Challenge acceptance confirmation requires recovery".to_owned());
+                    error_handle.set(Some(problem));
+                }
             }
-
-            remove_incoming_challenge_acceptance(&local_player_id, &stored.challenge_id())?;
-
-            Ok(true)
-        })();
-
-        match observation {
-            Ok(true) => {
-                pending_handle.set(false);
-                status_handle.set(
-                    "Challenge acceptance confirmed in verified authoritative \
-                     lobby state"
-                        .to_owned(),
-                );
-                error_handle.set(None);
-            }
-
-            Ok(false) => {}
-
-            Err(error) => {
-                /*
-                 * Retain the durable record and pending state. Removal itself
-                 * verifies that the exact identity-scoped record vanished.
-                 */
-                pending_handle.set(true);
-                status_handle.set("Challenge acceptance confirmation requires recovery".to_owned());
-                error_handle.set(Some(error));
-            }
-        }
+        });
     }
 
     fn handle_lobby_response(
@@ -314,6 +699,9 @@ mod browser {
         authoritative_state_handle: &UseStateHandle<Option<LobbyContractState>>,
         contract_key_handle: &Rc<RefCell<Option<ContractKey>>>,
         api_handle: &Rc<RefCell<Option<WebApi>>>,
+        durable_handle: &Rc<RefCell<Option<LocalStateDelegateHandle>>>,
+        reply_router: &Rc<RefCell<DurableReplyRouter>>,
+        epoch_handle: &Rc<RefCell<u64>>,
         local_player_id_handle: &UseStateHandle<Option<[u8; 32]>>,
         challenge_pending_handle: &UseStateHandle<bool>,
         challenge_status_handle: &UseStateHandle<String>,
@@ -350,6 +738,10 @@ mod browser {
             observe_authoritative_challenge_publication(
                 &state,
                 local_player_id_handle,
+                api_handle,
+                durable_handle,
+                reply_router,
+                epoch_handle,
                 challenge_pending_handle,
                 challenge_status_handle,
                 challenge_error_handle,
@@ -358,6 +750,10 @@ mod browser {
             observe_authoritative_incoming_challenge_acceptance(
                 &state,
                 local_player_id_handle,
+                api_handle,
+                durable_handle,
+                reply_router,
+                epoch_handle,
                 incoming_pending_handle,
                 incoming_status_handle,
                 incoming_error_handle,
@@ -409,6 +805,9 @@ mod browser {
         local_player_id_handle: &UseStateHandle<Option<[u8; 32]>>,
         lobby_key_handle: &Rc<RefCell<Option<ContractKey>>>,
         api_handle: &Rc<RefCell<Option<WebApi>>>,
+        durable_handle: &Rc<RefCell<Option<LocalStateDelegateHandle>>>,
+        reply_router: &Rc<RefCell<DurableReplyRouter>>,
+        epoch_handle: &Rc<RefCell<u64>>,
         pending_handle: &UseStateHandle<bool>,
         status_handle: &UseStateHandle<String>,
         error_handle: &UseStateHandle<Option<String>>,
@@ -455,10 +854,51 @@ mod browser {
             return true;
         };
 
+        pending_handle.set(true);
+        let api = api_handle.clone();
+        let delegate = durable_handle.clone();
+        let router = reply_router.clone();
+        let epoch = epoch_handle.clone();
+        let epoch_snapshot = *epoch.borrow();
+        let authoritative_state_handle = authoritative_state_handle.clone();
+        let local_player_id_handle = local_player_id_handle.clone();
+        let lobby_key_handle = lobby_key_handle.clone();
+        let pending_handle = pending_handle.clone();
+        let status_handle = status_handle.clone();
+        let error_handle = error_handle.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let checked = async {
+                let handle = delegate.borrow().clone().ok_or_else(||
+                    "Durable state delegate unavailable before acceptance signing".to_owned())?;
+                let get = DurableRequest {
+                    version: DURABLE_STATE_VERSION,
+                    request_id: secure_random_32("acceptance pre-signing request ID")?,
+                    scope: probe.local_player_id,
+                    slot: DurableSlot::IncomingAcceptance,
+                    action: DurableAction::Get,
+                };
+                match durable_call(&api, &router, &handle, get).await? {
+                    DurableResult::Value(None) => Ok(handle),
+                    DurableResult::Value(Some(_)) | DurableResult::Conflict =>
+                        Err("A durable incoming acceptance already exists for this identity".to_owned()),
+                    DurableResult::Error(problem) => Err(problem),
+                    _ => Err("Unexpected pre-signing acceptance reply".to_owned()),
+                }
+            }.await;
+            if *epoch.borrow() != epoch_snapshot { return; }
+            let handle = match checked {
+                Ok(handle) => handle,
+                Err(problem) => {
+                    pending_handle.set(true);
+                    status_handle.set("Acceptance safety check requires recovery".to_owned());
+                    error_handle.set(Some(problem));
+                    return;
+                }
+            };
         let mut finalization_started = false;
 
         let prepared = (|| {
-            let active_player_id = (**local_player_id_handle).ok_or_else(|| {
+            let active_player_id = (*local_player_id_handle).ok_or_else(|| {
                 "Local identity disappeared before acceptance finalization.".to_owned()
             })?;
 
@@ -466,13 +906,7 @@ mod browser {
                 return Err("Active PlayerId differs from the challenged recipient.".to_owned());
             }
 
-            if load_incoming_challenge_acceptance(&active_player_id)?.is_some() {
-                return Err("A durable incoming challenge acceptance already exists \
-                     for this identity."
-                    .to_owned());
-            }
-
-            let authoritative_state = (**authoritative_state_handle).as_ref().ok_or_else(|| {
+            let authoritative_state = (*authoritative_state_handle).as_ref().ok_or_else(|| {
                 "Authoritative lobby state disappeared before \
                          acceptance finalization."
                     .to_owned()
@@ -511,7 +945,7 @@ mod browser {
                 .clone()
                 .ok_or_else(|| "The verified lobby contract key is unavailable.".to_owned())?;
 
-            if api_handle.borrow().is_none() {
+            if api.borrow().is_none() {
                 return Err("The Freenet connection closed before acceptance \
                      finalization."
                     .to_owned());
@@ -540,12 +974,10 @@ mod browser {
              * This exact read-back-verified durable write must complete before
              * the signed lobby update is allowed onto the network.
              */
-            store_new_incoming_challenge_acceptance(&stored)?;
-
-            Ok((lobby_key, plan.encoded_lobby_state_update, challenge_id))
+            Ok((lobby_key, plan.encoded_lobby_state_update, challenge_id, stored))
         })();
 
-        let (lobby_key, encoded_lobby_state_update, challenge_id) = match prepared {
+        let (lobby_key, encoded_lobby_state_update, challenge_id, stored) = match prepared {
             Ok(prepared) => prepared,
 
             Err(error) => {
@@ -560,20 +992,54 @@ mod browser {
                 }
 
                 error_handle.set(Some(error));
-                return true;
+                return;
             }
         };
 
+        let write = async {
+            if *epoch.borrow() != epoch_snapshot { return Err("Connection changed before acceptance storage".to_owned()); }
+            let bytes = stored.encode()?;
+            let create = DurableRequest {
+                version: DURABLE_STATE_VERSION,
+                request_id: secure_random_32("acceptance durable create ID")?,
+                scope: stored.local_player_id,
+                slot: DurableSlot::IncomingAcceptance,
+                action: DurableAction::Create(bytes.clone()),
+            };
+            match durable_call(&api, &router, &handle, create).await? {
+                DurableResult::Stored => {}
+                DurableResult::Error(problem) => return Err(problem),
+                _ => return Err("Acceptance durable create was rejected".to_owned()),
+            }
+            let readback = DurableRequest {
+                version: DURABLE_STATE_VERSION,
+                request_id: secure_random_32("acceptance durable readback ID")?,
+                scope: stored.local_player_id,
+                slot: DurableSlot::IncomingAcceptance,
+                action: DurableAction::Get,
+            };
+            match durable_call(&api, &router, &handle, readback).await? {
+                DurableResult::Value(Some(value)) if value == bytes => Ok(()),
+                DurableResult::Error(problem) => Err(problem),
+                _ => Err("Acceptance durable readback differed from signed evidence".to_owned()),
+            }
+        }.await;
+        if *epoch.borrow() != epoch_snapshot { return; }
+        if let Err(problem) = write {
+            pending_handle.set(true);
+            status_handle.set("Acceptance storage requires recovery".to_owned());
+            error_handle.set(Some(problem));
+            return;
+        }
         pending_handle.set(true);
         error_handle.set(None);
-        status_handle
-            .set("Acceptance verified and stored; publishing its exact lobby update".to_owned());
+        status_handle.set("Acceptance verified and stored; publishing its exact lobby update".to_owned());
 
-        let api = api_handle.clone();
         let pending = pending_handle.clone();
         let status = status_handle.clone();
         let error = error_handle.clone();
 
+        let api = api.clone();
         wasm_bindgen_futures::spawn_local(async move {
             let result = {
                 let mut api = api.borrow_mut();
@@ -616,6 +1082,8 @@ mod browser {
             }
         });
 
+        });
+
         true
     }
 
@@ -631,6 +1099,9 @@ mod browser {
         local_player_id_handle: &UseStateHandle<Option<[u8; 32]>>,
         lobby_key_handle: &Rc<RefCell<Option<ContractKey>>>,
         api_handle: &Rc<RefCell<Option<WebApi>>>,
+        durable_handle: &Rc<RefCell<Option<LocalStateDelegateHandle>>>,
+        reply_router: &Rc<RefCell<DurableReplyRouter>>,
+        epoch_handle: &Rc<RefCell<u64>>,
         pending_handle: &UseStateHandle<bool>,
         status_handle: &UseStateHandle<String>,
         error_handle: &UseStateHandle<Option<String>>,
@@ -664,128 +1135,125 @@ mod browser {
          */
         submitted_handle.borrow_mut().take();
 
-        let prepared = (|| {
-            let local_player_id = (**local_player_id_handle).ok_or_else(|| {
-                "Local identity is unavailable during game-contract confirmation.".to_owned()
-            })?;
-
-            let mut stored =
-                load_outbound_challenge_publication(&local_player_id)?.ok_or_else(|| {
-                    "Exact game-contract confirmation has no durable challenge record.".to_owned()
-                })?;
-
-            if stored.signed_offer.body.proposal.game_id != submitted.game_id {
-                return Err(
-                    "Confirmed game contract does not match the stored signed game ID.".to_owned(),
-                );
-            }
-
-            let confirmed_contract_id = confirmed_key.id().encode();
-
-            if confirmed_contract_id != submitted.contract_id {
-                return Err(
-                    "Confirmed game contract ID differs from the armed publication ID.".to_owned(),
-                );
-            }
-
-            let now_unix_seconds = local_observation_unix_seconds()?;
-
-            verify_challenge_offer_at(
-                &stored.signed_offer,
-                now_unix_seconds,
-            )
-            .map_err(|error| {
-                format!(
-                    "Stored challenge expired or failed verification before lobby publication: {error}"
-                )
-            })?;
-
-            /*
-             * Rebuild before changing durable stage so malformed or inconsistent
-             * stored evidence can never become publication-authorized.
-             */
-            let plan = stored.rebuild_plan()?;
-
-            stored.mark_contract_confirmed()?;
-            update_outbound_challenge_publication(&stored)?;
-
-            let lobby_key = lobby_key_handle.borrow().clone().ok_or_else(|| {
-                "Game contract is confirmed, but the verified lobby key is unavailable.".to_owned()
-            })?;
-
-            Ok((
-                lobby_key,
-                plan.encoded_lobby_state_update,
-                stored.challenge_id(),
-            ))
-        })();
-
-        let (lobby_key, encoded_lobby_state_update, challenge_id) = match prepared {
-            Ok(prepared) => prepared,
-
-            Err(error) => {
-                pending_handle.set(true);
-                status_handle.set(
-                    "Challenge plan retained; lobby advertisement requires recovery".to_owned(),
-                );
-                error_handle.set(Some(error));
-                return true;
-            }
-        };
-
-        pending_handle.set(true);
-        error_handle.set(None);
-        status_handle.set("Game contract confirmed; advertising the signed challenge".to_owned());
-
         let api = api_handle.clone();
+        let delegate = durable_handle.clone();
+        let router = reply_router.clone();
+        let epoch = epoch_handle.clone();
+        let epoch_snapshot = *epoch.borrow();
+        let local_id = local_player_id_handle.clone();
+        let lobby_key = lobby_key_handle.clone();
         let pending = pending_handle.clone();
         let status = status_handle.clone();
         let error = error_handle.clone();
+        pending.set(true);
+        status.set("Game contract confirmed; verifying durable challenge stage".to_owned());
 
         wasm_bindgen_futures::spawn_local(async move {
-            let result = {
-                let mut api = api.borrow_mut();
-
-                match api.as_mut() {
-                    Some(api) => {
-                        submit_lobby_state_update(api, lobby_key, encoded_lobby_state_update).await
+            let prepared = async {
+                let player_id = (*local_id).ok_or_else(||
+                    "Local identity is unavailable during contract confirmation".to_owned())?;
+                let handle = delegate.borrow().clone().ok_or_else(||
+                    "Durable state delegate is unavailable after contract confirmation".to_owned())?;
+                let get = DurableRequest {
+                    version: DURABLE_STATE_VERSION,
+                    request_id: secure_random_32("confirmed challenge read request ID")?,
+                    scope: player_id,
+                    slot: DurableSlot::OutboundChallenge,
+                    action: DurableAction::Get,
+                };
+                let bytes = match durable_call(&api, &router, &handle, get).await? {
+                    DurableResult::Value(Some(bytes)) => bytes,
+                    DurableResult::Error(error) => return Err(error),
+                    _ => return Err("Confirmed contract has no exact durable challenge".to_owned()),
+                };
+                if *epoch.borrow() != epoch_snapshot || *local_id != Some(player_id) {
+                    return Err("Identity or connection changed during challenge confirmation".to_owned());
+                }
+                let mut stored = StoredOutboundChallengePublication::decode(&bytes)?;
+                if stored.local_player_id != player_id
+                    || stored.signed_offer.body.proposal.game_id != submitted.game_id
+                    || confirmed_key.id().encode() != submitted.contract_id
+                {
+                    return Err("Confirmed contract does not match durable signed challenge".to_owned());
+                }
+                verify_challenge_offer_at(&stored.signed_offer, local_observation_unix_seconds()?)
+                    .map_err(|error| format!("Stored challenge expired before advertisement: {error}"))?;
+                let plan = stored.rebuild_plan()?;
+                stored.mark_contract_confirmed()?;
+                let confirmed_bytes = stored.encode()?;
+                if bytes != confirmed_bytes {
+                    let replace = DurableRequest {
+                        version: DURABLE_STATE_VERSION,
+                        request_id: secure_random_32("confirmed challenge stage request ID")?,
+                        scope: player_id,
+                        slot: DurableSlot::OutboundChallenge,
+                        action: DurableAction::Replace {
+                            expected: bytes,
+                            replacement: confirmed_bytes.clone(),
+                        },
+                    };
+                    match durable_call(&api, &router, &handle, replace).await? {
+                        DurableResult::Stored => {}
+                        DurableResult::Error(error) => return Err(error),
+                        _ => return Err("Exact challenge stage update was rejected".to_owned()),
                     }
+                }
+                let readback = DurableRequest {
+                    version: DURABLE_STATE_VERSION,
+                    request_id: secure_random_32("confirmed challenge readback request ID")?,
+                    scope: player_id,
+                    slot: DurableSlot::OutboundChallenge,
+                    action: DurableAction::Get,
+                };
+                match durable_call(&api, &router, &handle, readback).await? {
+                    DurableResult::Value(Some(actual)) if actual == confirmed_bytes
+                        && StoredOutboundChallengePublication::decode(&actual)? == stored => {}
+                    DurableResult::Error(error) => return Err(error),
+                    _ => return Err("Confirmed challenge failed exact durable readback".to_owned()),
+                }
+                if *epoch.borrow() != epoch_snapshot || *local_id != Some(player_id) {
+                    return Err("Identity or connection changed before challenge advertisement".to_owned());
+                }
+                let lobby_key = lobby_key.borrow().clone().ok_or_else(||
+                    "Verified lobby key is unavailable after contract confirmation".to_owned())?;
+                Ok((lobby_key, plan.encoded_lobby_state_update, stored.challenge_id()))
+            }.await;
 
-                    None => {
-                        Err("Freenet connection closed before challenge advertisement.".to_owned())
+            let (lobby_key, update, challenge_id) = match prepared {
+                Ok(prepared) => prepared,
+                Err(problem) => {
+                    if *epoch.borrow() == epoch_snapshot {
+                        pending.set(true);
+                        status.set("Challenge retained; advertisement requires recovery".to_owned());
+                        error.set(Some(problem));
                     }
+                    return;
                 }
             };
-
+            status.set("Game contract confirmed; advertising the signed challenge".to_owned());
+            let result = {
+                let mut api = api.borrow_mut();
+                match api.as_mut() {
+                    Some(api) => submit_lobby_state_update(api, lobby_key, update).await,
+                    None => Err("Freenet connection closed before challenge advertisement".to_owned()),
+                }
+            };
+            if *epoch.borrow() != epoch_snapshot { return; }
             match result {
                 Ok(()) => {
-                    let short_challenge_id = challenge_id[..5]
-                        .iter()
+                    let short_id = challenge_id[..5].iter()
                         .map(|byte| format!("{byte:02x}"))
                         .collect::<String>();
-
                     pending.set(true);
-                    error.set(None);
-                    status.set(format!(
-                        "Challenge {short_challenge_id}… submitted; awaiting verified authoritative lobby confirmation",
-                    ));
+                    status.set(format!("Challenge {short_id}… submitted; awaiting verified authoritative lobby confirmation"));
                 }
-
-                Err(submission_error) => {
-                    /*
-                     * The durable stage remains AwaitingLobbyConfirmation.
-                     * Recovery must resend the exact rebuilt signed offer.
-                     */
+                Err(problem) => {
                     pending.set(true);
-                    status.set(
-                        "Game contract confirmed; challenge advertisement requires retry"
-                            .to_owned(),
-                    );
-                    error.set(Some(submission_error));
+                    status.set("Game contract confirmed; challenge advertisement requires retry".to_owned());
+                    error.set(Some(problem));
                 }
             }
         });
-
         true
     }
 
@@ -828,114 +1296,6 @@ mod browser {
         }))
     }
 
-    fn plan_browser_commitment(
-        contract_id: &str,
-        authoritative_state: &[u8],
-        local_player: Player,
-    ) -> Result<CommitmentPlan, String> {
-        let signing_key = load_cached_identity()?;
-
-        let pending = load_pending_action(contract_id)?;
-
-        let stored_secret = if let Some(pending) = pending.as_ref() {
-            let record = pending.verify()?;
-
-            let GameActionPayload::CommitDice { turn, player, .. } = &record.payload else {
-                return Err("Stored pending action is not a dice commitment.".to_owned());
-            };
-
-            if *player != local_player {
-                return Err(
-                    "Stored pending commitment belongs to a different local player.".to_owned(),
-                );
-            }
-
-            load_dice_secret(contract_id, &pending.game_id, *turn, *player)?
-        } else if let Some((game_id, turn, player)) =
-            local_commitment_storage_context(authoritative_state, local_player)?
-        {
-            load_dice_secret(contract_id, &game_id, turn, player)?
-        } else {
-            None
-        };
-
-        /*
-         * Entropy is supplied only as candidate material. The planner decides
-         * whether the verified authoritative state permits a new commitment.
-         * Candidate material is never stored unless the planner returns a
-         * newly created Submit plan.
-         */
-        let new_secret = if pending.is_none() && stored_secret.is_none() {
-            Some(secure_random_32("local dice secret")?)
-        } else {
-            None
-        };
-
-        let new_action_id = if pending.is_none() && stored_secret.is_none() {
-            Some(secure_random_32("network action ID")?)
-        } else {
-            None
-        };
-
-        let plan = plan_commitment(CommitmentPlannerInput {
-            contract_id: contract_id,
-            local_player,
-            signing_key: &signing_key,
-            authoritative_state,
-            pending: pending.as_ref(),
-            stored_secret,
-            new_secret,
-            new_action_id,
-        })?;
-
-        match &plan {
-            CommitmentPlan::NoAction => {}
-
-            CommitmentPlan::Accepted { .. } => {
-                if pending.is_some() {
-                    remove_pending_action(contract_id)?;
-                }
-            }
-
-            CommitmentPlan::Submit {
-                secret,
-                pending,
-                recovered_pending,
-            } => {
-                if !recovered_pending {
-                    let record = pending.verify()?;
-
-                    let GameActionPayload::CommitDice { turn, player, .. } = record.payload else {
-                        return Err(
-                            "New commitment plan produced a non-commitment action.".to_owned()
-                        );
-                    };
-
-                    if player != local_player {
-                        return Err(
-                            "New commitment plan produced an action for another player.".to_owned()
-                        );
-                    }
-
-                    /*
-                     * Persist the secret before the action that commits to it.
-                     * A crash must never leave a retryable commitment without
-                     * its corresponding reveal material.
-                     */
-                    store_dice_secret(contract_id, &pending.game_id, turn, player, secret)?;
-
-                    /*
-                     * Persist the exact encoded delta before network
-                     * submission. Retries must use these same bytes.
-                     */
-                    store_pending_action(pending)?;
-                }
-            }
-        }
-
-        Ok(plan)
-    }
-
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum NetworkActionKind {
         Commitment,
@@ -975,94 +1335,6 @@ mod browser {
         },
     }
 
-    fn plan_browser_reveal(
-        contract_id: &str,
-        authoritative_state: &[u8],
-        local_player: Player,
-    ) -> Result<RevealPlan, String> {
-        let signing_key = load_cached_identity()?;
-
-        let pending = load_pending_action(contract_id)?;
-
-        let stored_secret = if let Some(pending) = pending.as_ref() {
-            let record = pending.verify()?;
-
-            let GameActionPayload::RevealDice { turn, player, .. } = &record.payload else {
-                return Err("Stored pending action is not a dice reveal.".to_owned());
-            };
-
-            if *player != local_player {
-                return Err("Stored pending reveal belongs to a different local player.".to_owned());
-            }
-
-            load_dice_secret(contract_id, &pending.game_id, *turn, *player)?
-        } else if let Some((game_id, turn, player)) =
-            local_commitment_storage_context(authoritative_state, local_player)?
-        {
-            load_dice_secret(contract_id, &game_id, turn, player)?
-        } else {
-            None
-        };
-
-        /*
-         * A fresh action ID is candidate material only. It is unavailable while
-         * an exact durable pending action exists, so retry cannot regenerate it.
-         */
-        let new_action_id = if pending.is_none() && stored_secret.is_some() {
-            Some(secure_random_32("network action ID")?)
-        } else {
-            None
-        };
-
-        let plan = plan_reveal(RevealPlannerInput {
-            contract_id: contract_id,
-            local_player,
-            signing_key: &signing_key,
-            authoritative_state,
-            pending: pending.as_ref(),
-            stored_secret,
-            new_action_id,
-        })?;
-
-        match &plan {
-            RevealPlan::NoAction => {}
-
-            RevealPlan::Accepted { .. } => {
-                if pending.is_some() {
-                    remove_pending_action(contract_id)?;
-                }
-            }
-
-            RevealPlan::Submit {
-                pending,
-                recovered_pending,
-                ..
-            } => {
-                if !recovered_pending {
-                    let record = pending.verify()?;
-
-                    let GameActionPayload::RevealDice { player, .. } = record.payload else {
-                        return Err("New reveal plan produced a non-reveal action.".to_owned());
-                    };
-
-                    if player != local_player {
-                        return Err(
-                            "New reveal plan produced an action for another player.".to_owned()
-                        );
-                    }
-
-                    /*
-                     * The commitment path already persisted the secret. Preserve
-                     * it through reveal acceptance for restart verification.
-                     */
-                    store_pending_action(pending)?;
-                }
-            }
-        }
-
-        Ok(plan)
-    }
-
     fn map_reveal_plan(plan: RevealPlan) -> BrowserNetworkActionPlan {
         match plan {
             RevealPlan::NoAction => BrowserNetworkActionPlan::NoAction,
@@ -1085,248 +1357,54 @@ mod browser {
         }
     }
 
-    fn plan_browser_play_turn(
+    fn plan_fresh_roll_request(
         contract_id: &str,
         authoritative_state: &[u8],
         local_player: Player,
-        sequence: Option<&TurnSequence>,
-    ) -> Result<PlayTurnPlan, String> {
+    ) -> Result<crate::pending_action::PendingAction, String> {
         let signing_key = load_cached_identity()?;
-
-        let pending = load_pending_action(contract_id)?;
-
-        if let Some(pending) = pending.as_ref() {
-            let record = pending.verify()?;
-
-            let GameActionPayload::PlayTurn { player, .. } = &record.payload else {
-                return Err("Stored pending action is not a completed game turn.".to_owned());
-            };
-
-            if *player != local_player {
-                return Err("Stored pending turn belongs to a different local player.".to_owned());
-            }
-        }
-
-        /*
-         * Fresh entropy is supplied only when the interface has completed a
-         * sequence and no exact durable pending action already exists.
-         */
-        let new_action_id = if pending.is_none() && sequence.is_some() {
-            Some(secure_random_32("network turn action ID")?)
-        } else {
-            None
-        };
-
-        let plan = plan_play_turn(PlayTurnPlannerInput {
-            contract_id: contract_id,
-            local_player,
-            signing_key: &signing_key,
-            authoritative_state,
-            pending: pending.as_ref(),
-            sequence,
-            new_action_id,
-        })?;
-
-        match &plan {
-            PlayTurnPlan::NoAction => {}
-
-            PlayTurnPlan::Accepted => {
-                if pending.is_some() {
-                    remove_pending_action(contract_id)?;
-                }
-            }
-
-            PlayTurnPlan::Submit {
-                pending,
-                recovered_pending,
-            } => {
-                if !recovered_pending {
-                    let record = pending.verify()?;
-
-                    let GameActionPayload::PlayTurn { player, .. } = record.payload else {
-                        return Err("New turn plan produced a non-turn action.".to_owned());
-                    };
-
-                    if player != local_player {
-                        return Err(
-                            "New turn plan produced an action for another player.".to_owned()
-                        );
-                    }
-
-                    /*
-                     * Persist the exact encoded turn before any network
-                     * submission. Reload and reconnect must retry these same
-                     * bytes rather than rebuilding the action.
-                     */
-                    store_pending_action(pending)?;
-                }
-            }
-        }
-
-        Ok(plan)
-    }
-
-    fn map_play_turn_plan(plan: PlayTurnPlan) -> BrowserNetworkActionPlan {
-        match plan {
-            PlayTurnPlan::NoAction => BrowserNetworkActionPlan::NoAction,
-
-            PlayTurnPlan::Accepted => BrowserNetworkActionPlan::SecretlessAccepted {
-                kind: SecretlessNetworkActionKind::PlayTurn,
-            },
-
-            PlayTurnPlan::Submit {
-                pending,
-                recovered_pending,
-            } => BrowserNetworkActionPlan::SecretlessSubmit {
-                pending,
-                recovered_pending,
-                kind: SecretlessNetworkActionKind::PlayTurn,
-            },
-        }
-    }
-
-    fn plan_browser_request_roll(
-        contract_id: &str,
-        authoritative_state: &[u8],
-        local_player: Player,
-        requested: bool,
-    ) -> Result<RequestRollPlan, String> {
-        let signing_key = load_cached_identity()?;
-
-        let pending = load_pending_action(contract_id)?;
-
-        if let Some(pending) = pending.as_ref() {
-            let record = pending.verify()?;
-
-            let GameActionPayload::RequestRoll { player, .. } = &record.payload else {
-                return Err("Stored pending action is not a roll request.".to_owned());
-            };
-
-            if *player != local_player {
-                return Err(
-                    "Stored pending roll request belongs to a different local player.".to_owned(),
-                );
-            }
-        }
-
-        /*
-         * Fresh entropy is candidate material only for an explicit human request.
-         * Recovery of an exact durable pending RequestRoll never regenerates it.
-         */
-        let new_action_id = if pending.is_none() && requested {
-            Some(secure_random_32("network roll-request action ID")?)
-        } else {
-            None
-        };
-
-        let plan = plan_request_roll(RequestRollPlannerInput {
-            contract_id: contract_id,
-            local_player,
-            signing_key: &signing_key,
-            authoritative_state,
-            pending: pending.as_ref(),
-            requested,
-            new_action_id,
-        })?;
-
-        match &plan {
-            RequestRollPlan::NoAction => {}
-
-            RequestRollPlan::Accepted => {
-                if pending.is_some() {
-                    remove_pending_action(contract_id)?;
-                }
-            }
-
-            RequestRollPlan::Submit {
-                pending,
-                recovered_pending,
-            } => {
-                if !recovered_pending {
-                    let record = pending.verify()?;
-
-                    let GameActionPayload::RequestRoll { player, .. } = record.payload else {
-                        return Err("New roll-request plan produced a non-roll action.".to_owned());
-                    };
-
-                    if player != local_player {
-                        return Err(
-                            "New roll-request plan produced an action for another player."
-                                .to_owned(),
-                        );
-                    }
-
-                    /*
-                     * Persist the exact encoded request before any network submission.
-                     * Reload and reconnect must retry these same bytes.
-                     */
-                    store_pending_action(pending)?;
-                }
-            }
-        }
-
-        Ok(plan)
-    }
-
-    fn map_request_roll_plan(plan: RequestRollPlan) -> BrowserNetworkActionPlan {
-        match plan {
-            RequestRollPlan::NoAction => BrowserNetworkActionPlan::NoAction,
-
-            RequestRollPlan::Accepted => BrowserNetworkActionPlan::SecretlessAccepted {
-                kind: SecretlessNetworkActionKind::RequestRoll,
-            },
-
-            RequestRollPlan::Submit {
-                pending,
-                recovered_pending,
-            } => BrowserNetworkActionPlan::SecretlessSubmit {
-                pending,
-                recovered_pending,
-                kind: SecretlessNetworkActionKind::RequestRoll,
-            },
-        }
-    }
-
-    fn plan_browser_authenticated_genesis_submission(
-        contract_id: &str,
-        authenticated_genesis: &Action,
-        authoritative_state: &[u8],
-    ) -> Result<GenesisSubmissionPlan, String> {
-        let pending = load_pending_action(contract_id)?;
-
-        let plan = plan_authenticated_genesis_submission(GenesisSubmissionPlannerInput {
+        match plan_request_roll(RequestRollPlannerInput {
             contract_id,
-            authenticated_genesis,
+            local_player,
+            signing_key: &signing_key,
             authoritative_state,
-            pending: pending.as_ref(),
-        })?;
-
-        match &plan {
-            GenesisSubmissionPlan::Accepted { remove_pending } => {
-                if *remove_pending {
-                    remove_pending_action(contract_id)?;
-                }
-            }
-
-            GenesisSubmissionPlan::Submit {
-                pending,
-                recovered_pending,
-            } => {
-                if !*recovered_pending {
-                    /*
-                     * The existing storage API verifies an exact browser-storage
-                     * read-back before network submission can begin.
-                     */
-                    store_pending_action(pending)?;
-                }
-            }
+            pending: None,
+            requested: true,
+            new_action_id: Some(secure_random_32("network roll-request action ID")?),
+        })? {
+            RequestRollPlan::Submit { pending, recovered_pending: false } => Ok(pending),
+            _ => Err("Fresh roll request did not produce a new network action".to_owned()),
         }
-
-        Ok(plan)
     }
 
-    fn pending_genesis_requires_readiness(contract_id: &str) -> Result<bool, String> {
-        let Some(pending) = load_pending_action(contract_id)? else {
+    fn plan_fresh_turn(
+        contract_id: &str,
+        authoritative_state: &[u8],
+        local_player: Player,
+        sequence: &TurnSequence,
+    ) -> Result<crate::pending_action::PendingAction, String> {
+        let signing_key = load_cached_identity()?;
+        match plan_play_turn(PlayTurnPlannerInput {
+            contract_id,
+            local_player,
+            signing_key: &signing_key,
+            authoritative_state,
+            pending: None,
+            sequence: Some(sequence),
+            new_action_id: Some(secure_random_32("network turn action ID")?),
+        })? {
+            PlayTurnPlan::Submit { pending, recovered_pending: false } => Ok(pending),
+            _ => Err("Fresh turn did not produce a new network action".to_owned()),
+        }
+    }
+
+    async fn pending_genesis_requires_readiness(
+        api: &Rc<RefCell<Option<WebApi>>>,
+        router: &Rc<RefCell<DurableReplyRouter>>,
+        handle: &LocalStateDelegateHandle,
+        contract_id: &str,
+    ) -> Result<bool, String> {
+        let Some((pending, _)) = load_durable_pending_action(api, router, handle, contract_id).await? else {
             return Ok(false);
         };
 
@@ -1335,149 +1413,211 @@ mod browser {
         Ok(matches!(&record.payload, GameActionPayload::CreateGame(_)))
     }
 
-    fn plan_browser_network_action(
+    async fn plan_durable_reveal(
+        api: &Rc<RefCell<Option<WebApi>>>,
+        router: &Rc<RefCell<DurableReplyRouter>>,
+        handle: &LocalStateDelegateHandle,
+        contract_id: &str,
+        authoritative_state: &[u8],
+        local_player: Player,
+        previous: Option<(crate::pending_action::PendingAction, Vec<u8>)>,
+    ) -> Result<BrowserNetworkActionPlan, String> {
+        let context = if let Some((pending, _)) = previous.as_ref() {
+            let record = pending.verify()?;
+            let GameActionPayload::RevealDice { turn, player, .. } = record.payload else {
+                return Err("Stored pending action is not a dice reveal".to_owned());
+            };
+            if player != local_player { return Err("Pending reveal belongs to another player".to_owned()); }
+            Some((pending.game_id, turn, player))
+        } else {
+            local_commitment_storage_context(authoritative_state, local_player)?
+        };
+        let stored_secret = match context {
+            Some((game_id, turn, player)) => load_durable_dice_secret(
+                api, router, handle, &game_id, turn, player,
+            ).await?,
+            None => None,
+        };
+        let signing_key = load_cached_identity()?;
+        let plan = plan_reveal(RevealPlannerInput {
+            contract_id, local_player, signing_key: &signing_key, authoritative_state,
+            pending: previous.as_ref().map(|(pending, _)| pending),
+            stored_secret,
+            new_action_id: (previous.is_none() && stored_secret.is_some())
+                .then(|| secure_random_32("network reveal action ID"))
+                .transpose()?,
+        })?;
+        match &plan {
+            RevealPlan::Accepted { .. } if previous.is_some() => {
+                let (_, bytes) = previous.expect("accepted reveal had a pending record");
+                delete_durable_pending_action(api, router, handle, contract_id, bytes).await?;
+            }
+            RevealPlan::Submit { pending, recovered_pending: false, .. } => {
+                create_durable_pending_action(api, router, handle, pending).await?;
+            }
+            _ => {},
+        }
+        Ok(map_reveal_plan(plan))
+    }
+
+    async fn plan_durable_dice_action(
+        api: &Rc<RefCell<Option<WebApi>>>,
+        router: &Rc<RefCell<DurableReplyRouter>>,
+        handle: &LocalStateDelegateHandle,
+        contract_id: &str,
+        authoritative_state: &[u8],
+        local_player: Player,
+        previous: Option<(crate::pending_action::PendingAction, Vec<u8>)>,
+    ) -> Result<BrowserNetworkActionPlan, String> {
+        let context = if let Some((pending, _)) = previous.as_ref() {
+            let record = pending.verify()?;
+            let GameActionPayload::CommitDice { turn, player, .. } = record.payload else {
+                return plan_durable_reveal(api, router, handle, contract_id,
+                    authoritative_state, local_player, previous.clone()).await;
+            };
+            if player != local_player { return Err("Pending commitment belongs to another player".to_owned()); }
+            Some((pending.game_id, turn, player))
+        } else {
+            match local_commitment_storage_context(authoritative_state, local_player)? {
+                Some(context) => Some(context),
+                None => {
+                    let ledger = decode_verified_ledger(authoritative_state)?;
+                    let replay = replay_game(ledger.typed_actions())
+                        .map_err(|error| format!("Could not replay verified dice state: {error:?}"))?;
+                    Some((replay.game_id, replay.next_turn, local_player))
+                }
+            }
+        };
+        let stored_secret = match context {
+            Some((game_id, turn, player)) => load_durable_dice_secret(
+                api, router, handle, &game_id, turn, player,
+            ).await?,
+            None => None,
+        };
+        let fresh = previous.is_none();
+        let signing_key = load_cached_identity()?;
+        let plan = plan_commitment(CommitmentPlannerInput {
+            contract_id, local_player, signing_key: &signing_key, authoritative_state,
+            pending: previous.as_ref().map(|(pending, _)| pending),
+            stored_secret,
+            new_secret: if fresh { Some(match stored_secret {
+                Some(secret) => secret,
+                None => secure_random_32("local dice secret")?,
+            }) } else { None },
+            new_action_id: fresh.then(|| secure_random_32("network commitment action ID")).transpose()?,
+        })?;
+        match &plan {
+            CommitmentPlan::Accepted { .. } if previous.is_some() => {
+                let (_, bytes) = previous.expect("accepted commitment had a pending record");
+                delete_durable_pending_action(api, router, handle, contract_id, bytes).await?;
+            }
+            CommitmentPlan::Submit { secret, pending, recovered_pending: false } => {
+                let record = pending.verify()?;
+                let GameActionPayload::CommitDice { turn, player, commitment } = record.payload else {
+                    return Err("New commitment has the wrong payload".to_owned());
+                };
+                if player != local_player { return Err("New commitment belongs to another player".to_owned()); }
+                crate::secret_store::verify_dice_secret_commitment(
+                    &pending.game_id, turn, player, &commitment, secret,
+                )?;
+                if stored_secret.is_none() {
+                    create_durable_dice_secret(api, router, handle, &pending.game_id, turn, player, secret).await?;
+                } else if load_durable_dice_secret(api, router, handle, &pending.game_id, turn, player).await? != Some(*secret) {
+                    return Err("Durable dice secret changed before commitment submission".to_owned());
+                }
+                create_durable_pending_action(api, router, handle, pending).await?;
+            }
+            _ => {},
+        }
+        match plan {
+            CommitmentPlan::NoAction => plan_durable_reveal(api, router, handle,
+                contract_id, authoritative_state, local_player, None).await,
+            CommitmentPlan::Accepted { secret } => {
+                match plan_durable_reveal(api, router, handle, contract_id,
+                    authoritative_state, local_player, None).await? {
+                    BrowserNetworkActionPlan::NoAction => Ok(BrowserNetworkActionPlan::Accepted {
+                        secret, kind: NetworkActionKind::Commitment,
+                    }),
+                    next => Ok(next),
+                }
+            }
+            CommitmentPlan::Submit { secret, pending, recovered_pending } =>
+                Ok(BrowserNetworkActionPlan::Submit {
+                    secret, pending, recovered_pending, kind: NetworkActionKind::Commitment,
+                }),
+        }
+    }
+
+    async fn plan_durable_secretless_recovery(
+        api: &Rc<RefCell<Option<WebApi>>>,
+        router: &Rc<RefCell<DurableReplyRouter>>,
+        handle: &LocalStateDelegateHandle,
         contract_id: &str,
         authoritative_state: &[u8],
         local_player: Player,
     ) -> Result<BrowserNetworkActionPlan, String> {
-        if let Some(pending) = load_pending_action(contract_id)? {
-            let record = pending.verify()?;
-
-            return match record.payload {
-                GameActionPayload::CommitDice { .. } => {
-                    match plan_browser_commitment(contract_id, authoritative_state, local_player)? {
-                        CommitmentPlan::NoAction => Ok(BrowserNetworkActionPlan::NoAction),
-
-                        CommitmentPlan::Accepted { secret } => {
-                            /*
-                             * Acceptance removes the pending commitment. Continue
-                             * immediately into reveal planning so the browser does
-                             * not require an unrelated later update to advance.
-                             */
-                            match plan_browser_reveal(
-                                contract_id,
-                                authoritative_state,
-                                local_player,
-                            )? {
-                                RevealPlan::NoAction => Ok(BrowserNetworkActionPlan::Accepted {
-                                    secret,
-                                    kind: NetworkActionKind::Commitment,
-                                }),
-
-                                reveal => Ok(map_reveal_plan(reveal)),
-                            }
-                        }
-
-                        CommitmentPlan::Submit {
-                            secret,
-                            pending,
-                            recovered_pending,
-                        } => Ok(BrowserNetworkActionPlan::Submit {
-                            secret,
-                            pending,
-                            recovered_pending,
-                            kind: NetworkActionKind::Commitment,
-                        }),
-                    }
-                }
-
-                GameActionPayload::RevealDice { .. } => Ok(map_reveal_plan(plan_browser_reveal(
+        let previous = load_durable_pending_action(
+            api, router, handle, contract_id,
+        ).await?;
+        let Some((pending, exact_bytes)) = previous else {
+            return plan_durable_dice_action(api, router, handle,
+                contract_id, authoritative_state, local_player, None).await;
+        };
+        let record = pending.verify()?;
+        let disposition = match &record.payload {
+            GameActionPayload::RequestRoll { player, .. } if *player == local_player => {
+                let signing_key = load_cached_identity()?;
+                match plan_request_roll(RequestRollPlannerInput {
                     contract_id,
-                    authoritative_state,
                     local_player,
-                )?)),
-
-                GameActionPayload::RequestRoll { .. } => {
-                    Ok(map_request_roll_plan(plan_browser_request_roll(
-                        contract_id,
-                        authoritative_state,
-                        local_player,
-                        false,
-                    )?))
-                }
-
-                GameActionPayload::PlayTurn { .. } => Ok(map_play_turn_plan(
-                    plan_browser_play_turn(contract_id, authoritative_state, local_player, None)?,
-                )),
-
-                _ => Err(
-                    "Stored pending action is not supported by the browser network-action loop."
-                        .to_owned(),
-                ),
-            };
-        }
-
-        match plan_browser_commitment(contract_id, authoritative_state, local_player)? {
-            CommitmentPlan::NoAction => Ok(map_reveal_plan(plan_browser_reveal(
-                contract_id,
-                authoritative_state,
-                local_player,
-            )?)),
-
-            CommitmentPlan::Accepted { secret } => {
-                match plan_browser_reveal(contract_id, authoritative_state, local_player)? {
-                    RevealPlan::NoAction => Ok(BrowserNetworkActionPlan::Accepted {
-                        secret,
-                        kind: NetworkActionKind::Commitment,
-                    }),
-
-                    reveal => Ok(map_reveal_plan(reveal)),
+                    signing_key: &signing_key,
+                    authoritative_state,
+                    pending: Some(&pending),
+                    requested: false,
+                    new_action_id: None,
+                })? {
+                    RequestRollPlan::Accepted => BrowserNetworkActionPlan::SecretlessAccepted {
+                        kind: SecretlessNetworkActionKind::RequestRoll,
+                    },
+                    RequestRollPlan::Submit { pending, recovered_pending: true } =>
+                        BrowserNetworkActionPlan::SecretlessSubmit {
+                            pending, recovered_pending: true,
+                            kind: SecretlessNetworkActionKind::RequestRoll,
+                        },
+                    _ => return Err("Stored roll request produced an unexpected recovery plan".to_owned()),
                 }
             }
-
-            CommitmentPlan::Submit {
-                secret,
-                pending,
-                recovered_pending,
-            } => Ok(BrowserNetworkActionPlan::Submit {
-                secret,
-                pending,
-                recovered_pending,
-                kind: NetworkActionKind::Commitment,
-            }),
-        }
-    }
-
-    fn choose_local_role(contract_id: &str, player: Player) -> Result<(), String> {
-        if load_pending_action(contract_id)?.is_some() {
-            return Err("The local role cannot change while an action is pending.".to_owned());
-        }
-
-        match load_local_role(contract_id)? {
-            Some(existing) if existing == player => Ok(()),
-
-            Some(existing) => Err(format!(
-                "This browser profile is already locked as {} for this contract.",
-                player_name(existing),
-            )),
-
-            None => store_local_role(contract_id, player),
-        }
-    }
-
-    fn ensure_accepted_local_role(contract_id: &str, accepted_role: Player) -> Result<(), String> {
-        match load_local_role(contract_id)? {
-            Some(existing) if existing == accepted_role => Ok(()),
-
-            Some(existing) => Err(format!(
-                concat!(
-                    "Accepted game assigns this browser as {}, but browser storage ",
-                    "is already locked as {} for that contract.",
-                ),
-                player_name(accepted_role),
-                player_name(existing),
-            )),
-
-            None => {
-                if load_pending_action(contract_id)?.is_some() {
-                    return Err(
-                        "Accepted game has a pending action but no stored local role.".to_owned(),
-                    );
+            GameActionPayload::PlayTurn { player, .. } if *player == local_player => {
+                let signing_key = load_cached_identity()?;
+                match plan_play_turn(PlayTurnPlannerInput {
+                    contract_id,
+                    local_player,
+                    signing_key: &signing_key,
+                    authoritative_state,
+                    pending: Some(&pending),
+                    sequence: None,
+                    new_action_id: None,
+                })? {
+                    PlayTurnPlan::Accepted => BrowserNetworkActionPlan::SecretlessAccepted {
+                        kind: SecretlessNetworkActionKind::PlayTurn,
+                    },
+                    PlayTurnPlan::Submit { pending, recovered_pending: true } =>
+                        BrowserNetworkActionPlan::SecretlessSubmit {
+                            pending, recovered_pending: true,
+                            kind: SecretlessNetworkActionKind::PlayTurn,
+                        },
+                    _ => return Err("Stored turn produced an unexpected recovery plan".to_owned()),
                 }
-
-                store_local_role(contract_id, accepted_role)
             }
+            GameActionPayload::CommitDice { .. } | GameActionPayload::RevealDice { .. } =>
+                return plan_durable_dice_action(api, router, handle, contract_id,
+                    authoritative_state, local_player, Some((pending, exact_bytes))).await,
+            _ => return Err("Stored pending action is not a local roll request or turn".to_owned()),
+        };
+        if matches!(disposition, BrowserNetworkActionPlan::SecretlessAccepted { .. }) {
+            delete_durable_pending_action(api, router, handle, contract_id, exact_bytes).await?;
         }
+        Ok(disposition)
     }
 
     fn contract_id_for_scope_snapshot<'a>(
@@ -1648,6 +1788,25 @@ mod browser {
         Failed,
     }
 
+    #[derive(Clone)]
+    struct PresenceReservationIntent {
+        name: String,
+        available: bool,
+        issued_at: u64,
+        contract_key: ContractKey,
+        observed_revision: u64,
+        last_reserved: Option<u64>,
+    }
+
+    #[derive(Clone)]
+    enum RevisionPhase {
+        AwaitingRegistration,
+        AwaitingRead { player_id: [u8; 32], request_id: [u8; 32] },
+        Ready { player_id: [u8; 32], last_reserved: Option<u64> },
+        AwaitingReserve { player_id: [u8; 32], request_id: [u8; 32], intent: PresenceReservationIntent },
+        Failed,
+    }
+
     fn no_op() {}
 
     #[function_component(App)]
@@ -1662,7 +1821,6 @@ mod browser {
                 .expect("the fixed test contract ID must be a valid active-game scope")
         });
         let active_game_scope_snapshot = active_game_scope.borrow().snapshot();
-        let initial_game_contract_id = active_game_scope_snapshot.contract_id.clone();
         let controller = use_state(LocalGameController::new);
         let interface_error = use_state(|| None::<String>);
         let pending_confirmation = use_state(|| None::<PendingConfirmation>);
@@ -1690,6 +1848,15 @@ mod browser {
         let profile_registered = use_state(|| false);
         let profile_phase = use_mut_ref(|| ProfilePhase::AwaitingRegistration);
         let profile_delegate_status = use_state(|| "Profile delegate not checked".to_owned());
+        let revision_delegate = use_mut_ref(|| None::<LocalStateDelegateHandle>);
+        let revision_registered = use_state(|| false);
+        let revision_phase = use_mut_ref(|| RevisionPhase::AwaitingRegistration);
+        let revision_delegate_status = use_state(|| "Presence revision delegate not checked".to_owned());
+        let durable_delegate = use_mut_ref(|| None::<LocalStateDelegateHandle>);
+        let durable_registered = use_state(|| false);
+        let durable_delegate_status = use_state(|| "Durable state delegate not checked".to_owned());
+        let durable_replies = use_mut_ref(DurableReplyRouter::default);
+        let durable_registration_epoch = use_mut_ref(|| None::<u64>);
 
         /*
          * Lobby profile state tracks this browser's latest successfully
@@ -1767,12 +1934,14 @@ mod browser {
          * A reconnect resets this guard and reuses exact durable evidence.
          */
         let challenge_recovery_attempted = use_mut_ref(|| false);
+        let challenge_recovery_checked = use_state(|| false);
 
         /*
          * Incoming acceptance recovery has an independent per-connection
          * guard. It reuses the stored signature and never signs again.
          */
         let incoming_acceptance_recovery_attempted = use_mut_ref(|| false);
+        let incoming_acceptance_recovery_checked = use_state(|| false);
 
         /*
          * Role derived from this persistent PlayerId and a verified
@@ -1793,17 +1962,12 @@ mod browser {
         let synchronizing_game_state = use_state(|| false);
         let latest_lobby_contract_key = use_mut_ref(|| None::<ContractKey>);
 
-        /*
-         * The stored role is scoped to this exact contract instance.
-         * An invalid stored value is retained as an error rather than silently
-         * converted into a player role.
-         */
-        let local_role = use_state(move || load_local_role(initial_game_contract_id.as_str()));
+        let durable_pending_action_view = use_state(||
+            Err::<Option<crate::pending_action::PendingAction>, String>(
+                "Waiting for Freenet pending-action recovery".to_owned(),
+            )
+        );
 
-        let selected_local_role = match &*local_role {
-            Ok(role) => *role,
-            Err(_) => None,
-        };
 
         /*
          * Read-only comparison between this browser's persistent identity and
@@ -1818,6 +1982,67 @@ mod browser {
         let current_verified_view = (*verified_game_view)
             .as_ref()
             .filter(|view| view.scope == active_game_scope_snapshot);
+        // Accepted-action cleanup can finish after the ledger-triggered read.
+        // Refresh explicitly after recovery; invalidate older in-flight reads.
+        let pending_view_refresh = use_state(|| 0_u64);
+        let pending_view_refresh_counter = use_mut_ref(|| 0_u64);
+        let pending_view_read_generation = use_mut_ref(|| 0_u64);
+        let pending_view_input = (
+            active_game_scope_snapshot.clone(),
+            *durable_registered,
+            current_verified_view.map(|view| view.ledger_hash),
+            *pending_view_refresh,
+        );
+        {
+            let api = freenet_api.clone();
+            let delegate = durable_delegate.clone();
+            let router = durable_replies.clone();
+            let epoch = transport_epoch.clone();
+            let scope = active_game_scope.clone();
+            let view = durable_pending_action_view.clone();
+            let read_generation = pending_view_read_generation.clone();
+            use_effect_with(pending_view_input, move |(snapshot, ready, _ledger_hash, _refresh)| {
+                let generation = {
+                    let mut current = read_generation.borrow_mut();
+                    *current = current.wrapping_add(1);
+                    *current
+                };
+                view.set(Err("Checking Freenet pending-action state".to_owned()));
+                if *ready {
+                    let snapshot = snapshot.clone();
+                    let api = api.clone();
+                    let delegate = delegate.clone();
+                    let router = router.clone();
+                    let epoch = epoch.clone();
+                    let scope = scope.clone();
+                    let view = view.clone();
+                    let connection_epoch = *epoch.borrow();
+                    let read_generation = read_generation.clone();
+                    wasm_bindgen_futures::spawn_local(async move {
+                        let result = async {
+                            let handle = delegate.borrow().clone().ok_or_else(||
+                                "Durable state delegate is unavailable".to_owned())?;
+                            let pending = load_durable_pending_action(
+                                &api, &router, &handle, snapshot.contract_id.as_str(),
+                            ).await?.map(|(record, _)| record);
+                            if let Some(accepted) = scope.borrow().accepted_game().cloned() {
+                                if pending.as_ref().is_some_and(|record| record.game_id != accepted.game_id) {
+                                    return Err("Stored pending action belongs to another accepted game".to_owned());
+                                }
+                            }
+                            Ok(pending)
+                        }.await;
+                        if *epoch.borrow() == connection_epoch
+                            && scope.borrow().recognizes(&snapshot)
+                            && *read_generation.borrow() == generation
+                        {
+                            view.set(result);
+                        }
+                    });
+                }
+                || {}
+            });
+        }
         let verified_game_created = current_verified_view.is_some();
         let authoritative_identity_role_text = match *local_player_id {
             None => "Identity unavailable".to_owned(),
@@ -1920,6 +2145,60 @@ mod browser {
         }
 
         {
+            let revision_phase = revision_phase.clone();
+            let revision_delegate = revision_delegate.clone();
+            let revision_status = revision_delegate_status.clone();
+            let api = freenet_api.clone();
+            let epoch = transport_epoch.clone();
+
+            use_effect_with((*local_player_id, *revision_registered), move |(player_id, registered)| {
+                let Some(player_id) = *player_id else {
+                    revision_status.set("Waiting for Freenet identity".to_owned());
+                    return no_op as fn();
+                };
+                if !*registered {
+                    revision_status.set("Waiting for presence revision delegate".to_owned());
+                    return no_op as fn();
+                }
+                let Some(handle) = revision_delegate.borrow().clone() else {
+                    *revision_phase.borrow_mut() = RevisionPhase::Failed;
+                    revision_status.set("Presence revision delegate unavailable".to_owned());
+                    return no_op as fn();
+                };
+                let request_id = match secure_random_32("presence revision read request ID") {
+                    Ok(request_id) => request_id,
+                    Err(error) => {
+                        *revision_phase.borrow_mut() = RevisionPhase::Failed;
+                        revision_status.set(format!("Presence revision read failed: {error}"));
+                        return no_op as fn();
+                    }
+                };
+                *revision_phase.borrow_mut() = RevisionPhase::AwaitingRead { player_id, request_id };
+                revision_status.set("Reading reserved presence revision".to_owned());
+                let epoch_snapshot = *epoch.borrow();
+                wasm_bindgen_futures::spawn_local(async move {
+                    if *epoch.borrow() != epoch_snapshot { return; }
+                    let result = {
+                        let mut api = api.borrow_mut();
+                        match api.as_mut() {
+                            Some(api) => send_presence_revision_request(api, &handle, PresenceRevisionRequest {
+                                version: PRESENCE_REVISION_PROTOCOL_VERSION, request_id, player_id,
+                                action: PresenceRevisionAction::GetReserved,
+                            }).await,
+                            None => Err("Freenet connection closed before revision read".to_owned()),
+                        }
+                    };
+                    if let Err(error) = result {
+                        if *epoch.borrow() != epoch_snapshot { return; }
+                        *revision_phase.borrow_mut() = RevisionPhase::Failed;
+                        revision_status.set(format!("Presence revision read failed: {error}"));
+                    }
+                });
+                no_op as fn()
+            });
+        }
+
+        {
             let latest_authoritative_state = latest_authoritative_state.clone();
             let authoritative_local_role = authoritative_local_role.clone();
 
@@ -1949,6 +2228,12 @@ mod browser {
                 &*lobby_contract_status,
                 LobbyContractStatus::Retrieved { .. }
             ),
+            DurableRecoveryReadiness {
+                connection_epoch: *transport_epoch.borrow(),
+                socket_open: matches!(&*connection_status, ConnectionStatus::Connected),
+                delegate_registered: *durable_registered,
+                registered_epoch: *durable_registration_epoch.borrow(),
+            },
         );
 
         {
@@ -1959,17 +2244,71 @@ mod browser {
             let incoming_acceptance_pending = incoming_acceptance_pending.clone();
             let incoming_acceptance_status = incoming_acceptance_status.clone();
             let incoming_acceptance_error = incoming_acceptance_error.clone();
+            let incoming_acceptance_recovery_checked = incoming_acceptance_recovery_checked.clone();
+            let durable_delegate = durable_delegate.clone();
+            let durable_replies = durable_replies.clone();
+            let transport_epoch = transport_epoch.clone();
 
             use_effect_with(
                 incoming_acceptance_recovery_ready,
-                move |(player_id, lobby_ready)| {
-                    if let Some(player_id) = *player_id {
-                        match load_incoming_challenge_acceptance(&player_id) {
-                            Ok(None) => {}
+                move |(player_id, lobby_ready, readiness)| {
+                    if let (Some(player_id), true) = (*player_id, readiness.can_read()) {
+                        if !is_current_connection(
+                            readiness.connection_epoch,
+                            *transport_epoch.borrow(),
+                        ) {
+                            return no_op as fn();
+                        }
+                        let lobby_ready = *lobby_ready;
+                        let api = freenet_api.clone();
+                        let delegate = durable_delegate.clone();
+                        let router = durable_replies.clone();
+                        let epoch = transport_epoch.clone();
+                        let epoch_snapshot = *epoch.borrow();
+                        let checked = incoming_acceptance_recovery_checked.clone();
+                        let pending = incoming_acceptance_pending.clone();
+                        let status = incoming_acceptance_status.clone();
+                        let error_handle = incoming_acceptance_error.clone();
+                        let attempted = incoming_acceptance_recovery_attempted.clone();
+                        wasm_bindgen_futures::spawn_local(async move {
+                        if !is_current_connection(epoch_snapshot, *epoch.borrow()) { return; }
+                        let observed = async {
+                            let handle = delegate.borrow().clone().ok_or_else(||
+                                "Durable state delegate unavailable during acceptance recovery".to_owned())?;
+                            let get = DurableRequest {
+                                version: DURABLE_STATE_VERSION,
+                                request_id: secure_random_32("incoming acceptance recovery get ID")?,
+                                scope: player_id,
+                                slot: DurableSlot::IncomingAcceptance,
+                                action: DurableAction::Get,
+                            };
+                            match durable_call(&api, &router, &handle, get).await? {
+                                DurableResult::Value(None) => Ok(None),
+                                DurableResult::Value(Some(bytes)) => {
+                                    let record = StoredIncomingChallengeAcceptance::decode(&bytes)?;
+                                    if record.local_player_id != player_id {
+                                        return Err("Stored acceptance belongs to another identity".to_owned());
+                                    }
+                                    Ok(Some(record))
+                                }
+                                DurableResult::Error(problem) => Err(problem),
+                                _ => Err("Unexpected acceptance recovery reply".to_owned()),
+                            }
+                        }.await;
+                        if *epoch.borrow() != epoch_snapshot { return; }
+                        match observed {
+                            Ok(None) => {
+                                checked.set(true);
+                                if !*attempted.borrow() {
+                                    pending.set(false);
+                                    status.set("No incoming acceptance pending".to_owned());
+                                    error_handle.set(None);
+                                }
+                            }
 
                             Err(error) => {
-                                *incoming_acceptance_recovery_attempted.borrow_mut() = true;
-
+                                // A failed read has not published anything. In particular,
+                                // a send rejected before OPEN must be retried on readiness.
                                 incoming_acceptance_pending.set(true);
                                 incoming_acceptance_status.set(
                                     "Stored incoming acceptance recovery is \
@@ -1980,32 +2319,42 @@ mod browser {
                             }
 
                             Ok(Some(stored)) => {
+                                checked.set(true);
                                 incoming_acceptance_pending.set(true);
 
-                                if !*lobby_ready {
+                                if !lobby_ready {
                                     incoming_acceptance_status.set(
                                         "Stored acceptance loaded; waiting for \
                                          verified lobby recovery"
                                             .to_owned(),
                                     );
-                                } else if !*incoming_acceptance_recovery_attempted.borrow() {
+                                } else if claim_recovery_publication(
+                                    &mut incoming_acceptance_recovery_attempted.borrow_mut(),
+                                ) {
                                     /*
                                      * Arm before validation or asynchronous
                                      * submission. Any failure retains the
                                      * exact durable record until reconnect.
                                      */
-                                    *incoming_acceptance_recovery_attempted.borrow_mut() = true;
-
-                                    let prepared = (|| {
-                                        if load_outbound_challenge_publication(&player_id)?
-                                            .is_some()
-                                        {
-                                            return Err("Incoming acceptance recovery \
-                                                 is blocked by a durable \
-                                                 outbound challenge."
-                                                .to_owned());
+                                    let outbound_clear = async {
+                                        let handle = delegate.borrow().clone().ok_or_else(||
+                                            "Durable state delegate unavailable during acceptance recovery".to_owned())?;
+                                        let get = DurableRequest {
+                                            version: DURABLE_STATE_VERSION,
+                                            request_id: secure_random_32("acceptance recovery outbound check ID")?,
+                                            scope: player_id,
+                                            slot: DurableSlot::OutboundChallenge,
+                                            action: DurableAction::Get,
+                                        };
+                                        match durable_call(&api, &router, &handle, get).await? {
+                                            DurableResult::Value(None) => Ok(()),
+                                            DurableResult::Value(Some(_)) => Err("Incoming acceptance recovery is blocked by a durable outbound challenge".to_owned()),
+                                            DurableResult::Error(problem) => Err(problem),
+                                            _ => Err("Unexpected outbound challenge recovery reply".to_owned()),
                                         }
-
+                                    }.await;
+                                    if *epoch.borrow() != epoch_snapshot { return; }
+                                    let prepared = outbound_clear.and_then(|_| (|| {
                                         /*
                                          * Rebuilding regenerates the original
                                          * acceptance, proposal, full contract
@@ -2029,7 +2378,7 @@ mod browser {
                                             plan.encoded_lobby_state_update,
                                             stored.challenge_id(),
                                         ))
-                                    })();
+                                    })());
 
                                     match prepared {
                                         Err(error) => {
@@ -2056,8 +2405,6 @@ mod browser {
                                                      challenge \
                                                      {short_challenge_id}…",
                                             ));
-                                            incoming_acceptance_error.set(None);
-
                                             let api = freenet_api.clone();
                                             let pending = incoming_acceptance_pending.clone();
                                             let status = incoming_acceptance_status.clone();
@@ -2090,7 +2437,6 @@ mod browser {
                                                 match result {
                                                     Ok(()) => {
                                                         pending.set(true);
-                                                        error.set(None);
                                                         status.set(format!(
                                                             "Recovered \
                                                                  acceptance for \
@@ -2123,9 +2469,10 @@ mod browser {
                                 }
                             }
                         }
+                        });
                     }
 
-                    || {}
+                    no_op as fn()
                 },
             );
         }
@@ -2136,6 +2483,12 @@ mod browser {
                 &*lobby_contract_status,
                 LobbyContractStatus::Retrieved { .. }
             ),
+            DurableRecoveryReadiness {
+                connection_epoch: *transport_epoch.borrow(),
+                socket_open: matches!(&*connection_status, ConnectionStatus::Connected),
+                delegate_registered: *durable_registered,
+                registered_epoch: *durable_registration_epoch.borrow(),
+            },
         );
 
         {
@@ -2145,15 +2498,68 @@ mod browser {
             let challenge_publication_pending = challenge_publication_pending.clone();
             let challenge_publication_status = challenge_publication_status.clone();
             let challenge_publication_error = challenge_publication_error.clone();
+            let challenge_recovery_checked = challenge_recovery_checked.clone();
+            let durable_delegate = durable_delegate.clone();
+            let durable_replies = durable_replies.clone();
+            let transport_epoch = transport_epoch.clone();
 
-            use_effect_with(challenge_recovery_ready, move |(player_id, lobby_ready)| {
-                if let Some(player_id) = *player_id {
-                    match load_outbound_challenge_publication(&player_id) {
-                        Ok(None) => {}
+            use_effect_with(challenge_recovery_ready, move |(player_id, lobby_ready, readiness)| {
+                if let (Some(player_id), true) = (*player_id, readiness.can_read()) {
+                    if !is_current_connection(
+                        readiness.connection_epoch,
+                        *transport_epoch.borrow(),
+                    ) {
+                        return no_op as fn();
+                    }
+                    let lobby_ready = *lobby_ready;
+                    let api = freenet_api.clone();
+                    let router = durable_replies.clone();
+                    let delegate = durable_delegate.clone();
+                    let epoch = transport_epoch.clone();
+                    let epoch_snapshot = *epoch.borrow();
+                    let pending = challenge_publication_pending.clone();
+                    let status = challenge_publication_status.clone();
+                    let error_handle = challenge_publication_error.clone();
+                    let checked = challenge_recovery_checked.clone();
+                    let attempted = challenge_recovery_attempted.clone();
+                    wasm_bindgen_futures::spawn_local(async move {
+                    if !is_current_connection(epoch_snapshot, *epoch.borrow()) { return; }
+                    let observed = async {
+                        let handle = delegate.borrow().clone().ok_or_else(||
+                            "Durable state delegate is unavailable during recovery".to_owned())?;
+                        let request = DurableRequest {
+                            version: DURABLE_STATE_VERSION,
+                            request_id: secure_random_32("challenge recovery read request ID")?,
+                            scope: player_id,
+                            slot: DurableSlot::OutboundChallenge,
+                            action: DurableAction::Get,
+                        };
+                        match durable_rpc!(api, router, handle, request).await? {
+                            DurableResult::Value(None) => Ok(None),
+                            DurableResult::Value(Some(bytes)) =>
+                                StoredOutboundChallengePublication::decode(&bytes).and_then(|record| {
+                                    if record.local_player_id != player_id {
+                                        return Err("Stored challenge belongs to another identity".to_owned());
+                                    }
+                                    Ok(Some(record))
+                                }),
+                            DurableResult::Error(error) => Err(error),
+                            _ => Err("Unexpected durable challenge recovery response".to_owned()),
+                        }
+                    }.await;
+                    if *epoch.borrow() != epoch_snapshot { return; }
+                    match observed {
+                        Ok(None) => {
+                            checked.set(true);
+                            if !*attempted.borrow() {
+                                pending.set(false);
+                                status.set("No outbound challenge pending".to_owned());
+                                error_handle.set(None);
+                            }
+                        }
 
                         Err(error) => {
-                            *challenge_recovery_attempted.borrow_mut() = true;
-
+                            // Failed reads have not claimed the one publication attempt.
                             challenge_publication_pending.set(true);
                             challenge_publication_status
                                 .set("Stored challenge recovery is blocked".to_owned());
@@ -2161,9 +2567,10 @@ mod browser {
                         }
 
                         Ok(Some(stored)) => {
+                            checked.set(true);
                             challenge_publication_pending.set(true);
 
-                            if !*lobby_ready {
+                            if !lobby_ready {
                                 challenge_publication_status.set(
                                     "Stored challenge loaded; waiting for verified lobby recovery"
                                         .to_owned(),
@@ -2172,9 +2579,9 @@ mod browser {
                                 let already_attempted = *challenge_recovery_attempted.borrow()
                                     || submitted_game_contract.borrow().is_some();
 
-                                if !already_attempted {
-                                    *challenge_recovery_attempted.borrow_mut() = true;
-
+                                if !already_attempted && claim_recovery_publication(
+                                    &mut challenge_recovery_attempted.borrow_mut(),
+                                ) {
                                     match local_observation_unix_seconds() {
                                         Err(error) => {
                                             challenge_publication_status
@@ -2192,10 +2599,24 @@ mod browser {
                                                     .body
                                                     .expires_at_unix_seconds =>
                                         {
-                                            match remove_outbound_challenge_publication(
-                                                &player_id,
-                                                &stored.challenge_id(),
-                                            ) {
+                                            let deletion = async {
+                                                let handle = delegate.borrow().clone().ok_or_else(||
+                                                    "Durable state delegate disconnected before challenge cleanup".to_owned())?;
+                                                let request = DurableRequest {
+                                                    version: DURABLE_STATE_VERSION,
+                                                    request_id: secure_random_32("expired challenge delete request ID")?,
+                                                    scope: player_id,
+                                                    slot: DurableSlot::OutboundChallenge,
+                                                    action: DurableAction::Delete { expected: stored.encode()? },
+                                                };
+                                                match durable_rpc!(api, router, handle, request).await? {
+                                                    DurableResult::Deleted => Ok(()),
+                                                    DurableResult::Error(error) => Err(error),
+                                                    _ => Err("Exact expired challenge removal was rejected".to_owned()),
+                                                }
+                                            }.await;
+                                            if *epoch.borrow() != epoch_snapshot { return; }
+                                            match deletion {
                                                 Ok(()) => {
                                                     challenge_publication_pending.set(false);
                                                     challenge_publication_status
@@ -2267,8 +2688,6 @@ mod browser {
                                                             .set(format!(
                                                                 "Recovering challenge {short_challenge_id}… by re-confirming its exact game contract",
                                                             ));
-                                                    challenge_publication_error.set(None);
-
                                                     let api = freenet_api.clone();
                                                     let submitted = submitted_game_contract.clone();
                                                     let pending =
@@ -2316,7 +2735,6 @@ mod browser {
                                                                     .collect::<String>();
 
                                                                 pending.set(true);
-                                                                error.set(None);
                                                                 status
                                                                             .set(format!(
                                                                                 "Recovered game contract {short_contract_id}… submitted; awaiting exact confirmation",
@@ -2342,9 +2760,10 @@ mod browser {
                             }
                         }
                     }
+                    });
                 }
 
-                || {}
+                no_op as fn()
             });
         }
 
@@ -2367,6 +2786,9 @@ mod browser {
             let refresh_gate = genesis_refresh_gate.clone();
             let contract_status = contract_status.clone();
             let publication_status = genesis_share_publication_status.clone();
+            let durable_delegate = durable_delegate.clone();
+            let durable_replies = durable_replies.clone();
+            let transport_epoch = transport_epoch.clone();
 
             use_effect_with(
                 genesis_share_reconciliation,
@@ -2385,8 +2807,24 @@ mod browser {
                             genesis_readiness.borrow_mut().take();
                         }
                     } else {
-                        let prepared = (|| -> Result<Option<(ContractKey, Vec<u8>)>, String> {
-                            if !active_game_scope.borrow().recognizes(scope_snapshot) {
+                        let scope_snapshot = scope_snapshot.clone();
+                        let player_id = *player_id;
+                        let authoritative_state = authoritative_state.clone();
+                        let active_game_scope = active_game_scope.clone();
+                        let freenet_api = freenet_api.clone();
+                        let latest_lobby_contract_key = latest_lobby_contract_key.clone();
+                        let publication_in_flight = publication_in_flight.clone();
+                        let genesis_readiness = genesis_readiness.clone();
+                        let refresh_gate = refresh_gate.clone();
+                        let contract_status = contract_status.clone();
+                        let publication_status = publication_status.clone();
+                        let delegate = durable_delegate.clone();
+                        let router = durable_replies.clone();
+                        let epoch = transport_epoch.clone();
+                        let epoch_snapshot = *epoch.borrow();
+                        wasm_bindgen_futures::spawn_local(async move {
+                        let prepared: Result<Option<(ContractKey, Vec<u8>)>, String> = async {
+                            if !active_game_scope.borrow().recognizes(&scope_snapshot) {
                                 return Ok(None);
                             }
 
@@ -2398,7 +2836,7 @@ mod browser {
                             if genesis_readiness
                                 .borrow()
                                 .as_ref()
-                                .is_some_and(|(snapshot, _)| snapshot == scope_snapshot)
+                                .is_some_and(|(snapshot, _)| snapshot == &scope_snapshot)
                             {
                                 genesis_readiness.borrow_mut().take();
                             }
@@ -2418,11 +2856,18 @@ mod browser {
                                     .to_owned()
                             })?;
 
-                            let handshake = load_genesis_handshake(&accepted.game_id, &player_id)?
-                                .ok_or_else(|| {
-                                    "Active accepted game has no durable genesis handshake."
-                                        .to_owned()
-                                })?;
+                            let handle = delegate.borrow().clone().ok_or_else(||
+                                "Freenet durable state delegate is unavailable".to_owned())?;
+                            let (handshake, previous) = load_durable_genesis_handshake(
+                                &freenet_api, &router, &handle, &accepted.game_id, &player_id
+                            ).await?;
+                            if *epoch.borrow() != epoch_snapshot
+                                || !active_game_scope.borrow().recognizes(&scope_snapshot) {
+                                return Err("Game scope changed during genesis handshake recovery".to_owned());
+                            }
+                            let handshake = handshake.ok_or_else(|| {
+                                "Active accepted game has no durable genesis handshake".to_owned()
+                            })?;
 
                             if handshake.proposal != accepted.accepted_proposal {
                                 return Err("Durable genesis handshake does not match the \
@@ -2453,17 +2898,20 @@ mod browser {
                             )?;
 
                             if ingestion.changed {
-                                /*
-                                 * This existing storage API verifies an exact
-                                 * browser-storage read-back before returning.
-                                 */
-                                store_genesis_handshake(&ingestion.updated_handshake)?;
+                                save_durable_genesis_handshake(
+                                    &freenet_api, &router, &handle,
+                                    previous, &ingestion.updated_handshake,
+                                ).await?;
+                                if *epoch.borrow() != epoch_snapshot
+                                    || !active_game_scope.borrow().recognizes(&scope_snapshot) {
+                                    return Err("Game scope changed during genesis share storage".to_owned());
+                                }
                             }
 
                             let genesis_ready = ingestion.authenticated_genesis.is_some();
 
                             if !genesis_ready {
-                                refresh_gate.borrow_mut().revoke(scope_snapshot);
+                                refresh_gate.borrow_mut().revoke(&scope_snapshot);
                             }
 
                             *genesis_readiness.borrow_mut() = ingestion
@@ -2476,7 +2924,7 @@ mod browser {
                              * once per connection when genesis becomes ready.
                              */
                             let should_refresh = refresh_gate.borrow_mut().claim(
-                                scope_snapshot,
+                                &scope_snapshot,
                                 genesis_ready,
                                 freenet_api.borrow().is_some(),
                             );
@@ -2528,7 +2976,7 @@ mod browser {
                             let Some(plan) =
                                 plan_genesis_share_publication(authoritative_offer, &handshake)?
                             else {
-                                if publication_in_flight.borrow().as_ref() == Some(scope_snapshot) {
+                                if publication_in_flight.borrow().as_ref() == Some(&scope_snapshot) {
                                     publication_in_flight.borrow_mut().take();
                                 }
 
@@ -2544,7 +2992,7 @@ mod browser {
                                 return Ok(None);
                             };
 
-                            if publication_in_flight.borrow().as_ref() == Some(scope_snapshot) {
+                            if publication_in_flight.borrow().as_ref() == Some(&scope_snapshot) {
                                 return Ok(None);
                             }
 
@@ -2558,13 +3006,14 @@ mod browser {
                             *publication_in_flight.borrow_mut() = Some(scope_snapshot.clone());
 
                             Ok(Some((lobby_key, plan.encoded_lobby_state_update)))
-                        })();
+                        }.await;
+                        if *epoch.borrow() != epoch_snapshot { return; }
 
                         match prepared {
                             Ok(None) => {}
 
                             Err(error) => {
-                                if publication_in_flight.borrow().as_ref() == Some(scope_snapshot) {
+                                if publication_in_flight.borrow().as_ref() == Some(&scope_snapshot) {
                                     publication_in_flight.borrow_mut().take();
                                 }
 
@@ -2644,6 +3093,7 @@ mod browser {
                                 });
                             }
                         }
+                        });
                     }
 
                     || {}
@@ -2681,6 +3131,9 @@ mod browser {
             let pending_incoming_acceptance_probe = pending_incoming_acceptance_probe.clone();
             let retrieved_incoming_acceptance_read = retrieved_incoming_acceptance_read.clone();
             let challenge_recovery_attempted = challenge_recovery_attempted.clone();
+            let challenge_recovery_checked_for_effect = challenge_recovery_checked.clone();
+            let incoming_acceptance_recovery_checked_for_effect =
+                incoming_acceptance_recovery_checked.clone();
             let incoming_acceptance_recovery_attempted =
                 incoming_acceptance_recovery_attempted.clone();
             let local_player_id_for_effect = local_player_id.clone();
@@ -2700,10 +3153,23 @@ mod browser {
             let profile_registered_for_effect = profile_registered.clone();
             let profile_phase_for_effect = profile_phase.clone();
             let profile_status_for_effect = profile_delegate_status.clone();
+            let revision_delegate_for_effect = revision_delegate.clone();
+            let revision_registered_for_effect = revision_registered.clone();
+            let revision_phase_for_effect = revision_phase.clone();
+            let revision_status_for_effect = revision_delegate_status.clone();
+            let durable_delegate_for_effect = durable_delegate.clone();
+            let durable_registered_for_effect = durable_registered.clone();
+            let durable_status_for_effect = durable_delegate_status.clone();
+            let durable_replies_for_effect = durable_replies.clone();
+            let durable_registration_epoch_for_effect = durable_registration_epoch.clone();
             let lobby_name_for_effect = lobby_display_name.clone();
             let lobby_profile_status_for_effect = lobby_profile_status.clone();
             let lobby_profile_error_for_effect = lobby_profile_error.clone();
+            let lobby_available_for_effect = lobby_available.clone();
+            let presence_pending_for_effect = lobby_presence_submission_pending.clone();
 
+            let pending_view_refresh = pending_view_refresh.clone();
+            let pending_view_refresh_counter = pending_view_refresh_counter.clone();
             use_effect_with(*auto_reconnect_generation, move |generation| {
                 let connection_generation = *generation;
                 let connection_epoch = {
@@ -2725,16 +3191,22 @@ mod browser {
                 profile_delegate_for_effect.borrow_mut().take();
                 *profile_phase_for_effect.borrow_mut() = ProfilePhase::AwaitingRegistration;
                 profile_registered_for_effect.set(false);
+                revision_delegate_for_effect.borrow_mut().take();
+                *revision_phase_for_effect.borrow_mut() = RevisionPhase::AwaitingRegistration;
+                revision_registered_for_effect.set(false);
+                durable_delegate_for_effect.borrow_mut().take();
+                durable_registered_for_effect.set(false);
+                *durable_registration_epoch_for_effect.borrow_mut() = None;
+                durable_replies_for_effect.borrow_mut().clear();
+                presence_pending_for_effect.set(false);
                 submitted_game_contract.borrow_mut().take();
                 pending_incoming_acceptance_probe.borrow_mut().take();
                 retrieved_incoming_acceptance_read.borrow_mut().take();
-                incoming_acceptance_pending.set(false);
-                incoming_acceptance_status.set(
-                    "No incoming acceptance pending; contract proof is required before signing"
-                        .to_owned(),
-                );
-                incoming_acceptance_error.set(None);
+                // Keep a blocked recovery visible until a durable read or exact
+                // authoritative confirmation resolves it on the new connection.
                 *challenge_recovery_attempted.borrow_mut() = false;
+                challenge_recovery_checked_for_effect.set(false);
+                incoming_acceptance_recovery_checked_for_effect.set(false);
                 *incoming_acceptance_recovery_attempted.borrow_mut() = false;
                 *local_network_action_submitted.borrow_mut() = None;
                 genesis_refresh_gate.borrow_mut().reset_connection();
@@ -2751,6 +3223,7 @@ mod browser {
                 let response_generation = auto_reconnect_generation.clone();
                 let epoch_for_status = transport_epoch.clone();
                 let epoch_for_response = transport_epoch.clone();
+                let epoch_for_host_error = transport_epoch.clone();
                 let contract_for_response = contract_status.clone();
                 let contract_for_host_error = contract_status.clone();
                 let lobby_contract_for_response = lobby_contract_status.clone();
@@ -2763,6 +3236,8 @@ mod browser {
                 let network_action_for_response = local_network_action_submitted.clone();
                 let secret_for_response = local_dice_secret.clone();
                 let secret_status_for_response = dice_secret_status.clone();
+                let pending_refresh_for_response = pending_view_refresh.clone();
+                let pending_counter_for_response = pending_view_refresh_counter.clone();
                 let key_for_response = latest_contract_key.clone();
                 let state_for_response = latest_authoritative_state.clone();
                 let probe_ids_for_response = history_probe_ids.clone();
@@ -2799,9 +3274,20 @@ mod browser {
                 let profile_registered_for_response = profile_registered_for_effect.clone();
                 let profile_phase_for_response = profile_phase_for_effect.clone();
                 let profile_status_for_response = profile_status_for_effect.clone();
+                let revision_delegate_for_response = revision_delegate_for_effect.clone();
+                let revision_registered_for_response = revision_registered_for_effect.clone();
+                let revision_phase_for_response = revision_phase_for_effect.clone();
+                let revision_status_for_response = revision_status_for_effect.clone();
+                let durable_delegate_for_response = durable_delegate_for_effect.clone();
+                let durable_registered_for_response = durable_registered_for_effect.clone();
+                let durable_registration_epoch_for_response = durable_registration_epoch_for_effect.clone();
+                let durable_status_for_response = durable_status_for_effect.clone();
+                let durable_replies_for_response = durable_replies_for_effect.clone();
                 let lobby_name_for_response = lobby_name_for_effect.clone();
                 let lobby_profile_status_for_response = lobby_profile_status_for_effect.clone();
                 let lobby_profile_error_for_response = lobby_profile_error_for_effect.clone();
+                let lobby_available_for_response = lobby_available_for_effect.clone();
+                let presence_pending_for_response = presence_pending_for_effect.clone();
 
                 let incoming_probe_for_status = pending_incoming_acceptance_probe.clone();
                 let incoming_read_for_status = retrieved_incoming_acceptance_read.clone();
@@ -2817,6 +3303,12 @@ mod browser {
                 let profile_delegate_for_open = profile_delegate_for_effect.clone();
                 let profile_status_for_open = profile_status_for_effect.clone();
                 let profile_phase_for_open = profile_phase_for_effect.clone();
+                let revision_delegate_for_open = revision_delegate_for_effect.clone();
+                let revision_status_for_open = revision_status_for_effect.clone();
+                let revision_phase_for_open = revision_phase_for_effect.clone();
+                let durable_delegate_for_open = durable_delegate_for_effect.clone();
+                let durable_status_for_open = durable_status_for_effect.clone();
+                let durable_replies_for_status = durable_replies_for_effect.clone();
                 let identity_phase_for_status = delegate_identity_phase_for_effect.clone();
                 let identity_status_for_status = local_identity_status_for_effect.clone();
                 let player_id_for_status = local_player_id_for_effect.clone();
@@ -2827,6 +3319,11 @@ mod browser {
 
                 match connect(
                     move |status| {
+                        if *retry_generation != connection_generation
+                            || !is_current_connection(connection_epoch, *epoch_for_status.borrow())
+                        {
+                            return;
+                        }
                         match &status {
                             ConnectionStatus::Connecting => {
                                 subscription_for_status.set(SubscriptionStatus::Pending);
@@ -2834,6 +3331,7 @@ mod browser {
                             }
                             ConnectionStatus::Connected => {}
                             ConnectionStatus::Disconnected | ConnectionStatus::Failed(_) => {
+                                durable_replies_for_status.borrow_mut().clear();
                                 subscription_for_status.set(SubscriptionStatus::Inactive);
                                 lobby_subscription_for_status.set(SubscriptionStatus::Inactive);
 
@@ -2858,11 +3356,6 @@ mod browser {
                             }
                         }
 
-                        if *retry_generation != connection_generation
-                            || *epoch_for_status.borrow() != connection_epoch
-                        {
-                            return;
-                        }
                         if matches!(
                             &status,
                             ConnectionStatus::Disconnected | ConnectionStatus::Failed(_)
@@ -2885,7 +3378,7 @@ mod browser {
                     },
                     move |response| {
                         if *response_generation != connection_generation
-                            || *epoch_for_response.borrow() != connection_epoch
+                            || !is_current_connection(connection_epoch, *epoch_for_response.borrow())
                         {
                             return;
                         }
@@ -2902,6 +3395,9 @@ mod browser {
                             &lobby_state_for_response,
                             &lobby_key_for_response,
                             &api_for_response,
+                            &durable_delegate_for_response,
+                            &durable_replies_for_response,
+                            &epoch_for_response,
                             &player_id_for_response,
                             &challenge_pending_for_response,
                             &challenge_status_for_response,
@@ -2921,6 +3417,9 @@ mod browser {
                             &player_id_for_response,
                             &lobby_key_for_response,
                             &api_for_response,
+                            &durable_delegate_for_response,
+                            &durable_replies_for_response,
+                            &epoch_for_response,
                             &incoming_pending_for_response,
                             &incoming_status_for_response,
                             &incoming_error_for_response,
@@ -2934,6 +3433,9 @@ mod browser {
                             &player_id_for_response,
                             &lobby_key_for_response,
                             &api_for_response,
+                            &durable_delegate_for_response,
+                            &durable_replies_for_response,
+                            &epoch_for_response,
                             &challenge_pending_for_response,
                             &challenge_status_for_response,
                             &challenge_error_for_response,
@@ -3181,6 +3683,29 @@ mod browser {
                             }
                         }
 
+                        if let Some(handle) = durable_delegate_for_response.borrow().clone() {
+                            match classify_durable_state_response(&response, &handle.key) {
+                                Ok(Some(None)) => {
+                                    durable_status_for_response.set("Durable state delegate registered".to_owned());
+                                    *durable_registration_epoch_for_response.borrow_mut() = Some(connection_epoch);
+                                    durable_registered_for_response.set(true);
+                                    return;
+                                }
+                                Ok(Some(Some(message))) => {
+                                    if let Err(error) = durable_replies_for_response.borrow_mut().dispatch(message) {
+                                        durable_status_for_response.set(format!("Durable state reply rejected: {error}"));
+                                    }
+                                    return;
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    durable_status_for_response.set(format!("Invalid durable state reply: {error}"));
+                                    durable_replies_for_response.borrow_mut().clear();
+                                    return;
+                                }
+                            }
+                        }
+
                         if let Some(handle) = profile_delegate_for_response.borrow().clone() {
                             match classify_profile_delegate_response(&response, &handle.key) {
                                 Ok(Some(None)) => {
@@ -3339,6 +3864,152 @@ mod browser {
                             }
                         }
 
+                        if let Some(handle) = revision_delegate_for_response.borrow().clone() {
+                            match classify_presence_revision_response(&response, &handle.key) {
+                                Ok(Some(None)) => {
+                                    if matches!(*revision_phase_for_response.borrow(), RevisionPhase::AwaitingRegistration) {
+                                        revision_status_for_response.set("Presence revision delegate registered".to_owned());
+                                        revision_registered_for_response.set(true);
+                                    }
+                                    return;
+                                }
+                                Ok(Some(Some(message))) => {
+                                    let phase = revision_phase_for_response.borrow().clone();
+                                    let matching = match &phase {
+                                        RevisionPhase::AwaitingRead { player_id, request_id }
+                                        | RevisionPhase::AwaitingReserve { player_id, request_id, .. } => {
+                                            message.player_id == *player_id && message.request_id == *request_id
+                                        }
+                                        _ => false,
+                                    };
+                                    if !matching { return; }
+                                    match (phase, message.result) {
+                                        (RevisionPhase::AwaitingRead { player_id, .. }, PresenceRevisionResult::LastReserved(last_reserved)) => {
+                                            *revision_phase_for_response.borrow_mut() = RevisionPhase::Ready { player_id, last_reserved };
+                                            revision_status_for_response.set(match last_reserved {
+                                                Some(value) => format!("Last reserved presence revision: {value}"),
+                                                None => "No presence revision reserved in Freenet yet".to_owned(),
+                                            });
+                                        }
+                                        (RevisionPhase::AwaitingReserve { player_id, intent, .. }, PresenceRevisionResult::Reserved(revision)) => {
+                                            // Even if a later check fails, the durable revision has been consumed.
+                                            *revision_phase_for_response.borrow_mut() = RevisionPhase::Ready { player_id, last_reserved: Some(revision) };
+                                            revision_status_for_response.set(format!("Last reserved presence revision: {revision}"));
+                                            let prepared = (|| {
+                                                if revision <= intent.observed_revision
+                                                    || intent.last_reserved.is_some_and(|last| revision <= last) {
+                                                    return Err("Presence delegate returned a revision below the verified reservation floor.".to_owned());
+                                                }
+                                                if *player_id_for_response != Some(player_id)
+                                                    || !matches!(&*profile_phase_for_response.borrow(), ProfilePhase::Ready {
+                                                        player_id: current, name: Some(saved),
+                                                    } if *current == player_id && saved == &intent.name)
+                                                    || *lobby_name_for_response != intent.name {
+                                                    return Err("Identity or verified lobby profile changed during revision reservation.".to_owned());
+                                                }
+                                                if !matches!(&*lobby_contract_for_response, LobbyContractStatus::Retrieved { .. })
+                                                    || lobby_key_for_response.borrow().as_ref() != Some(&intent.contract_key) {
+                                                    return Err("Verified lobby contract changed during revision reservation.".to_owned());
+                                                }
+                                                let state = (*lobby_state_for_response).as_ref().ok_or_else(||
+                                                    "Verified lobby state is unavailable after revision reservation.".to_owned())?;
+                                                let current_floor = state.lobby.0.players.iter()
+                                                    .find(|entry| entry.player_id == player_id)
+                                                    .map_or(0, |entry| entry.revision);
+                                                if revision <= current_floor {
+                                                    return Err("Lobby advanced past the reserved revision; retry publication.".to_owned());
+                                                }
+                                                let signing_key = load_cached_identity()?;
+                                                if player_id_for_signing_key(&signing_key) != player_id {
+                                                    return Err("Verified signing identity changed during revision reservation.".to_owned());
+                                                }
+                                                let plan = plan_lobby_presence(LobbyPresencePlannerInput {
+                                                    signing_key: &signing_key,
+                                                    display_name: &intent.name,
+                                                    available: intent.available,
+                                                    revision,
+                                                    issued_at_unix_seconds: intent.issued_at,
+                                                })?;
+                                                Ok(plan.encoded_state_update)
+                                            })();
+                                            match prepared {
+                                                Err(error) => {
+                                                    lobby_profile_error_for_response.set(Some(error));
+                                                    presence_pending_for_response.set(false);
+                                                }
+                                                Ok(state_update) => {
+                                                    lobby_profile_status_for_response.set(format!("Publishing {} presence revision {revision}", if intent.available { "available" } else { "unavailable" }));
+                                                    let api_for_update = api_for_response.clone();
+                                                    let available_for_update = lobby_available_for_response.clone();
+                                                    let pending_for_update = presence_pending_for_response.clone();
+                                                    let status_for_update = lobby_profile_status_for_response.clone();
+                                                    let error_for_update = lobby_profile_error_for_response.clone();
+                                                    let epoch_for_update = epoch_for_response.clone();
+                                                    let epoch_snapshot = connection_epoch;
+                                                    wasm_bindgen_futures::spawn_local(async move {
+                                                        if *epoch_for_update.borrow() != epoch_snapshot { return; }
+                                                        let submit_result = {
+                                                            let mut api = api_for_update.borrow_mut();
+                                                            match api.as_mut() {
+                                                                Some(api) => submit_lobby_state_update(api, intent.contract_key, state_update).await,
+                                                                None => Err("Freenet connection closed before presence publication.".to_owned()),
+                                                            }
+                                                        };
+                                                        if *epoch_for_update.borrow() != epoch_snapshot { return; }
+                                                        match submit_result {
+                                                            Ok(()) => {
+                                                                available_for_update.set(intent.available);
+                                                                status_for_update.set(format!("{} presence revision {revision} submitted; awaiting verified lobby refresh", if intent.available { "Available" } else { "Unavailable" }));
+                                                                gloo_timers::future::TimeoutFuture::new(750).await;
+                                                                if *epoch_for_update.borrow() != epoch_snapshot { return; }
+                                                                let refresh_result = {
+                                                                    let mut api = api_for_update.borrow_mut();
+                                                                    match api.as_mut() {
+                                                                        Some(api) => request_lobby_contract(api).await,
+                                                                        None => Err("Freenet connection closed before lobby verification.".to_owned()),
+                                                                    }
+                                                                };
+                                                                if *epoch_for_update.borrow() != epoch_snapshot { return; }
+                                                                if let Err(error) = refresh_result {
+                                                                    error_for_update.set(Some(format!("Presence revision {revision} was submitted, but lobby refresh failed: {error}")));
+                                                                }
+                                                            }
+                                                            Err(error) => {
+                                                                error_for_update.set(Some(error));
+                                                                status_for_update.set("Presence publication failed".to_owned());
+                                                            }
+                                                        }
+                                                        pending_for_update.set(false);
+                                                    });
+                                                }
+                                            }
+                                        }
+                                        (_, PresenceRevisionResult::Error(error)) => {
+                                            *revision_phase_for_response.borrow_mut() = RevisionPhase::Failed;
+                                            revision_status_for_response.set(format!("Presence revision delegate error: {error}"));
+                                            lobby_profile_error_for_response.set(Some(format!("Presence revision reservation failed: {error}")));
+                                            presence_pending_for_response.set(false);
+                                        }
+                                        _ => {
+                                            *revision_phase_for_response.borrow_mut() = RevisionPhase::Failed;
+                                            revision_status_for_response.set("Unexpected presence revision delegate response".to_owned());
+                                            lobby_profile_error_for_response.set(Some("Unexpected presence revision response; publication stopped.".to_owned()));
+                                            presence_pending_for_response.set(false);
+                                        }
+                                    }
+                                    return;
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    *revision_phase_for_response.borrow_mut() = RevisionPhase::Failed;
+                                    revision_status_for_response.set(format!("Invalid presence revision response: {error}"));
+                                    lobby_profile_error_for_response.set(Some("Invalid presence revision response; publication stopped.".to_owned()));
+                                    presence_pending_for_response.set(false);
+                                    return;
+                                }
+                            }
+                        }
+
                         if !scope_for_response
                             .borrow()
                             .recognizes(&scope_snapshot_for_response)
@@ -3408,6 +4079,31 @@ mod browser {
                                     }
                                 }
 
+                                let api_for_response = api_for_response.clone();
+                                let authoritative_role_for_response = authoritative_role_for_response.clone();
+                                let contract_for_response = contract_for_response.clone();
+                                let controller_for_response = controller_for_response.clone();
+                                let genesis_readiness_for_response = genesis_readiness_for_response.clone();
+                                let key_for_response = key_for_response.clone();
+                                let network_action_for_response = network_action_for_response.clone();
+                                let player_id_for_response = player_id_for_response.clone();
+                                let scope_for_response = scope_for_response.clone();
+                                let scope_snapshot_for_response = scope_snapshot_for_response.clone();
+                                let secret_for_response = secret_for_response.clone();
+                                let secret_status_for_response = secret_status_for_response.clone();
+                                let pending_refresh_for_response = pending_refresh_for_response.clone();
+                                let pending_counter_for_response = pending_counter_for_response.clone();
+                                let state_for_response = state_for_response.clone();
+                                let view_for_response = view_for_response.clone();
+                                let durable_delegate_for_response = durable_delegate_for_response.clone();
+                                let durable_replies_for_response = durable_replies_for_response.clone();
+                                let history_guard_for_response = history_guard_for_response.clone();
+                                let epoch_for_game_recovery = epoch_for_response.clone();
+                                let response_epoch = *epoch_for_game_recovery.borrow();
+                                wasm_bindgen_futures::spawn_local(async move {
+                                    if *epoch_for_game_recovery.borrow() != response_epoch
+                                        || !scope_for_response.borrow().recognizes(&scope_snapshot_for_response)
+                                    { return; }
                                 let authenticated_genesis = {
                                     let readiness = genesis_readiness_for_response.borrow();
 
@@ -3421,11 +4117,23 @@ mod browser {
                                     None => None,
 
                                     Some(authenticated_genesis) => {
-                                        match plan_browser_authenticated_genesis_submission(
-                                            scope_snapshot_for_response.contract_id.as_str(),
-                                            authenticated_genesis,
-                                            &state_bytes,
-                                        ) {
+                                        let planned = match durable_delegate_for_response.borrow().clone() {
+                                            Some(handle) => plan_durable_authenticated_genesis_submission(
+                                                &api_for_response,
+                                                &durable_replies_for_response,
+                                                &handle,
+                                                scope_snapshot_for_response.contract_id.as_str(),
+                                                authenticated_genesis,
+                                                &state_bytes,
+                                            ).await,
+                                            None => Err("Freenet durable state delegate is unavailable".to_owned()),
+                                        };
+                                        if *epoch_for_game_recovery.borrow() != response_epoch
+                                            || !scope_for_response.borrow().recognizes(&scope_snapshot_for_response)
+                                            || history_guard_for_response.borrow().action_count(&scope_snapshot_for_response)
+                                                != Some(verified_ledger.action_count())
+                                        { return; }
+                                        match planned {
                                             Ok(plan) => Some(plan),
 
                                             Err(error) => {
@@ -3510,9 +4218,21 @@ mod browser {
                                 }
 
                                 if genesis_plan.is_none() {
-                                    match pending_genesis_requires_readiness(
-                                        scope_snapshot_for_response.contract_id.as_str(),
-                                    ) {
+                                    let readiness = match durable_delegate_for_response.borrow().clone() {
+                                        Some(handle) => pending_genesis_requires_readiness(
+                                            &api_for_response,
+                                            &durable_replies_for_response,
+                                            &handle,
+                                            scope_snapshot_for_response.contract_id.as_str(),
+                                        ).await,
+                                        None => Err("Freenet durable state delegate is unavailable".to_owned()),
+                                    };
+                                    if *epoch_for_game_recovery.borrow() != response_epoch
+                                        || !scope_for_response.borrow().recognizes(&scope_snapshot_for_response)
+                                        || history_guard_for_response.borrow().action_count(&scope_snapshot_for_response)
+                                            != Some(verified_ledger.action_count())
+                                    { return; }
+                                    match readiness {
                                         Ok(true) => {
                                             secret_status_for_response.set(
                                                 "Waiting for authenticated genesis readiness from verified lobby state"
@@ -3574,11 +4294,23 @@ mod browser {
                                             return;
                                         };
 
-                                        match plan_browser_network_action(
-                                            scope_snapshot_for_response.contract_id.as_str(),
-                                            &state_bytes,
-                                            local_player,
-                                        ) {
+                                        let recovery = match durable_delegate_for_response.borrow().clone() {
+                                            Some(handle) => plan_durable_secretless_recovery(
+                                                &api_for_response,
+                                                &durable_replies_for_response,
+                                                &handle,
+                                                scope_snapshot_for_response.contract_id.as_str(),
+                                                &state_bytes,
+                                                local_player,
+                                            ).await,
+                                            None => Err("Freenet durable state delegate is unavailable".to_owned()),
+                                        };
+                                        if *epoch_for_game_recovery.borrow() != response_epoch
+                                            || !scope_for_response.borrow().recognizes(&scope_snapshot_for_response)
+                                            || history_guard_for_response.borrow().action_count(&scope_snapshot_for_response)
+                                                != Some(verified_ledger.action_count())
+                                        { return; }
+                                        match recovery {
                                             Ok(plan) => plan,
 
                                             Err(error) => {
@@ -3601,6 +4333,12 @@ mod browser {
                                     }
 
                                     BrowserNetworkActionPlan::Accepted { secret, kind } => {
+                                        let next_refresh = {
+                                            let mut counter = pending_counter_for_response.borrow_mut();
+                                            *counter = counter.wrapping_add(1);
+                                            *counter
+                                        };
+                                        pending_refresh_for_response.set(next_refresh);
                                         *secret_for_response.borrow_mut() = Some(secret);
                                         *network_action_for_response.borrow_mut() = None;
 
@@ -3617,6 +4355,12 @@ mod browser {
                                     }
 
                                     BrowserNetworkActionPlan::SecretlessAccepted { kind: _ } => {
+                                        let next_refresh = {
+                                            let mut counter = pending_counter_for_response.borrow_mut();
+                                            *counter = counter.wrapping_add(1);
+                                            *counter
+                                        };
+                                        pending_refresh_for_response.set(next_refresh);
                                         /*
                                          * The authoritative board was already
                                          * synchronized above from the accepted
@@ -3887,10 +4631,14 @@ mod browser {
                                         });
                                     }
                                 }
+                                });
                             }
                         }
                     },
                     move |error| {
+                        if !is_current_connection(connection_epoch, *epoch_for_host_error.borrow()) {
+                            return;
+                        }
                         contract_for_host_error
                             .set(crate::transport::host_result_error_status(&error));
 
@@ -3914,6 +4662,11 @@ mod browser {
                         let profile_delegate_for_request = profile_delegate_for_open.clone();
                         let profile_status_for_request = profile_status_for_open.clone();
                         let profile_phase_for_request = profile_phase_for_open.clone();
+                        let revision_delegate_for_request = revision_delegate_for_open.clone();
+                        let revision_status_for_request = revision_status_for_open.clone();
+                        let revision_phase_for_request = revision_phase_for_open.clone();
+                        let durable_delegate_for_request = durable_delegate_for_open.clone();
+                        let durable_status_for_request = durable_status_for_open.clone();
 
                         wasm_bindgen_futures::spawn_local(async move {
                             if *epoch_for_request.borrow() != connection_epoch {
@@ -4018,6 +4771,64 @@ mod browser {
                                     *profile_phase_for_request.borrow_mut() = ProfilePhase::Failed;
                                     profile_status_for_request
                                         .set(format!("Profile delegate unavailable: {error}"));
+                                }
+                            }
+
+                            if *epoch_for_request.borrow() != connection_epoch { return; }
+                            durable_status_for_request.set("Loading durable state delegate".to_owned());
+                            match fetch_durable_state_delegate_wasm()
+                                .await
+                                .and_then(delegate_handle_from_wasm)
+                            {
+                                Ok((container, handle)) => {
+                                    if *epoch_for_request.borrow() != connection_epoch { return; }
+                                    *durable_delegate_for_request.borrow_mut() = Some(handle);
+                                    durable_status_for_request.set("Registering durable state delegate".to_owned());
+                                    let registration = {
+                                        let mut api = api_for_request.borrow_mut();
+                                        match api.as_mut() {
+                                            Some(api) => register_local_state_delegate(api, container).await,
+                                            None => Err("Freenet connection closed before durable state registration".to_owned()),
+                                        }
+                                    };
+                                    if let Err(error) = registration {
+                                        if *epoch_for_request.borrow() != connection_epoch { return; }
+                                        durable_status_for_request.set(format!("Durable state registration failed: {error}"));
+                                    }
+                                }
+                                Err(error) => {
+                                    if *epoch_for_request.borrow() != connection_epoch { return; }
+                                    durable_status_for_request.set(format!("Durable state delegate unavailable: {error}"));
+                                }
+                            }
+
+                            if *epoch_for_request.borrow() != connection_epoch { return; }
+                            revision_status_for_request.set("Loading presence revision delegate".to_owned());
+                            match fetch_presence_revision_delegate_wasm()
+                                .await
+                                .and_then(delegate_handle_from_wasm)
+                            {
+                                Ok((container, handle)) => {
+                                    if *epoch_for_request.borrow() != connection_epoch { return; }
+                                    *revision_delegate_for_request.borrow_mut() = Some(handle);
+                                    revision_status_for_request.set("Registering presence revision delegate".to_owned());
+                                    let registration = {
+                                        let mut api = api_for_request.borrow_mut();
+                                        match api.as_mut() {
+                                            Some(api) => register_local_state_delegate(api, container).await,
+                                            None => Err("Freenet connection closed before revision registration".to_owned()),
+                                        }
+                                    };
+                                    if let Err(error) = registration {
+                                        if *epoch_for_request.borrow() != connection_epoch { return; }
+                                        *revision_phase_for_request.borrow_mut() = RevisionPhase::Failed;
+                                        revision_status_for_request.set(format!("Presence revision registration failed: {error}"));
+                                    }
+                                }
+                                Err(error) => {
+                                    if *epoch_for_request.borrow() != connection_epoch { return; }
+                                    *revision_phase_for_request.borrow_mut() = RevisionPhase::Failed;
+                                    revision_status_for_request.set(format!("Presence revision delegate unavailable: {error}"));
                                 }
                             }
 
@@ -4140,8 +4951,7 @@ mod browser {
         let left_table = controller.has_left_table();
         let session_active = controller_matches_verified_view && controller.is_active();
 
-        let pending_role_check =
-            load_pending_action(active_game_scope_snapshot.contract_id.as_str());
+        let pending_role_check = (*durable_pending_action_view).clone();
 
         let no_pending_action = matches!(&pending_role_check, Ok(None));
 
@@ -4319,61 +5129,12 @@ mod browser {
             Vec::new()
         };
 
-        let role_selection_locked =
-            selected_local_role.is_some() || !matches!(&pending_role_check, Ok(None));
-
-        let on_select_white = {
-            let local_role = local_role.clone();
-            let interface_error = interface_error.clone();
-            let scope_for_role = active_game_scope.clone();
-            let scope_snapshot_for_role = active_game_scope_snapshot.clone();
-
-            Callback::from(move |_| {
-                let selection =
-                    contract_id_for_scope_snapshot(&scope_for_role, &scope_snapshot_for_role)
-                        .and_then(|contract_id| choose_local_role(contract_id, Player::White));
-
-                match selection {
-                    Ok(()) => {
-                        interface_error.set(None);
-                        local_role.set(Ok(Some(Player::White)));
-                    }
-
-                    Err(error) => {
-                        interface_error
-                            .set(Some(format!("White role could not be selected: {error}")));
-                    }
-                }
-            })
-        };
-
-        let on_select_black = {
-            let local_role = local_role.clone();
-            let interface_error = interface_error.clone();
-            let scope_for_role = active_game_scope.clone();
-            let scope_snapshot_for_role = active_game_scope_snapshot.clone();
-
-            Callback::from(move |_| {
-                let selection =
-                    contract_id_for_scope_snapshot(&scope_for_role, &scope_snapshot_for_role)
-                        .and_then(|contract_id| choose_local_role(contract_id, Player::Black));
-
-                match selection {
-                    Ok(()) => {
-                        interface_error.set(None);
-                        local_role.set(Ok(Some(Player::Black)));
-                    }
-
-                    Err(error) => {
-                        interface_error
-                            .set(Some(format!("Black role could not be selected: {error}")));
-                    }
-                }
-            })
-        };
-
         let submit_pending_secretless_action = {
             let freenet_api = freenet_api.clone();
+            let durable_pending_action_view = durable_pending_action_view.clone();
+            let durable_delegate = durable_delegate.clone();
+            let durable_replies = durable_replies.clone();
+            let transport_epoch = transport_epoch.clone();
             let contract_status = contract_status.clone();
             let interface_error = interface_error.clone();
             let local_network_action_submitted = local_network_action_submitted.clone();
@@ -4393,7 +5154,7 @@ mod browser {
                     }
 
                     let action_id = pending.action_id;
-                    let delta = pending.delta;
+                    let delta = pending.delta.clone();
 
                     {
                         let mut submitted = local_network_action_submitted.borrow_mut();
@@ -4413,6 +5174,11 @@ mod browser {
                     let interface_for_update = interface_error.clone();
                     let scope_for_update = scope_for_action.clone();
                     let scope_snapshot_for_update = scope_snapshot_for_action.clone();
+                    let durable_delegate_for_update = durable_delegate.clone();
+                    let durable_replies_for_update = durable_replies.clone();
+                    let pending_view_for_update = durable_pending_action_view.clone();
+                    let epoch_for_update = transport_epoch.clone();
+                    let epoch_snapshot = *epoch_for_update.borrow();
 
                     wasm_bindgen_futures::spawn_local(async move {
                         if !scope_for_update
@@ -4421,6 +5187,31 @@ mod browser {
                         {
                             return;
                         }
+
+                        let durable_write = async {
+                            let handle = durable_delegate_for_update.borrow().clone().ok_or_else(||
+                                "Freenet durable state delegate is unavailable".to_owned())?;
+                            if load_durable_pending_action(
+                                &api_for_update, &durable_replies_for_update, &handle,
+                                scope_snapshot_for_update.contract_id.as_str(),
+                            ).await?.is_some() {
+                                return Err("An action is already pending; reconnect to recover it".to_owned());
+                            }
+                            if *epoch_for_update.borrow() != epoch_snapshot
+                                || !scope_for_update.borrow().recognizes(&scope_snapshot_for_update) {
+                                return Err("Connection or game changed before action storage".to_owned());
+                            }
+                            create_durable_pending_action(
+                                &api_for_update, &durable_replies_for_update, &handle, &pending,
+                            ).await
+                        }.await;
+                        if *epoch_for_update.borrow() != epoch_snapshot { return; }
+                        if let Err(problem) = durable_write {
+                            interface_for_update.set(Some(format!("Action storage requires recovery: {problem}")));
+                            contract_for_update.set(ContractProbeStatus::Failed(problem));
+                            return;
+                        }
+                        pending_view_for_update.set(Ok(Some(pending.clone())));
 
                         let submit_result = {
                             let mut api = api_for_update.borrow_mut();
@@ -4539,37 +5330,12 @@ mod browser {
                         .clone()
                         .ok_or_else(|| "No verified authoritative parent state is available.".to_owned())?;
 
-                    match plan_browser_request_roll(
-                        contract_id_for_scope_snapshot(
-                            &scope_for_planning,
-                            &scope_snapshot_for_planning,
-                        )?,
+                    let pending = plan_fresh_roll_request(
+                        contract_id_for_scope_snapshot(&scope_for_planning, &scope_snapshot_for_planning)?,
                         &state_bytes,
                         local_player,
-                        true,
-                    )? {
-                        RequestRollPlan::Submit {
-                            pending,
-                            recovered_pending: false,
-                        } => Ok((key, pending)),
-
-                        RequestRollPlan::Submit {
-                            recovered_pending: true,
-                            ..
-                        } => Err(
-                            "A prior pending roll request already exists; reconnect to recover it."
-                                .to_owned(),
-                        ),
-
-                        RequestRollPlan::NoAction => {
-                            Err("The roll request did not produce a network action.".to_owned())
-                        }
-
-                        RequestRollPlan::Accepted => Err(
-                            "The roll request was already accepted before this submission."
-                                .to_owned(),
-                        ),
-                    }
+                    )?;
+                    Ok((key, pending))
                 })();
 
                 match prepared {
@@ -4635,38 +5401,13 @@ mod browser {
                                 .to_owned()
                         })?;
 
-                    match plan_browser_play_turn(
-                        contract_id_for_scope_snapshot(
-                            &scope_for_planning,
-                            &scope_snapshot_for_planning,
-                        )?,
+                    let pending = plan_fresh_turn(
+                        contract_id_for_scope_snapshot(&scope_for_planning, &scope_snapshot_for_planning)?,
                         &state_bytes,
                         local_player,
-                        Some(&sequence),
-                    )? {
-                        PlayTurnPlan::Submit {
-                            pending,
-                            recovered_pending: false,
-                        } => Ok((key, pending)),
-
-                        PlayTurnPlan::Submit {
-                            recovered_pending: true,
-                            ..
-                        } => Err(
-                            "A prior pending turn already exists; reconnect to recover it."
-                                .to_owned(),
-                        ),
-
-                        PlayTurnPlan::NoAction => Err(
-                            "The prepared pass did not produce a network action."
-                                .to_owned(),
-                        ),
-
-                        PlayTurnPlan::Accepted => Err(
-                            "The pass was already accepted before this submission."
-                                .to_owned(),
-                        ),
-                    }
+                        &sequence,
+                    )?;
+                    Ok((key, pending))
                 })();
 
                 match prepared {
@@ -4757,38 +5498,13 @@ mod browser {
                                             .to_owned()
                                     })?;
 
-                            match plan_browser_play_turn(
-                                contract_id_for_scope_snapshot(
-                                    &scope_for_planning,
-                                    &scope_snapshot_for_planning,
-                                )?,
+                            let pending = plan_fresh_turn(
+                                contract_id_for_scope_snapshot(&scope_for_planning, &scope_snapshot_for_planning)?,
                                 &state_bytes,
                                 local_player,
-                                Some(&sequence),
-                            )? {
-                                PlayTurnPlan::Submit {
-                                    pending,
-                                    recovered_pending: false,
-                                } => Ok((key, pending)),
-
-                                PlayTurnPlan::Submit {
-                                    recovered_pending: true,
-                                    ..
-                                } => Err(
-                                    "A prior pending turn already exists; reconnect to recover it."
-                                        .to_owned(),
-                                ),
-
-                                PlayTurnPlan::NoAction => Err(
-                                    "The completed checker sequence did not produce a network action."
-                                        .to_owned(),
-                                ),
-
-                                PlayTurnPlan::Accepted => Err(
-                                    "The completed turn was already accepted before submission."
-                                        .to_owned(),
-                                ),
-                            }
+                                &sequence,
+                            )?;
+                            Ok((key, pending))
                         })();
 
                         match prepared {
@@ -4938,7 +5654,15 @@ mod browser {
         );
 
         let on_reconnect = {
+            let pending_view_refresh = pending_view_refresh.clone();
+            let pending_view_refresh_counter = pending_view_refresh_counter.clone();
             let connection_status = connection_status.clone();
+            let durable_delegate = durable_delegate.clone();
+            let durable_registered = durable_registered.clone();
+            let durable_registration_epoch = durable_registration_epoch.clone();
+            let durable_replies = durable_replies.clone();
+            let durable_delegate_status = durable_delegate_status.clone();
+            let challenge_recovery_checked = challenge_recovery_checked.clone();
             let contract_status = contract_status.clone();
             let subscription_status = subscription_status.clone();
             let freenet_api = freenet_api.clone();
@@ -4967,6 +5691,8 @@ mod browser {
             let challenge_recovery_attempted = challenge_recovery_attempted.clone();
             let incoming_acceptance_recovery_attempted =
                 incoming_acceptance_recovery_attempted.clone();
+            let incoming_acceptance_recovery_checked_for_reconnect =
+                incoming_acceptance_recovery_checked.clone();
             let local_player_id_for_reconnect = local_player_id.clone();
             let authoritative_local_role_for_reconnect = authoritative_local_role.clone();
             let controller_for_reconnect = controller.clone();
@@ -4984,15 +5710,17 @@ mod browser {
                     *epoch
                 };
                 freenet_api.borrow_mut().take();
+                durable_delegate.borrow_mut().take();
+                durable_registered.set(false);
+                *durable_registration_epoch.borrow_mut() = None;
+                durable_replies.borrow_mut().clear();
+                challenge_recovery_checked.set(false);
+                incoming_acceptance_recovery_checked_for_reconnect.set(false);
                 submitted_game_contract.borrow_mut().take();
                 pending_incoming_acceptance_probe.borrow_mut().take();
                 retrieved_incoming_acceptance_read.borrow_mut().take();
-                incoming_acceptance_pending.set(false);
-                incoming_acceptance_status.set(
-                    "No incoming acceptance pending; contract proof is required before signing"
-                        .to_owned(),
-                );
-                incoming_acceptance_error.set(None);
+                // Preserve any blocked recovery until the replacement connection
+                // has performed a successful durable read or exact confirmation.
                 *challenge_recovery_attempted.borrow_mut() = false;
                 *incoming_acceptance_recovery_attempted.borrow_mut() = false;
 
@@ -5017,6 +5745,7 @@ mod browser {
                 let status_for_callback = connection_status.clone();
                 let epoch_for_status = transport_epoch.clone();
                 let epoch_for_response = transport_epoch.clone();
+                let epoch_for_host_error = transport_epoch.clone();
                 let contract_for_response = contract_status.clone();
                 let contract_for_host_error = contract_status.clone();
                 let lobby_contract_for_response = lobby_contract_status.clone();
@@ -5029,6 +5758,8 @@ mod browser {
                 let network_action_for_response = local_network_action_submitted.clone();
                 let secret_for_response = local_dice_secret.clone();
                 let secret_status_for_response = dice_secret_status.clone();
+                let pending_refresh_for_response = pending_view_refresh.clone();
+                let pending_counter_for_response = pending_view_refresh_counter.clone();
                 let key_for_response = latest_contract_key.clone();
                 let state_for_response = latest_authoritative_state.clone();
                 let probe_ids_for_response = history_probe_ids.clone();
@@ -5048,6 +5779,11 @@ mod browser {
                 let challenge_status_for_response = challenge_publication_status.clone();
                 let challenge_error_for_response = challenge_publication_error.clone();
                 let submitted_game_for_response = submitted_game_contract.clone();
+                let durable_delegate_for_response = durable_delegate.clone();
+                let durable_registered_for_response = durable_registered.clone();
+                let durable_registration_epoch_for_response = durable_registration_epoch.clone();
+                let durable_replies_for_response = durable_replies.clone();
+                let durable_status_for_response = durable_delegate_status.clone();
                 let incoming_probe_for_response = pending_incoming_acceptance_probe.clone();
                 let incoming_read_for_response = retrieved_incoming_acceptance_read.clone();
                 let incoming_pending_for_response = incoming_acceptance_pending.clone();
@@ -5066,6 +5802,8 @@ mod browser {
 
                 let api_for_open = freenet_api.clone();
                 let epoch_for_open = transport_epoch.clone();
+                let durable_delegate_for_open = durable_delegate.clone();
+                let durable_status_for_open = durable_delegate_status.clone();
                 let contract_for_open = contract_status.clone();
                 let subscription_for_open = subscription_status.clone();
                 let lobby_contract_for_open = lobby_contract_status.clone();
@@ -5073,7 +5811,7 @@ mod browser {
 
                 match connect(
                     move |status| {
-                        if *epoch_for_status.borrow() != connection_epoch {
+                        if !is_current_connection(connection_epoch, *epoch_for_status.borrow()) {
                             return;
                         }
                         match &status {
@@ -5110,7 +5848,7 @@ mod browser {
                         status_for_callback.set(status);
                     },
                     move |response| {
-                        if *epoch_for_response.borrow() != connection_epoch {
+                        if !is_current_connection(connection_epoch, *epoch_for_response.borrow()) {
                             return;
                         }
                         observe_accepted_game_probe(
@@ -5126,6 +5864,9 @@ mod browser {
                             &lobby_state_for_response,
                             &lobby_key_for_response,
                             &api_for_response,
+                            &durable_delegate_for_response,
+                            &durable_replies_for_response,
+                            &epoch_for_response,
                             &player_id_for_response,
                             &challenge_pending_for_response,
                             &challenge_status_for_response,
@@ -5145,6 +5886,9 @@ mod browser {
                             &player_id_for_response,
                             &lobby_key_for_response,
                             &api_for_response,
+                            &durable_delegate_for_response,
+                            &durable_replies_for_response,
+                            &epoch_for_response,
                             &incoming_pending_for_response,
                             &incoming_status_for_response,
                             &incoming_error_for_response,
@@ -5158,11 +5902,37 @@ mod browser {
                             &player_id_for_response,
                             &lobby_key_for_response,
                             &api_for_response,
+                            &durable_delegate_for_response,
+                            &durable_replies_for_response,
+                            &epoch_for_response,
                             &challenge_pending_for_response,
                             &challenge_status_for_response,
                             &challenge_error_for_response,
                         ) {
                             return;
+                        }
+
+                        if let Some(handle) = durable_delegate_for_response.borrow().clone() {
+                            match classify_durable_state_response(&response, &handle.key) {
+                                Ok(Some(None)) => {
+                                    *durable_registration_epoch_for_response.borrow_mut() = Some(connection_epoch);
+                                    durable_registered_for_response.set(true);
+                                    durable_status_for_response.set("Durable state delegate registered".to_owned());
+                                    return;
+                                }
+                                Ok(Some(Some(reply))) => {
+                                    if let Err(error) = durable_replies_for_response.borrow_mut().dispatch(reply) {
+                                        durable_status_for_response.set(format!("Durable state reply rejected: {error}"));
+                                    }
+                                    return;
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    durable_replies_for_response.borrow_mut().clear();
+                                    durable_status_for_response.set(format!("Invalid durable state reply: {error}"));
+                                    return;
+                                }
+                            }
                         }
 
                         if !scope_for_response
@@ -5234,6 +6004,31 @@ mod browser {
                                     }
                                 }
 
+                                let api_for_response = api_for_response.clone();
+                                let authoritative_role_for_response = authoritative_role_for_response.clone();
+                                let contract_for_response = contract_for_response.clone();
+                                let controller_for_response = controller_for_response.clone();
+                                let genesis_readiness_for_response = genesis_readiness_for_response.clone();
+                                let key_for_response = key_for_response.clone();
+                                let network_action_for_response = network_action_for_response.clone();
+                                let player_id_for_response = player_id_for_response.clone();
+                                let scope_for_response = scope_for_response.clone();
+                                let scope_snapshot_for_response = scope_snapshot_for_response.clone();
+                                let secret_for_response = secret_for_response.clone();
+                                let secret_status_for_response = secret_status_for_response.clone();
+                                let pending_refresh_for_response = pending_refresh_for_response.clone();
+                                let pending_counter_for_response = pending_counter_for_response.clone();
+                                let state_for_response = state_for_response.clone();
+                                let view_for_response = view_for_response.clone();
+                                let durable_delegate_for_response = durable_delegate_for_response.clone();
+                                let durable_replies_for_response = durable_replies_for_response.clone();
+                                let history_guard_for_response = history_guard_for_response.clone();
+                                let epoch_for_game_recovery = epoch_for_response.clone();
+                                let response_epoch = *epoch_for_game_recovery.borrow();
+                                wasm_bindgen_futures::spawn_local(async move {
+                                    if *epoch_for_game_recovery.borrow() != response_epoch
+                                        || !scope_for_response.borrow().recognizes(&scope_snapshot_for_response)
+                                    { return; }
                                 let authenticated_genesis = {
                                     let readiness = genesis_readiness_for_response.borrow();
 
@@ -5247,11 +6042,23 @@ mod browser {
                                     None => None,
 
                                     Some(authenticated_genesis) => {
-                                        match plan_browser_authenticated_genesis_submission(
-                                            scope_snapshot_for_response.contract_id.as_str(),
-                                            authenticated_genesis,
-                                            &state_bytes,
-                                        ) {
+                                        let planned = match durable_delegate_for_response.borrow().clone() {
+                                            Some(handle) => plan_durable_authenticated_genesis_submission(
+                                                &api_for_response,
+                                                &durable_replies_for_response,
+                                                &handle,
+                                                scope_snapshot_for_response.contract_id.as_str(),
+                                                authenticated_genesis,
+                                                &state_bytes,
+                                            ).await,
+                                            None => Err("Freenet durable state delegate is unavailable".to_owned()),
+                                        };
+                                        if *epoch_for_game_recovery.borrow() != response_epoch
+                                            || !scope_for_response.borrow().recognizes(&scope_snapshot_for_response)
+                                            || history_guard_for_response.borrow().action_count(&scope_snapshot_for_response)
+                                                != Some(verified_ledger.action_count())
+                                        { return; }
+                                        match planned {
                                             Ok(plan) => Some(plan),
 
                                             Err(error) => {
@@ -5336,9 +6143,21 @@ mod browser {
                                 }
 
                                 if genesis_plan.is_none() {
-                                    match pending_genesis_requires_readiness(
-                                        scope_snapshot_for_response.contract_id.as_str(),
-                                    ) {
+                                    let readiness = match durable_delegate_for_response.borrow().clone() {
+                                        Some(handle) => pending_genesis_requires_readiness(
+                                            &api_for_response,
+                                            &durable_replies_for_response,
+                                            &handle,
+                                            scope_snapshot_for_response.contract_id.as_str(),
+                                        ).await,
+                                        None => Err("Freenet durable state delegate is unavailable".to_owned()),
+                                    };
+                                    if *epoch_for_game_recovery.borrow() != response_epoch
+                                        || !scope_for_response.borrow().recognizes(&scope_snapshot_for_response)
+                                        || history_guard_for_response.borrow().action_count(&scope_snapshot_for_response)
+                                            != Some(verified_ledger.action_count())
+                                    { return; }
+                                    match readiness {
                                         Ok(true) => {
                                             secret_status_for_response.set(
                                                 "Waiting for authenticated genesis readiness from verified lobby state"
@@ -5400,11 +6219,23 @@ mod browser {
                                             return;
                                         };
 
-                                        match plan_browser_network_action(
-                                            scope_snapshot_for_response.contract_id.as_str(),
-                                            &state_bytes,
-                                            local_player,
-                                        ) {
+                                        let recovery = match durable_delegate_for_response.borrow().clone() {
+                                            Some(handle) => plan_durable_secretless_recovery(
+                                                &api_for_response,
+                                                &durable_replies_for_response,
+                                                &handle,
+                                                scope_snapshot_for_response.contract_id.as_str(),
+                                                &state_bytes,
+                                                local_player,
+                                            ).await,
+                                            None => Err("Freenet durable state delegate is unavailable".to_owned()),
+                                        };
+                                        if *epoch_for_game_recovery.borrow() != response_epoch
+                                            || !scope_for_response.borrow().recognizes(&scope_snapshot_for_response)
+                                            || history_guard_for_response.borrow().action_count(&scope_snapshot_for_response)
+                                                != Some(verified_ledger.action_count())
+                                        { return; }
+                                        match recovery {
                                             Ok(plan) => plan,
 
                                             Err(error) => {
@@ -5427,6 +6258,12 @@ mod browser {
                                     }
 
                                     BrowserNetworkActionPlan::Accepted { secret, kind } => {
+                                        let next_refresh = {
+                                            let mut counter = pending_counter_for_response.borrow_mut();
+                                            *counter = counter.wrapping_add(1);
+                                            *counter
+                                        };
+                                        pending_refresh_for_response.set(next_refresh);
                                         *secret_for_response.borrow_mut() = Some(secret);
                                         *network_action_for_response.borrow_mut() = None;
 
@@ -5443,6 +6280,12 @@ mod browser {
                                     }
 
                                     BrowserNetworkActionPlan::SecretlessAccepted { kind: _ } => {
+                                        let next_refresh = {
+                                            let mut counter = pending_counter_for_response.borrow_mut();
+                                            *counter = counter.wrapping_add(1);
+                                            *counter
+                                        };
+                                        pending_refresh_for_response.set(next_refresh);
                                         /*
                                          * The authoritative board was already
                                          * synchronized above from the accepted
@@ -5712,10 +6555,14 @@ mod browser {
                                         });
                                     }
                                 }
+                                });
                             }
                         }
                     },
                     move |error| {
+                        if !is_current_connection(connection_epoch, *epoch_for_host_error.borrow()) {
+                            return;
+                        }
                         contract_for_host_error
                             .set(crate::transport::host_result_error_status(&error));
 
@@ -5725,6 +6572,8 @@ mod browser {
                     move || {
                         let api_for_request = api_for_open.clone();
                         let epoch_for_request = epoch_for_open.clone();
+                        let durable_delegate_for_request = durable_delegate_for_open.clone();
+                        let durable_status_for_request = durable_status_for_open.clone();
                         let contract_for_request = contract_for_open.clone();
                         let subscription_for_request = subscription_for_open.clone();
                         let lobby_contract_for_request = lobby_contract_for_open.clone();
@@ -5732,10 +6581,44 @@ mod browser {
                         let scope_for_request = scope_for_request.clone();
                         let scope_snapshot_for_request = scope_snapshot_for_request.clone();
 
+                        // Re-register on the replacement WebSocket. Keep the game
+                        // and lobby GETs independent of the delegate WASM fetch.
+                        let api_for_registration = api_for_request.clone();
+                        let epoch_for_registration = epoch_for_request.clone();
                         wasm_bindgen_futures::spawn_local(async move {
-                            if *epoch_for_request.borrow() != connection_epoch {
+                            if *epoch_for_registration.borrow() != connection_epoch {
                                 return;
                             }
+                            durable_status_for_request.set("Loading durable state delegate".to_owned());
+                            match fetch_durable_state_delegate_wasm()
+                                .await
+                                .and_then(delegate_handle_from_wasm)
+                            {
+                                Ok((container, handle)) => {
+                                    if *epoch_for_registration.borrow() != connection_epoch { return; }
+                                    *durable_delegate_for_request.borrow_mut() = Some(handle);
+                                    durable_status_for_request.set("Registering durable state delegate".to_owned());
+                                    let result = {
+                                        let mut api = api_for_registration.borrow_mut();
+                                        match api.as_mut() {
+                                            Some(api) => register_local_state_delegate(api, container).await,
+                                            None => Err("Freenet connection closed before durable state registration".to_owned()),
+                                        }
+                                    };
+                                    if *epoch_for_registration.borrow() != connection_epoch { return; }
+                                    if let Err(error) = result {
+                                        durable_status_for_request.set(format!("Durable state registration failed: {error}"));
+                                    }
+                                }
+                                Err(error) => {
+                                    if *epoch_for_registration.borrow() != connection_epoch { return; }
+                                    durable_status_for_request.set(format!("Durable state delegate unavailable: {error}"));
+                                }
+                            }
+                        });
+
+                        wasm_bindgen_futures::spawn_local(async move {
+                            if *epoch_for_request.borrow() != connection_epoch { return; }
                             if scope_for_request
                                 .borrow()
                                 .recognizes(&scope_snapshot_for_request)
@@ -6006,6 +6889,12 @@ mod browser {
             let lobby_profile_status = lobby_profile_status.clone();
             let lobby_profile_error = lobby_profile_error.clone();
             let latest_lobby_contract_key = latest_lobby_contract_key.clone();
+            let authoritative_lobby_state = authoritative_lobby_state.clone();
+            let lobby_contract_status = lobby_contract_status.clone();
+            let revision_phase = revision_phase.clone();
+            let revision_delegate = revision_delegate.clone();
+            let revision_status = revision_delegate_status.clone();
+            let transport_epoch = transport_epoch.clone();
             let freenet_api = freenet_api.clone();
 
             Callback::from(move |_| {
@@ -6026,18 +6915,21 @@ mod browser {
                         return Err("Save and verify this display name in Freenet before publishing presence.".to_owned());
                     }
 
-                    let signing_key = load_cached_identity()?;
-
-                    if player_id_for_signing_key(&signing_key) != player_id {
-                        return Err(
-                            "Stored signing identity does not match the active PlayerId."
-                                .to_owned(),
-                        );
+                    let last_reserved = match &*revision_phase.borrow() {
+                        RevisionPhase::Ready { player_id: current, last_reserved } if *current == player_id => *last_reserved,
+                        _ => return Err("Verified Freenet presence revision is not ready.".to_owned()),
+                    };
+                    let handle = revision_delegate.borrow().clone().ok_or_else(||
+                        "Presence revision delegate is unavailable.".to_owned())?;
+                    if !matches!(&*lobby_contract_status, LobbyContractStatus::Retrieved { .. }) {
+                        return Err("Verified lobby state is not ready for revision reservation.".to_owned());
                     }
-
-                    let issued_at_unix_seconds = local_observation_unix_seconds()?;
-
-                    let key = latest_lobby_contract_key
+                    let observed_revision = (*authoritative_lobby_state).as_ref()
+                        .ok_or_else(|| "Verified lobby state is unavailable.".to_owned())?
+                        .lobby.0.players.iter()
+                        .find(|entry| entry.player_id == player_id)
+                        .map_or(0, |entry| entry.revision);
+                    let contract_key = latest_lobby_contract_key
                         .borrow()
                         .as_ref()
                         .cloned()
@@ -6048,26 +6940,19 @@ mod browser {
                     if freenet_api.borrow().is_none() {
                         return Err("The Freenet connection is not available.".to_owned());
                     }
-
-                    /*
-                     * Reserve before constructing or signing. A failure after
-                     * this point may skip a revision, which is safe; reusing one
-                     * would not be.
-                     */
-                    let revision = reserve_next_presence_revision(&player_id)?;
-
-                    let plan = plan_lobby_presence(LobbyPresencePlannerInput {
-                        signing_key: &signing_key,
-                        display_name: lobby_display_name.as_str(),
+                    let request_id = secure_random_32("presence revision reservation request ID")?;
+                    let intent = PresenceReservationIntent {
+                        name: (*lobby_display_name).clone(),
                         available: target_available,
-                        revision,
-                        issued_at_unix_seconds,
-                    })?;
-
-                    Ok((key, plan.encoded_state_update, revision))
+                        issued_at: local_observation_unix_seconds()?,
+                        contract_key,
+                        observed_revision,
+                        last_reserved,
+                    };
+                    Ok((player_id, request_id, handle, intent))
                 })();
 
-                let (key, state_update, revision) = match prepared {
+                let (player_id, request_id, handle, intent) = match prepared {
                     Ok(prepared) => prepared,
 
                     Err(error) => {
@@ -6078,76 +6963,39 @@ mod browser {
 
                 lobby_presence_submission_pending.set(true);
                 lobby_profile_error.set(None);
-                lobby_profile_status.set(format!(
-                    "Publishing {} presence revision {revision}",
-                    if target_available {
-                        "available"
-                    } else {
-                        "unavailable"
-                    },
-                ));
-
-                let api_for_update = freenet_api.clone();
-                let available_for_update = lobby_available.clone();
-                let pending_for_update = lobby_presence_submission_pending.clone();
-                let status_for_update = lobby_profile_status.clone();
-                let error_for_update = lobby_profile_error.clone();
+                lobby_profile_status.set("Reserving a Freenet presence revision".to_owned());
+                revision_status.set("Reserving next presence revision".to_owned());
+                let observed_revision = intent.observed_revision;
+                *revision_phase.borrow_mut() = RevisionPhase::AwaitingReserve { player_id, request_id, intent };
+                let epoch_snapshot = *transport_epoch.borrow();
+                let epoch_for_request = transport_epoch.clone();
+                let api_for_request = freenet_api.clone();
+                let phase_for_request = revision_phase.clone();
+                let revision_status_for_request = revision_status.clone();
+                let profile_error_for_request = lobby_profile_error.clone();
+                let profile_status_for_request = lobby_profile_status.clone();
+                let pending_for_request = lobby_presence_submission_pending.clone();
 
                 wasm_bindgen_futures::spawn_local(async move {
-                    let submit_result = {
-                        let mut api = api_for_update.borrow_mut();
-
+                    if *epoch_for_request.borrow() != epoch_snapshot { return; }
+                    let send_result = {
+                        let mut api = api_for_request.borrow_mut();
                         match api.as_mut() {
-                            Some(api) => submit_lobby_state_update(api, key, state_update).await,
-
-                            None => {
-                                Err("Freenet connection closed before presence publication."
-                                    .to_owned())
-                            }
+                            Some(api) => send_presence_revision_request(api, &handle, PresenceRevisionRequest {
+                                version: PRESENCE_REVISION_PROTOCOL_VERSION, request_id, player_id,
+                                action: PresenceRevisionAction::ReserveNext { observed_revision },
+                            }).await,
+                            None => Err("Freenet connection closed before presence revision reservation.".to_owned()),
                         }
                     };
-
-                    match submit_result {
-                        Ok(()) => {
-                            available_for_update.set(target_available);
-                            status_for_update.set(format!(
-                                "{} presence revision {revision} submitted; awaiting verified lobby refresh",
-                                if target_available {
-                                    "Available"
-                                } else {
-                                    "Unavailable"
-                                },
-                            ));
-
-                            gloo_timers::future::TimeoutFuture::new(750).await;
-
-                            let refresh_result = {
-                                let mut api = api_for_update.borrow_mut();
-
-                                match api.as_mut() {
-                                    Some(api) => request_lobby_contract(api).await,
-
-                                    None => {
-                                        Err("Freenet connection closed before lobby verification."
-                                            .to_owned())
-                                    }
-                                }
-                            };
-
-                            if let Err(error) = refresh_result {
-                                error_for_update.set(Some(format!(
-                                    "Presence revision {revision} was submitted, but lobby refresh failed: {error}"
-                                )));
-                            }
-                        }
-
-                        Err(error) => {
-                            error_for_update.set(Some(error));
-                            status_for_update.set("Presence publication failed".to_owned());
-                        }
+                    if *epoch_for_request.borrow() != epoch_snapshot { return; }
+                    if let Err(error) = send_result {
+                        *phase_for_request.borrow_mut() = RevisionPhase::Failed;
+                        revision_status_for_request.set(format!("Presence revision reservation failed: {error}"));
+                        profile_error_for_request.set(Some(error));
+                        profile_status_for_request.set("Presence publication failed".to_owned());
+                        pending_for_request.set(false);
                     }
-
-                    pending_for_update.set(false);
                 });
             })
         };
@@ -6161,6 +7009,11 @@ mod browser {
             let challenge_publication_status = challenge_publication_status.clone();
             let challenge_publication_error = challenge_publication_error.clone();
             let submitted_game_contract = submitted_game_contract.clone();
+            let durable_delegate = durable_delegate.clone();
+            let durable_registered = durable_registered.clone();
+            let durable_replies = durable_replies.clone();
+            let challenge_recovery_checked = challenge_recovery_checked.clone();
+            let challenge_recovery_attempted = challenge_recovery_attempted.clone();
 
             Callback::from(
                 move |(
@@ -6169,7 +7022,7 @@ mod browser {
                     recipient_presence_expiry,
                     challenger_role,
                 ): ([u8; 32], String, Option<u64>, Player)| {
-                    if *challenge_publication_pending {
+                    if *challenge_publication_pending || !*challenge_recovery_checked {
                         return;
                     }
 
@@ -6205,11 +7058,8 @@ mod browser {
                             return Err("The Freenet connection is not available.".to_owned());
                         }
 
-                        if load_outbound_challenge_publication(&local_player_id)?.is_some() {
-                            return Err(
-                                "A durable outbound challenge is already pending for this identity."
-                                    .to_owned(),
-                            );
+                        if !*durable_registered || durable_delegate.borrow().is_none() {
+                            return Err("Freenet durable state is not ready for challenge publication.".to_owned());
                         }
 
                         let expires_at_unix_seconds = now
@@ -6242,17 +7092,11 @@ mod browser {
 
                         let stored = StoredOutboundChallengePublication::new(&plan)?;
 
-                        /*
-                         * This exact read-back-verified write must complete
-                         * before the game contract is submitted.
-                         */
-                        store_new_outbound_challenge_publication(&stored)?;
-
-                        Ok(game_id)
+                        Ok((local_player_id, stored, game_id))
                     })();
 
-                    let game_id = match prepared {
-                        Ok(game_id) => game_id,
+                    let (local_player_id, stored, game_id) = match prepared {
+                        Ok(prepared) => prepared,
 
                         Err(error) => {
                             challenge_publication_error.set(Some(error));
@@ -6261,9 +7105,10 @@ mod browser {
                     };
 
                     challenge_publication_pending.set(true);
+                    *challenge_recovery_attempted.borrow_mut() = true;
                     challenge_publication_error.set(None);
                     challenge_publication_status.set(format!(
-                        "Publishing a single-game contract before advertising the challenge to {recipient_display_name}",
+                        "Saving the signed challenge in Freenet local state",
                     ));
 
                     let api_for_publication = freenet_api.clone();
@@ -6271,8 +7116,51 @@ mod browser {
                     let status_for_publication = challenge_publication_status.clone();
                     let error_for_publication = challenge_publication_error.clone();
                     let submitted_for_publication = submitted_game_contract.clone();
+                    let delegate_for_publication = durable_delegate.clone();
+                    let replies_for_publication = durable_replies.clone();
 
                     wasm_bindgen_futures::spawn_local(async move {
+                        let persisted = async {
+                            let handle = delegate_for_publication.borrow().clone()
+                                .ok_or_else(|| "Durable state delegate disconnected before challenge storage".to_owned())?;
+                            let bytes = stored.encode()?;
+                            let request_id = secure_random_32("durable challenge create request ID")?;
+                            let create = DurableRequest {
+                                version: DURABLE_STATE_VERSION,
+                                request_id,
+                                scope: local_player_id,
+                                slot: DurableSlot::OutboundChallenge,
+                                action: DurableAction::Create(bytes.clone()),
+                            };
+                            match durable_rpc!(api_for_publication, replies_for_publication, handle, create).await? {
+                                DurableResult::Stored => {}
+                                DurableResult::Conflict => return Err("A different durable challenge is already pending for this identity.".to_owned()),
+                                DurableResult::Error(error) => return Err(error),
+                                _ => return Err("Unexpected response while saving the challenge".to_owned()),
+                            }
+                            let readback = DurableRequest {
+                                version: DURABLE_STATE_VERSION,
+                                request_id: secure_random_32("durable challenge readback request ID")?,
+                                scope: local_player_id,
+                                slot: DurableSlot::OutboundChallenge,
+                                action: DurableAction::Get,
+                            };
+                            match durable_rpc!(api_for_publication, replies_for_publication, handle, readback).await? {
+                                DurableResult::Value(Some(actual)) if actual == bytes
+                                    && StoredOutboundChallengePublication::decode(&actual)? == stored => Ok(()),
+                                DurableResult::Error(error) => Err(error),
+                                _ => Err("Stored challenge failed exact Freenet readback; publication is blocked".to_owned()),
+                            }
+                        }.await;
+                        if let Err(error) = persisted {
+                            pending_for_publication.set(true);
+                            status_for_publication.set("Challenge storage requires recovery".to_owned());
+                            error_for_publication.set(Some(error));
+                            return;
+                        }
+                        status_for_publication.set(format!(
+                            "Publishing a single-game contract before advertising the challenge to {recipient_display_name}"
+                        ));
                         let result = {
                             let mut api = api_for_publication.borrow_mut();
 
@@ -6331,6 +7219,7 @@ mod browser {
 
         let on_accept_incoming_challenge: Callback<SignedChallengeOffer> = {
             let local_player_id = local_player_id.clone();
+            let recovery_checked = incoming_acceptance_recovery_checked.clone();
             let authoritative_lobby_state = authoritative_lobby_state.clone();
             let freenet_api = freenet_api.clone();
             let outbound_pending = challenge_publication_pending.clone();
@@ -6341,7 +7230,7 @@ mod browser {
             let retrieved_read = retrieved_incoming_acceptance_read.clone();
 
             Callback::from(move |signed_offer: SignedChallengeOffer| {
-                if *incoming_pending {
+                if *incoming_pending || !*recovery_checked {
                     return;
                 }
 
@@ -6618,7 +7507,6 @@ mod browser {
             let selected = selected_for_activation.clone();
             let local_player_id = local_player_id.clone();
             let active_game_scope = active_game_scope.clone();
-            let local_role = local_role.clone();
             let controller = controller.clone();
             let interface_error = interface_error.clone();
             let pending_confirmation = pending_confirmation.clone();
@@ -6627,9 +7515,33 @@ mod browser {
             let suppress_completed_overlay = suppress_completed_overlay.clone();
             let verified_game_view = verified_game_view.clone();
             let reconnect = on_reconnect.clone();
+            let freenet_api = freenet_api.clone();
+            let durable_delegate = durable_delegate.clone();
+            let durable_replies = durable_replies.clone();
+            let transport_epoch = transport_epoch.clone();
 
             Callback::from(move |event| {
-                let activation = (|| -> Result<(ActiveGameScope, AcceptedGame, bool), String> {
+                let selected = selected.clone();
+                let local_player_id = local_player_id.clone();
+                let active_game_scope = active_game_scope.clone();
+                let controller = controller.clone();
+                let interface_error = interface_error.clone();
+                let pending_confirmation = pending_confirmation.clone();
+                let local_dice_secret = local_dice_secret.clone();
+                let activation_status = activation_status.clone();
+                let suppress_completed_overlay = suppress_completed_overlay.clone();
+                let verified_game_view = verified_game_view.clone();
+                let reconnect = reconnect.clone();
+                let api = freenet_api.clone();
+                let delegate = durable_delegate.clone();
+                let router = durable_replies.clone();
+                let epoch = transport_epoch.clone();
+                let epoch_snapshot = *epoch.borrow();
+                activation_status.set("Verifying and storing genesis handshake in Freenet".to_owned());
+                wasm_bindgen_futures::spawn_local(async move {
+                let activation = async {
+                    let handle = delegate.borrow().clone().ok_or_else(||
+                        "Freenet durable state delegate is not ready".to_owned())?;
                     let player_id = (*local_player_id)
                         .ok_or_else(|| "Persistent local identity is unavailable.".to_owned())?;
 
@@ -6641,7 +7553,39 @@ mod browser {
                         .borrow()
                         .activate_accepted(player_id, &accepted)?;
 
-                    ensure_accepted_local_role(next_scope.contract_id(), accepted.local_role)?;
+                    if let Some((pending, _)) = load_durable_pending_action(
+                        &api, &router, &handle, next_scope.contract_id()
+                    ).await? {
+                        if pending.game_id != accepted.game_id {
+                            return Err("Durable pending action belongs to another accepted game".to_owned());
+                        }
+                        let record = pending.verify()?;
+                        match &record.payload {
+                            GameActionPayload::CommitDice { turn, player, commitment } => {
+                                if *player != accepted.local_role {
+                                    return Err("Pending commitment belongs to another player".to_owned());
+                                }
+                                let secret = load_durable_dice_secret(
+                                    &api, &router, &handle, &accepted.game_id, *turn, *player,
+                                ).await?.ok_or_else(|| "Pending commitment has no durable dice secret".to_owned())?;
+                                crate::secret_store::verify_dice_secret_commitment(
+                                    &accepted.game_id, *turn, *player, commitment, &secret,
+                                )?;
+                            }
+                            GameActionPayload::RevealDice { turn, player, secret } => {
+                                if *player != accepted.local_role {
+                                    return Err("Pending reveal belongs to another player".to_owned());
+                                }
+                                let saved = load_durable_dice_secret(
+                                    &api, &router, &handle, &accepted.game_id, *turn, *player,
+                                ).await?.ok_or_else(|| "Pending reveal has no durable dice secret".to_owned())?;
+                                if saved != *secret {
+                                    return Err("Pending reveal differs from the durable dice secret".to_owned());
+                                }
+                            }
+                            _ => {},
+                        }
+                    }
 
                     let signing_key = load_cached_identity()?;
 
@@ -6652,8 +7596,13 @@ mod browser {
                         );
                     }
 
-                    let mut handshake = match load_genesis_handshake(&accepted.game_id, &player_id)?
-                    {
+                    let (stored, previous) = load_durable_genesis_handshake(
+                        &api, &router, &handle, &accepted.game_id, &player_id
+                    ).await?;
+                    if *epoch.borrow() != epoch_snapshot {
+                        return Err("Connection changed during accepted-game activation".to_owned());
+                    }
+                    let mut handshake = match stored {
                         Some(stored) => {
                             if stored.proposal != accepted.accepted_proposal {
                                 return Err(
@@ -6673,10 +7622,15 @@ mod browser {
 
                     let local_share_added = handshake.ensure_local_share(&signing_key)?;
 
-                    store_genesis_handshake(&handshake)?;
-
-                    Ok((next_scope, accepted, local_share_added))
-                })();
+                    save_durable_genesis_handshake(
+                        &api, &router, &handle, previous, &handshake
+                    ).await?;
+                    if *epoch.borrow() != epoch_snapshot {
+                        return Err("Connection changed during genesis handshake storage".to_owned());
+                    }
+                    Ok::<_, String>((next_scope, accepted, local_share_added))
+                }.await;
+                if *epoch.borrow() != epoch_snapshot { return; }
 
                 match activation {
                     Ok((next_scope, accepted, local_share_added)) => {
@@ -6687,7 +7641,6 @@ mod browser {
                         suppress_completed_overlay.set(false);
                         pending_confirmation.set(None);
                         local_dice_secret.borrow_mut().take();
-                        local_role.set(Ok(Some(accepted.local_role)));
                         interface_error.set(None);
 
                         let genesis_share_status = if local_share_added {
@@ -6719,6 +7672,7 @@ mod browser {
                         )));
                     }
                 }
+                });
             })
         };
 
@@ -6882,18 +7836,26 @@ mod browser {
 
         let lobby_availability_disabled = (*local_player_id).is_none()
             || *lobby_presence_submission_pending
+            || !matches!(&*revision_phase.borrow(), RevisionPhase::Ready { player_id, .. }
+                    if Some(*player_id) == *local_player_id)
             || (!*lobby_available
                 && !matches!(&*profile_phase.borrow(), ProfilePhase::Ready {
                 player_id, name: Some(saved),
             } if Some(*player_id) == *local_player_id && saved == lobby_display_name.as_str()))
-            || latest_lobby_contract_key.borrow().is_none();
+            || latest_lobby_contract_key.borrow().is_none()
+            || (*authoritative_lobby_state).is_none()
+            || !matches!(&*lobby_contract_status, LobbyContractStatus::Retrieved { .. });
 
         let challenge_controls_disabled = *challenge_publication_pending
+            || !*challenge_recovery_checked
+            || !*durable_registered
             || (*local_player_id).is_none()
             || latest_lobby_contract_key.borrow().is_none()
             || freenet_api.borrow().is_none();
 
         let incoming_acceptance_controls_disabled = *incoming_acceptance_pending
+            || !*incoming_acceptance_recovery_checked
+            || !*durable_registered
             || *challenge_publication_pending
             || (*local_player_id).is_none()
             || (*authoritative_lobby_state).is_none()
@@ -7423,106 +8385,15 @@ mod browser {
                         <section class="panel status-panel" aria-labelledby="status-heading" tabindex="0">
                             <h2 id="status-heading">{ "Connection" }</h2>
 
-                            <div
-                                class="role-selector"
-                                aria-label="Choose local player role"
-                            >
-                                <button
-                                    type="button"
-                                    class={classes!(
-                                        "role-choice",
-                                        (
-                                            selected_local_role
-                                                == Some(Player::White)
-                                        )
-                                            .then_some("selected"),
-                                    )}
-                                    aria-pressed={
-                                        (
-                                            selected_local_role
-                                                == Some(Player::White)
-                                        )
-                                            .to_string()
-                                    }
-                                    disabled={role_selection_locked}
-                                    onclick={on_select_white}
-                                >
-                                    { "Play as White" }
-                                </button>
-
-                                <button
-                                    type="button"
-                                    class={classes!(
-                                        "role-choice",
-                                        (
-                                            selected_local_role
-                                                == Some(Player::Black)
-                                        )
-                                            .then_some("selected"),
-                                    )}
-                                    aria-pressed={
-                                        (
-                                            selected_local_role
-                                                == Some(Player::Black)
-                                        )
-                                            .to_string()
-                                    }
-                                    disabled={role_selection_locked}
-                                    onclick={on_select_black}
-                                >
-                                    { "Play as Black" }
-                                </button>
-                            </div>
-
-                            {
-                                match &*local_role {
-                                    Err(error) => html! {
-                                        <p class="interface-error" role="alert">
-                                            {
-                                                format!(
-                                                    "Stored local role failed validation: {error}"
-                                                )
-                                            }
-                                        </p>
-                                    },
-
-                                    Ok(_) => html! {},
-                                }
-                            }
-
-                            {
-                                match &pending_role_check {
-                                    Err(error) => html! {
-                                        <p class="interface-error" role="alert">
-                                            {
-                                                format!(
-                                                    "Pending-action role guard failed: {error}"
-                                                )
-                                            }
-                                        </p>
-                                    },
-
-                                    Ok(_) => html! {},
-                                }
-                            }
+                            { match &pending_role_check {
+                                Err(error) => html! { <p class="interface-error" role="alert">{format!("Pending-action recovery failed: {error}")}</p> },
+                                Ok(_) => html! {},
+                            }}
 
                             <dl class="status-list">
                                 <div>
                                     <dt>{ "Game mode" }</dt>
                                     <dd>{ "Network commitment test" }</dd>
-                                </div>
-
-                                <div class="role-status-row">
-                                    <dt>{ "Local role" }</dt>
-                                    <dd>
-                                        {
-                                            match &*local_role {
-                                                Ok(Some(player)) => player_name(*player),
-                                                Ok(None) => "Not selected",
-                                                Err(_) => "Storage error",
-                                            }
-                                        }
-                                    </dd>
                                 </div>
 
                             <div>
@@ -7754,6 +8625,16 @@ mod browser {
                                 <div>
                                     <dt>{ "Freenet profile" }</dt>
                                     <dd>{ (*profile_delegate_status).clone() }</dd>
+                                </div>
+
+                                <div>
+                                    <dt>{ "Freenet presence revision" }</dt>
+                                    <dd>{ (*revision_delegate_status).clone() }</dd>
+                                </div>
+
+                                <div>
+                                    <dt>{ "Freenet durable state" }</dt>
+                                    <dd>{ (*durable_delegate_status).clone() }</dd>
                                 </div>
 
                                 <div>

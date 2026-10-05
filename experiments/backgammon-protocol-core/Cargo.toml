@@ -8,7 +8,9 @@ members = [
     "crates/backgammon-lobby-contract",
     "crates/backgammon-local-state-delegate",
     "crates/backgammon-profile-delegate",
+    "crates/backgammon-presence-revision-delegate",
     "crates/backgammon-client",
+    "crates/backgammon-durable-state-delegate",
 ]
 
 [workspace.package]

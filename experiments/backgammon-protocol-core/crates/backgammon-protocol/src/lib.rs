@@ -3,24 +3,28 @@
 mod authentication;
 mod challenge;
 mod challenge_state;
+mod durable_state;
 mod fair_dice;
 mod game_action;
 mod genesis_handshake;
 mod lobby_presence;
 mod local_state;
 mod profile_state;
+mod presence_revision_state;
 mod replay;
 mod state_hash;
 
 pub use authentication::*;
 pub use challenge::*;
 pub use challenge_state::*;
+pub use durable_state::*;
 pub use fair_dice::*;
 pub use game_action::*;
 pub use genesis_handshake::*;
 pub use lobby_presence::*;
 pub use local_state::*;
 pub use profile_state::*;
+pub use presence_revision_state::*;
 pub use replay::*;
 pub use state_hash::*;
 

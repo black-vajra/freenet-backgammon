@@ -11,6 +11,7 @@ backgammon-core = { path = "../backgammon-core" }
 backgammon-lobby-core = { path = "../backgammon-lobby-core" }
 backgammon-protocol = { path = "../backgammon-protocol" }
 ciborium.workspace = true
+futures-channel = "0.3"
 ed25519-dalek = { version = "3.0.0", default-features = false, features = ["zeroize"] }
 serde.workspace = true
 freenet-stdlib = { version = "0.8.5", features = ["net"] }
