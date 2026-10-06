@@ -5,7 +5,6 @@ pub struct GameControlsProps {
     pub can_roll: bool,
     pub can_pass: bool,
     pub can_resign: bool,
-    pub can_leave: bool,
     pub can_reconnect: bool,
     pub status_note: String,
     pub on_roll: Callback<MouseEvent>,
@@ -68,10 +67,9 @@ pub fn game_controls(props: &GameControlsProps) -> Html {
 
                 <button
                     type="button"
-                    disabled={!props.can_leave}
                     onclick={props.on_leave.clone()}
                 >
-                    { "Leave" }
+                    { "Return to lobby" }
                 </button>
             </div>
 

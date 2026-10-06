@@ -5,6 +5,21 @@ use std::io::Cursor;
 
 use crate::GameId;
 
+/// Keep pending lobby negotiations separate across lobby instances without
+/// changing the signed player identity stored inside their payloads.
+/// Game recovery slots retain their existing scope and exact secret keys.
+pub fn scope_lobby_durable_request(mut request: DurableRequest, lobby_id: &str) -> DurableRequest {
+    if matches!(request.slot, DurableSlot::OutboundChallenge | DurableSlot::IncomingAcceptance) {
+        let mut hash = blake3::Hasher::new();
+        hash.update(b"freenet-backgammon:durable-lobby-player:v1\0");
+        hash.update(&(lobby_id.len() as u64).to_be_bytes());
+        hash.update(lobby_id.as_bytes());
+        hash.update(&request.scope);
+        request.scope = *hash.finalize().as_bytes();
+    }
+    request
+}
+
 /// Versioned, bounded messages for local Freenet delegate secrets. The scope
 /// identifies a player or game; the slot prevents unrelated records sharing a
 /// key. Client code must also validate the record's authenticated contents.
@@ -172,6 +187,44 @@ mod tests {
         assert_eq!(contract_durable_scope("contract-A"), contract_durable_scope("contract-A"));
         assert_ne!(contract_durable_scope("contract-A"), contract_durable_scope("contract-B"));
         assert_ne!(contract_durable_scope("contract-A"), dice_secret_durable_scope(&[0; 32], 0, Player::White));
+    }
+
+    #[test]
+    fn pending_lobby_records_are_separated_by_lobby_and_player() {
+        let request = DurableRequest {
+            version: DURABLE_STATE_VERSION, request_id: [1; 32], scope: [2; 32],
+            slot: DurableSlot::OutboundChallenge, action: DurableAction::Get,
+        };
+        let scoped = scope_lobby_durable_request(request.clone(), "lobby-A");
+        assert_eq!(scoped, scope_lobby_durable_request(request.clone(), "lobby-A"));
+        assert_ne!(scoped.scope, request.scope);
+        assert_ne!(scoped.scope, scope_lobby_durable_request(request.clone(), "lobby-B").scope);
+        let mut other_player = request.clone();
+        other_player.scope = [3; 32];
+        assert_ne!(scoped.scope, scope_lobby_durable_request(other_player, "lobby-A").scope);
+        for slot in [DurableSlot::OutboundChallenge, DurableSlot::IncomingAcceptance] {
+            let mut pending = request.clone();
+            pending.slot = slot;
+            pending.action = DurableAction::Delete { expected: vec![7, 8] };
+            let namespaced = scope_lobby_durable_request(pending.clone(), "lobby-A");
+            assert_eq!(namespaced.scope, scoped.scope);
+            assert_eq!(namespaced.slot, pending.slot);
+            assert_eq!(namespaced.action, pending.action);
+            assert_eq!(namespaced.request_id, pending.request_id);
+        }
+    }
+
+    #[test]
+    fn lobby_rotation_preserves_game_recovery_scopes() {
+        for slot in [DurableSlot::GenesisHandshake, DurableSlot::DiceSecret,
+            DurableSlot::PendingAction, DurableSlot::LocalRole] {
+            let request = DurableRequest {
+                version: DURABLE_STATE_VERSION, request_id: [1; 32], scope: [2; 32],
+                slot, action: DurableAction::Get,
+            };
+            assert_eq!(scope_lobby_durable_request(request.clone(), "lobby-A"), request);
+            assert_eq!(scope_lobby_durable_request(request.clone(), "lobby-B"), request);
+        }
     }
 
     #[test]

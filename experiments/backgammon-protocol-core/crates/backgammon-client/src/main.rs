@@ -11,6 +11,7 @@ pub mod challenge_publication_store;
 pub mod challenge_state;
 pub mod commitment_planner;
 pub mod controller;
+pub mod game_transition;
 pub mod genesis_handshake;
 pub mod genesis_handshake_store;
 pub mod genesis_refresh_gate;
@@ -97,6 +98,10 @@ mod browser {
         confirm_game_contract_publication, submit_game_contract_publication,
         SubmittedGameContractPublication,
     };
+    use crate::game_transition::{
+        plan_game_transition, verify_activation_candidate, ActivationGate,
+        GameTransitionDecision, GameTransitionIntent,
+    };
     use crate::genesis_handshake_store::StoredGenesisHandshake;
     use crate::genesis_refresh_gate::GenesisRefreshGate;
     use crate::genesis_share_publication_planner::{
@@ -156,7 +161,9 @@ mod browser {
     // dispatch it. Dropping the router on reconnect fails all pending calls.
     macro_rules! durable_rpc {
         ($api_handle:expr, $reply_router:expr, $delegate_handle:expr, $request:expr) => {{
-            let request = $request;
+            let request = backgammon_protocol::scope_lobby_durable_request(
+                $request, crate::lobby_transport::LOBBY_CONTRACT_ID,
+            );
             let api_handle = ($api_handle).clone();
             let reply_router = ($reply_router).clone();
             let delegate_handle = ($delegate_handle).clone();
@@ -188,6 +195,9 @@ mod browser {
         delegate_handle: &LocalStateDelegateHandle,
         request: DurableRequest,
     ) -> Result<DurableResult, String> {
+        let request = backgammon_protocol::scope_lobby_durable_request(
+            request, crate::lobby_transport::LOBBY_CONTRACT_ID,
+        );
         let receiver = reply_router.borrow_mut().register(&request)?;
         let send_result = {
             let mut api = api_handle.borrow_mut();
@@ -1652,28 +1662,24 @@ mod browser {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum PendingConfirmation {
         Resign,
-        Leave,
     }
 
     impl PendingConfirmation {
         fn title(self) -> &'static str {
             match self {
                 Self::Resign => "Resign this game?",
-                Self::Leave => "Leave the table?",
             }
         }
 
         fn message(self) -> &'static str {
             match self {
                 Self::Resign => "The active player will resign and the opponent will win.",
-                Self::Leave => "The current local session will end.",
             }
         }
 
         fn confirm_label(self) -> &'static str {
             match self {
                 Self::Resign => "Resign game",
-                Self::Leave => "Leave table",
             }
         }
     }
@@ -1826,6 +1832,16 @@ mod browser {
         let pending_confirmation = use_state(|| None::<PendingConfirmation>);
         let new_game_options = use_state(|| false);
         let suppress_completed_overlay = use_state(|| false);
+        let lobby_view = use_state(|| true);
+        let finished_games_view = use_state(|| false);
+        let older_games_visible = use_state(|| 0_usize);
+        let invitations_view = use_state(|| false);
+        let game_transition_intent = use_state(|| None::<GameTransitionIntent>);
+        let current_transition_intent = use_mut_ref(|| None::<GameTransitionIntent>);
+        let automatic_activation_attempted = use_mut_ref(|| None::<GameTransitionIntent>);
+        let activation_gate = use_mut_ref(ActivationGate::default);
+        let activation_busy = use_state(|| false);
+        let accepted_candidates_for_activation = use_mut_ref(|| Ok(Vec::<AcceptedGame>::new()));
         let copy_status = use_state(|| String::new());
         let connection_status = use_state(|| ConnectionStatus::Disconnected);
         let auto_reconnect_generation = use_state(|| 0_u64);
@@ -2775,6 +2791,12 @@ mod browser {
                 &*lobby_contract_status,
                 LobbyContractStatus::Retrieved { .. }
             ),
+            DurableRecoveryReadiness {
+                connection_epoch: *transport_epoch.borrow(),
+                socket_open: matches!(&*connection_status, ConnectionStatus::Connected),
+                delegate_registered: *durable_registered,
+                registered_epoch: *durable_registration_epoch.borrow(),
+            },
         );
 
         {
@@ -2792,7 +2814,7 @@ mod browser {
 
             use_effect_with(
                 genesis_share_reconciliation,
-                move |(scope_snapshot, player_id, authoritative_state, lobby_ready)| {
+                move |(scope_snapshot, player_id, authoritative_state, lobby_ready, recovery_ready)| {
                     if !*lobby_ready {
                         refresh_gate.borrow_mut().revoke(scope_snapshot);
                         if publication_in_flight.borrow().as_ref() == Some(scope_snapshot) {
@@ -2806,6 +2828,16 @@ mod browser {
                         {
                             genesis_readiness.borrow_mut().take();
                         }
+                    } else if !recovery_ready.can_read() {
+                        // Registration is a dependency: its acknowledgement will
+                        // rerun this effect using the same stored genesis share.
+                        // A GET can arrive before delegate loading on reconnect.
+                        refresh_gate.borrow_mut().revoke(scope_snapshot);
+                        genesis_readiness.borrow_mut().take();
+                        publication_status.set(
+                            "Waiting for durable state registration before genesis-share recovery"
+                                .to_owned(),
+                        );
                     } else {
                         let scope_snapshot = scope_snapshot.clone();
                         let player_id = *player_id;
@@ -5052,7 +5084,9 @@ mod browser {
             }
         };
 
-        let game_state_text = if left_table {
+        let game_state_text = if selected_accepted_game_id.is_none() {
+            "No game selected".to_owned()
+        } else if left_table {
             "Table left".to_owned()
         } else if outcome.is_some() {
             "Game complete".to_owned()
@@ -5545,6 +5579,35 @@ mod browser {
             })
         };
 
+        let on_return_to_lobby: Callback<MouseEvent> = {
+            let lobby_view = lobby_view.clone();
+            let options = new_game_options.clone();
+            let suppress = suppress_completed_overlay.clone();
+            let intent = game_transition_intent.clone();
+            let current_intent = current_transition_intent.clone();
+            let selected = selected_accepted_game_id.clone();
+            let gate = activation_gate.clone();
+            let busy = activation_busy.clone();
+            Callback::from(move |_| {
+                gate.borrow_mut().cancel();
+                busy.set(false);
+                current_intent.borrow_mut().take();
+                intent.set(None);
+                selected.set(None);
+                options.set(false);
+                suppress.set(true);
+                lobby_view.set(true);
+            })
+        };
+        let on_view_table: Callback<MouseEvent> = {
+            let lobby_view = lobby_view.clone();
+            let suppress = suppress_completed_overlay.clone();
+            Callback::from(move |_| {
+                lobby_view.set(false);
+                suppress.set(true);
+            })
+        };
+
         let on_new_game = {
             let new_game_options = new_game_options.clone();
 
@@ -5553,13 +5616,7 @@ mod browser {
             })
         };
 
-        let on_leave = {
-            let pending_confirmation = pending_confirmation.clone();
-
-            Callback::from(move |_| {
-                pending_confirmation.set(Some(PendingConfirmation::Leave));
-            })
-        };
+        let on_leave = on_return_to_lobby.clone();
 
         let on_cancel_confirmation = {
             let pending_confirmation = pending_confirmation.clone();
@@ -5583,10 +5640,6 @@ mod browser {
 
                 let result = match action {
                     PendingConfirmation::Resign => next.resign(),
-                    PendingConfirmation::Leave => {
-                        next.leave_table();
-                        Ok(())
-                    }
                 };
 
                 match result {
@@ -5653,7 +5706,7 @@ mod browser {
             },
         );
 
-        let on_reconnect = {
+        let reconnect_game_transport: Callback<()> = {
             let pending_view_refresh = pending_view_refresh.clone();
             let pending_view_refresh_counter = pending_view_refresh_counter.clone();
             let connection_status = connection_status.clone();
@@ -6696,7 +6749,9 @@ mod browser {
             })
         };
 
-        let terminal_overlay = if *suppress_completed_overlay || *new_game_options {
+        let on_reconnect: Callback<MouseEvent> = reconnect_game_transport.reform(|_| ());
+
+        let terminal_overlay = if *suppress_completed_overlay || *new_game_options || *lobby_view {
             html! {}
         } else if left_table {
             html! {
@@ -6772,6 +6827,10 @@ mod browser {
                                     onclick={on_new_game.clone()}
                                 >
                                     { "Play again" }
+                                </button>
+                                <button type="button" class="overlay-action"
+                                    onclick={on_return_to_lobby.clone()}>
+                                    { "Return to lobby" }
                                 </button>
                             </div>
                         </div>
@@ -7014,6 +7073,15 @@ mod browser {
             let durable_replies = durable_replies.clone();
             let challenge_recovery_checked = challenge_recovery_checked.clone();
             let challenge_recovery_attempted = challenge_recovery_attempted.clone();
+            let transition_intent = game_transition_intent.clone();
+            let active_scope = active_game_scope.clone();
+            let may_activate_automatically = *lobby_view || outcome.is_some()
+                || (!verified_game_created && active_game_scope.borrow().accepted_game().is_none());
+            let current_intent = current_transition_intent.clone();
+            let gate = activation_gate.clone();
+            let origin_for_navigation = active_game_scope_snapshot.clone();
+            let suppress = suppress_completed_overlay.clone();
+            let options = new_game_options.clone();
 
             Callback::from(
                 move |(
@@ -7022,10 +7090,15 @@ mod browser {
                     recipient_presence_expiry,
                     challenger_role,
                 ): ([u8; 32], String, Option<u64>, Player)| {
-                    if *challenge_publication_pending || !*challenge_recovery_checked {
+                    if *challenge_publication_pending || !*challenge_recovery_checked
+                        || gate.borrow().is_busy() || current_intent.borrow().is_some() {
                         return;
                     }
 
+                    if !active_scope.borrow().recognizes(&origin_for_navigation) {
+                        challenge_publication_error.set(Some("The game changed; choose your challenge again.".to_owned()));
+                        return;
+                    }
                     let prepared = (|| {
                         let local_player_id = (*local_player_id)
                             .ok_or_else(|| "Local identity is not ready yet.".to_owned())?;
@@ -7104,6 +7177,15 @@ mod browser {
                         }
                     };
 
+                    let intent = GameTransitionIntent {
+                        proposal: stored.signed_offer.body.proposal.clone(),
+                        origin_scope: active_scope.borrow().snapshot(),
+                        automatic: may_activate_automatically,
+                    };
+                    *current_intent.borrow_mut() = Some(intent.clone());
+                    transition_intent.set(Some(intent));
+                    suppress.set(true);
+                    options.set(false);
                     challenge_publication_pending.set(true);
                     *challenge_recovery_attempted.borrow_mut() = true;
                     challenge_publication_error.set(None);
@@ -7228,12 +7310,25 @@ mod browser {
             let incoming_error = incoming_acceptance_error.clone();
             let pending_probe = pending_incoming_acceptance_probe.clone();
             let retrieved_read = retrieved_incoming_acceptance_read.clone();
+            let transition_intent = game_transition_intent.clone();
+            let active_scope = active_game_scope.clone();
+            let may_activate_automatically = *lobby_view || outcome.is_some()
+                || (!verified_game_created && active_game_scope.borrow().accepted_game().is_none());
+            let current_intent = current_transition_intent.clone();
+            let gate = activation_gate.clone();
+            let origin_for_navigation = active_game_scope_snapshot.clone();
+            let suppress = suppress_completed_overlay.clone();
+            let options = new_game_options.clone();
 
             Callback::from(move |signed_offer: SignedChallengeOffer| {
-                if *incoming_pending || !*recovery_checked {
+                if *incoming_pending || !*recovery_checked || gate.borrow().is_busy() {
                     return;
                 }
 
+                if !active_scope.borrow().recognizes(&origin_for_navigation) {
+                    incoming_error.set(Some("The game changed; choose the incoming challenge again.".to_owned()));
+                    return;
+                }
                 let prepared = (|| {
                     if *outbound_pending {
                         return Err("An outbound challenge workflow is already pending.".to_owned());
@@ -7301,6 +7396,15 @@ mod browser {
                  * Arm before the asynchronous send. Even an immediate response
                  * therefore has its exact unsigned originating evidence.
                  */
+                let intent = GameTransitionIntent {
+                    proposal: probe.signed_offer.body.proposal.clone(),
+                    origin_scope: active_scope.borrow().snapshot(),
+                    automatic: may_activate_automatically,
+                };
+                *current_intent.borrow_mut() = Some(intent.clone());
+                transition_intent.set(Some(intent));
+                suppress.set(true);
+                options.set(false);
                 retrieved_read.borrow_mut().take();
                 *pending_probe.borrow_mut() = Some(probe);
 
@@ -7397,8 +7501,9 @@ mod browser {
 
         /*
          * Accepted games are projected from the complete verified lobby state
-         * without consulting the browser clock. Selection remains harmless UI
-         * intent until the user explicitly activates one verified candidate.
+         * without consulting the browser clock. Only an explicit challenge or
+         * acceptance intent can automatically activate its exact candidate;
+         * historical records still require manual inspection/activation.
          */
         let accepted_games = match (*local_player_id, (*authoritative_lobby_state).as_ref()) {
             (Some(player_id), Some(state)) => {
@@ -7407,6 +7512,8 @@ mod browser {
 
             _ => Ok(Vec::new()),
         };
+
+        *accepted_candidates_for_activation.borrow_mut() = accepted_games.clone();
 
         let accepted_probe_list = accepted_games.as_ref().map_or_else(
             |_| Vec::new(),
@@ -7503,8 +7610,7 @@ mod browser {
             _ => false,
         };
 
-        let on_activate_accepted_game = {
-            let selected = selected_for_activation.clone();
+        let activate_accepted_game: Callback<AcceptedGame> = {
             let local_player_id = local_player_id.clone();
             let active_game_scope = active_game_scope.clone();
             let controller = controller.clone();
@@ -7514,14 +7620,29 @@ mod browser {
             let activation_status = accepted_game_activation_status.clone();
             let suppress_completed_overlay = suppress_completed_overlay.clone();
             let verified_game_view = verified_game_view.clone();
-            let reconnect = on_reconnect.clone();
+            let reconnect = reconnect_game_transport.clone();
             let freenet_api = freenet_api.clone();
             let durable_delegate = durable_delegate.clone();
             let durable_replies = durable_replies.clone();
             let transport_epoch = transport_epoch.clone();
+            let gate = activation_gate.clone();
+            let busy = activation_busy.clone();
+            let selected_id = selected_accepted_game_id.clone();
+            let options = new_game_options.clone();
+            let lobby_view = lobby_view.clone();
+            let candidates = accepted_candidates_for_activation.clone();
 
-            Callback::from(move |event| {
-                let selected = selected.clone();
+            Callback::from(move |accepted: AcceptedGame| {
+                if active_game_scope.borrow().accepted_game() == Some(&accepted) {
+                    return;
+                }
+                let Some(request_id) = gate.borrow_mut().begin() else { return; };
+                let origin_scope = active_game_scope.borrow().snapshot();
+                busy.set(true);
+                selected_id.set(Some(accepted.game_id));
+                options.set(false);
+                suppress_completed_overlay.set(true);
+                let accepted = accepted.clone();
                 let local_player_id = local_player_id.clone();
                 let active_game_scope = active_game_scope.clone();
                 let controller = controller.clone();
@@ -7537,17 +7658,22 @@ mod browser {
                 let router = durable_replies.clone();
                 let epoch = transport_epoch.clone();
                 let epoch_snapshot = *epoch.borrow();
+                let gate = gate.clone();
+                let busy = busy.clone();
+                let lobby_view = lobby_view.clone();
+                let candidates = candidates.clone();
                 activation_status.set("Verifying and storing genesis handshake in Freenet".to_owned());
                 wasm_bindgen_futures::spawn_local(async move {
                 let activation = async {
+                    {
+                        let candidates = candidates.borrow();
+                        let games = candidates.as_ref().map_err(|error| error.clone())?;
+                        verify_activation_candidate(&accepted, games)?;
+                    }
                     let handle = delegate.borrow().clone().ok_or_else(||
                         "Freenet durable state delegate is not ready".to_owned())?;
                     let player_id = (*local_player_id)
                         .ok_or_else(|| "Persistent local identity is unavailable.".to_owned())?;
-
-                    let accepted = selected
-                        .clone()?
-                        .ok_or_else(|| "No authoritative accepted game is selected.".to_owned())?;
 
                     let next_scope = active_game_scope
                         .borrow()
@@ -7628,9 +7754,23 @@ mod browser {
                     if *epoch.borrow() != epoch_snapshot {
                         return Err("Connection changed during genesis handshake storage".to_owned());
                     }
+                    {
+                        let candidates = candidates.borrow();
+                        let games = candidates.as_ref().map_err(|error| error.clone())?;
+                        verify_activation_candidate(&accepted, games)?;
+                    }
                     Ok::<_, String>((next_scope, accepted, local_share_added))
                 }.await;
-                if *epoch.borrow() != epoch_snapshot { return; }
+                if !gate.borrow().is_current(request_id) { return; }
+                if *epoch.borrow() != epoch_snapshot
+                    || !active_game_scope.borrow().recognizes(&origin_scope) {
+                    gate.borrow_mut().finish(request_id);
+                    busy.set(false);
+                    activation_status.set("Activation interrupted by a connection or game change; retry when connected".to_owned());
+                    return;
+                }
+                gate.borrow_mut().finish(request_id);
+                busy.set(false);
 
                 match activation {
                     Ok((next_scope, accepted, local_share_added)) => {
@@ -7639,6 +7779,7 @@ mod browser {
                         controller.set(LocalGameController::new());
                         verified_game_view.set(None);
                         suppress_completed_overlay.set(false);
+                        lobby_view.set(false);
                         pending_confirmation.set(None);
                         local_dice_secret.borrow_mut().take();
                         interface_error.set(None);
@@ -7661,7 +7802,7 @@ mod browser {
                          * callbacks and initial request bind to its epoch and
                          * contract ID.
                          */
-                        reconnect.emit(event);
+                        reconnect.emit(());
                     }
 
                     Err(error) => {
@@ -7676,11 +7817,84 @@ mod browser {
             })
         };
 
+        let activation_connection_ready = matches!(&*connection_status, ConnectionStatus::Connected)
+            && *durable_registered
+            && *durable_registration_epoch.borrow() == Some(*transport_epoch.borrow())
+            && durable_delegate.borrow().is_some();
+        let transition_decision = match accepted_games.as_ref() {
+            Ok(games) => plan_game_transition(
+                game_transition_intent.as_ref(),
+                &active_game_scope_snapshot,
+                active_game_scope.borrow().accepted_game(),
+                games,
+                activation_connection_ready,
+            ),
+            Err(error) => Err(error.clone()),
+        };
+        {
+            let intent = game_transition_intent.clone();
+            let current_intent = current_transition_intent.clone();
+            let attempted = automatic_activation_attempted.clone();
+            let selected = selected_accepted_game_id.clone();
+            let activate = activate_accepted_game.clone();
+            use_effect_with(
+                ((*game_transition_intent).clone(), transition_decision.clone()),
+                move |(requested, decision)| {
+                    // A click can cancel/change intent before this render's
+                    // effect runs. Check the synchronously updated reference.
+                    if current_intent.borrow().as_ref() != requested.as_ref() {
+                        return no_op;
+                    }
+                    match decision {
+                        Ok(GameTransitionDecision::AlreadyActive | GameTransitionDecision::Superseded) => {
+                            current_intent.borrow_mut().take();
+                            intent.set(None);
+                        }
+                        Ok(GameTransitionDecision::Activate(game)) => {
+                            if attempted.borrow().as_ref() != requested.as_ref() {
+                                *attempted.borrow_mut() = requested.clone();
+                                activate.emit(game.clone());
+                            }
+                        }
+                        Ok(GameTransitionDecision::WaitingForConnection(game)
+                            | GameTransitionDecision::ManualActivationRequired(game)) => {
+                            selected.set(Some(game.game_id));
+                        }
+                        _ => {},
+                    }
+                    no_op
+                },
+            );
+        }
+        let on_activate_accepted_game: Callback<MouseEvent> = {
+            let selected = selected_for_activation.clone();
+            let activate = activate_accepted_game.clone();
+            let attempted = automatic_activation_attempted.clone();
+            let intent = (*game_transition_intent).clone();
+            let error = interface_error.clone();
+            Callback::from(move |_| match &selected {
+                Ok(Some(game)) => {
+                    *attempted.borrow_mut() = intent.clone();
+                    activate.emit(game.clone());
+                }
+                Ok(None) => error.set(Some("Select an accepted game first".to_owned())),
+                Err(problem) => error.set(Some(problem.clone())),
+            })
+        };
+
         let on_clear_accepted_game = {
             let selected_game_id = selected_accepted_game_id.clone();
             let activation_status = accepted_game_activation_status.clone();
+            let intent = game_transition_intent.clone();
+            let current_intent = current_transition_intent.clone();
+            let gate = activation_gate.clone();
+            let busy = activation_busy.clone();
 
             Callback::from(move |_| {
+                gate.borrow_mut().cancel();
+                busy.set(false);
+                current_intent.borrow_mut().take();
+                intent.set(None);
                 selected_game_id.set(None);
                 activation_status
                     .set("Selection cleared; active contract remains unchanged".to_owned());
@@ -7704,39 +7918,58 @@ mod browser {
                 let options = new_game_options.clone();
                 Callback::from(move |_| options.set(false))
             };
-            let new_opponent = {
-                let options = new_game_options.clone();
-                let suppress = suppress_completed_overlay.clone();
-                Callback::from(move |_| {
-                    options.set(false);
-                    suppress.set(true);
-                })
-            };
+            let new_opponent = on_return_to_lobby.clone();
             let rematch_buttons = rematch_target.map_or_else(|| html! {}, |(peer_id, peer_name, old_role)| {
                 let make_button = |proposed_role: Player, label: &'static str| {
                     let callback = on_challenge_player.clone();
                     let name = peer_name.clone();
-                    let options = new_game_options.clone();
-                    let suppress = suppress_completed_overlay.clone();
                     html! {
                         <button type="button" class="overlay-action"
                             disabled={
                                 *challenge_publication_pending
+                                    || !*challenge_recovery_checked
+                                    || !*durable_registered
+                                    || *activation_busy
+                                    || game_transition_intent.is_some()
                                     || (*local_player_id).is_none()
                                     || latest_lobby_contract_key.borrow().is_none()
                                     || freenet_api.borrow().is_none()
                             }
                             onclick={Callback::from(move |_| {
                                 callback.emit((peer_id, name.clone(), None, proposed_role));
-                                options.set(false);
-                                suppress.set(true);
                             })}>
                             {format!("{label} — you play {}", player_name(proposed_role))}
                         </button>
                     }
                 };
+                let incoming_rematches = incoming_challenges.iter()
+                    .filter(|challenge| challenge.challenger_id == peer_id)
+                    .collect::<Vec<_>>();
                 html! {
                     <>
+                        {if incoming_rematches.is_empty() { html! {} } else {
+                            html! {
+                                <div>
+                                    <p>{"Your opponent has already offered a new game. Accept an offer to join the same table."}</p>
+                                    {for incoming_rematches.iter().map(|challenge| {
+                                        let accept = on_accept_incoming_challenge.clone();
+                                        let offer = challenge.signed_offer.clone();
+                                        html! {
+                                            <button type="button" class="overlay-action"
+                                                disabled={*incoming_acceptance_pending
+                                                    || !*incoming_acceptance_recovery_checked
+                                                    || !*durable_registered
+                                                    || *challenge_publication_pending || *activation_busy}
+                                                onclick={Callback::from(move |_| accept.emit(offer.clone()))}>
+                                                {format!("Accept offer — you play {} · game {}…",
+                                                    player_name(challenge.recipient_role),
+                                                    &format_player_id(&challenge.game_id)[..8])}
+                                            </button>
+                                        }
+                                    })}
+                                </div>
+                            }
+                        }}
                         <p>{format!("Offer a new signed game to {}. Colors are fixed in the proposal before acceptance.", peer_name)}</p>
                         {make_button(old_role, "Rematch, same colors")}
                         {make_button(old_role.opponent(), "Switch colors")}
@@ -7815,17 +8048,17 @@ mod browser {
         let lobby_availability_label = if *lobby_presence_submission_pending {
             "Publishing"
         } else if *lobby_available {
-            "Accepting new challenges"
+            "Shown as available"
         } else {
-            "Not accepting new challenges"
+            "Not shown as available"
         };
 
         let lobby_availability_action = if *lobby_presence_submission_pending {
             "Publishing presence…"
         } else if *lobby_available {
-            "Stop accepting new challenges"
+            "Hide me from available players"
         } else {
-            "Accept new challenges"
+            "Show me as available"
         };
 
         let lobby_profile_controls_disabled = (*local_player_id).is_none()
@@ -7847,6 +8080,8 @@ mod browser {
             || !matches!(&*lobby_contract_status, LobbyContractStatus::Retrieved { .. });
 
         let challenge_controls_disabled = *challenge_publication_pending
+            || *activation_busy
+            || game_transition_intent.is_some()
             || !*challenge_recovery_checked
             || !*durable_registered
             || (*local_player_id).is_none()
@@ -7854,12 +8089,246 @@ mod browser {
             || freenet_api.borrow().is_none();
 
         let incoming_acceptance_controls_disabled = *incoming_acceptance_pending
+            || *activation_busy
             || !*incoming_acceptance_recovery_checked
             || !*durable_registered
             || *challenge_publication_pending
             || (*local_player_id).is_none()
             || (*authoritative_lobby_state).is_none()
             || freenet_api.borrow().is_none();
+
+        let transition_panel = if game_transition_intent.is_some() {
+            let message = if *activation_busy {
+                "Preparing your new game and confirming your participation.".to_owned()
+            } else {
+                match &transition_decision {
+                    Ok(GameTransitionDecision::WaitingForAcceptance) =>
+                        "Waiting for the signed challenge and acceptance to be confirmed.".to_owned(),
+                    Ok(GameTransitionDecision::WaitingForConnection(_)) =>
+                        "New game accepted. Waiting for your local Freenet connection to be ready.".to_owned(),
+                    Ok(GameTransitionDecision::ManualActivationRequired(_)) =>
+                        "New game accepted. Open it when you are ready to switch tables.".to_owned(),
+                    Ok(GameTransitionDecision::Activate(_)) =>
+                        (*accepted_game_activation_status).clone(),
+                    Err(error) => format!("New game could not be selected: {error}"),
+                    _ => "Opening the new game.".to_owned(),
+                }
+            };
+            let retry_game = match &transition_decision {
+                Ok(GameTransitionDecision::ManualActivationRequired(game))
+                    if !*activation_busy && activation_connection_ready => Some(game.clone()),
+                Ok(GameTransitionDecision::Activate(game))
+                    if !*activation_busy && activation_connection_ready
+                        && automatic_activation_attempted.borrow().as_ref()
+                            == game_transition_intent.as_ref() => Some(game.clone()),
+                _ => None,
+            };
+            let title = game_transition_intent.as_ref().and_then(|intent| {
+                let player_id = (*local_player_id)?;
+                let configuration = &intent.proposal.configuration;
+                let role = role_for_player_id(configuration, &player_id)?;
+                let peer = match role {
+                    Player::White => &configuration.black,
+                    Player::Black => &configuration.white,
+                };
+                Some(format!("New game with {} — you play {}", peer.display_name, player_name(role)))
+            }).unwrap_or_else(|| "Starting a new game".to_owned());
+            html! {
+                <section class="panel game-transition-panel" role="status" aria-live="polite">
+                    <h2>{title}</h2>
+                    <p>{message}</p>
+                    {retry_game.map_or_else(|| html! {}, |game| {
+                        let activate = activate_accepted_game.clone();
+                        html! { <button type="button" class="challenge-player-button"
+                            onclick={Callback::from(move |_| activate.emit(game.clone()))}>
+                            {"Open game"}
+                        </button> }
+                    })}
+                    {if connection_status.can_reconnect() {
+                        html! { <button type="button" class="challenge-player-button"
+                            onclick={on_reconnect.clone()}>{"Reconnect"}</button> }
+                    } else { html! {} }}
+                    <button type="button" class="challenge-player-button"
+                        onclick={on_return_to_lobby.clone()}>{"Return to lobby"}</button>
+                </section>
+            }
+        } else {
+            html! {}
+        };
+        let collapse_table = *lobby_view || (game_transition_intent.is_some()
+            && game_transition_intent.as_ref().is_some_and(|intent| intent.automatic));
+
+        let games_panel = if *lobby_view {
+            let show_current = {
+                let finished = finished_games_view.clone();
+                let older = older_games_visible.clone();
+                Callback::from(move |_| {
+                    older.set(0);
+                    finished.set(false);
+                })
+            };
+            let show_finished = {
+                let finished = finished_games_view.clone();
+                let older = older_games_visible.clone();
+                Callback::from(move |_| {
+                    older.set(0);
+                    finished.set(true);
+                })
+            };
+            let active_id = active_game_scope.borrow().accepted_game().map(|game| game.game_id);
+            html! {
+                <section class="panel lobby-games" aria-label="Your games">
+                    <div class="panel-heading-row">
+                        <h2>{"Your games"}</h2>
+                        <div class="game-list-tabs" role="group" aria-label="Game filter">
+                            <button type="button" aria-pressed={(!*finished_games_view).to_string()}
+                                onclick={show_current}>{"In progress"}</button>
+                            <button type="button" aria-pressed={(*finished_games_view).to_string()}
+                                onclick={show_finished}>{"Finished"}</button>
+                        </div>
+                    </div>
+                    {interface_error.as_ref().map_or_else(|| html! {}, |error| html! {
+                        <p class="interface-error" role="alert">{error}</p>
+                    })}
+                    {match &accepted_games {
+                        Err(error) => html! { <p class="interface-error" role="alert">{error}</p> },
+                        Ok(games) => {
+                            let mut entries = games.iter().filter(|game| {
+                                let section = classify_accepted_game(game.game_id, active_id,
+                                    *selected_accepted_game_id, outcome.is_some(),
+                                    accepted_game_activation_status.starts_with("Activation refused:"),
+                                    inspected_game_statuses.get(&game.game_id));
+                                (section == AcceptedGameSection::CompletedArchive) == *finished_games_view
+                            }).collect::<Vec<_>>();
+                            // Keep the active table visible even when it is older than this page.
+                            entries.sort_by_key(|game| active_id != Some(game.game_id));
+                            let total = entries.len();
+                            let active_visible = !*finished_games_view && entries.iter()
+                                .any(|game| active_id == Some(game.game_id));
+                            let initial_limit: usize = if *finished_games_view { 10 } else {
+                                5 + usize::from(active_visible)
+                            };
+                            let visible_count = total.min(initial_limit.saturating_add(*older_games_visible));
+                            let show_older = {
+                                let older = older_games_visible.clone();
+                                Callback::from(move |_| older.set((*older).saturating_add(10)))
+                            };
+                            let show_less = {
+                                let older = older_games_visible.clone();
+                                Callback::from(move |_| older.set(0))
+                            };
+                            if entries.is_empty() {
+                                html! { <p class="lobby-empty-state">{
+                                    if *finished_games_view { "No finished games yet." }
+                                    else { "Accept an invitation or challenge an available player to start a game." }
+                                }</p> }
+                            } else {
+                                html! { <>
+                                    <div class="game-card-list">{for entries.into_iter().take(visible_count).map(|game| {
+                                    let peer = match game.local_role {
+                                        Player::White => &game.accepted_proposal.configuration.black,
+                                        Player::Black => &game.accepted_proposal.configuration.white,
+                                    };
+                                    let selected = game.clone();
+                                    let activate = activate_accepted_game.clone();
+                                    let view_table = on_view_table.clone();
+                                    let is_active = active_id == Some(game.game_id);
+                                    let open_game = Callback::from(move |event: MouseEvent| {
+                                        if is_active { view_table.emit(event); }
+                                        else { activate.emit(selected.clone()); }
+                                    });
+                                    let finished = *finished_games_view;
+                                    let status = if finished { "Finished" }
+                                        else if is_active { "At your table" }
+                                        else { match inspected_game_statuses.get(&game.game_id) {
+                                            Some(InspectedGameStatus::Empty) => "Ready to start",
+                                            Some(InspectedGameStatus::InProgress) => "In progress",
+                                            Some(InspectedGameStatus::MissingContract)
+                                                | Some(InspectedGameStatus::Failed(_)) => "Could not load game; try opening it again",
+                                            _ => "Not yet checked",
+                                        }};
+                                    let rematch = on_challenge_player.clone();
+                                    let target = (peer.id, peer.display_name.clone(), None, game.local_role);
+                                    let play_again = Callback::from(move |_| rematch.emit(target.clone()));
+                                    html! {
+                                        <article class="game-card" key={format_player_id(&game.game_id)}>
+                                            <div>
+                                                <h3>{format!("You vs {}", peer.display_name)}</h3>
+                                                <p>{format!("{} · You play {}", status, player_name(game.local_role))}</p>
+                                                <p class="panel-note">{format!("Started {}", offered_time(game.offered_at_unix_seconds))}</p>
+                                                {if is_active && !finished { html! { <p>{turn_text.clone()}</p> } }
+                                                    else { html! {} }}
+                                            </div>
+                                            <div class="game-card-actions">
+                                                {if finished { html! {
+                                                    <button type="button" class="challenge-player-button"
+                                                        disabled={challenge_controls_disabled}
+                                                        onclick={play_again}>{"Play again, same player"}</button>
+                                                }} else { html! {} }}
+                                                <button type="button" class="challenge-player-button"
+                                                    disabled={*activation_busy || game_transition_intent.is_some()
+                                                        || !activation_connection_ready}
+                                                    onclick={open_game}>{if finished { "View result" }
+                                                        else if is_active { "Resume" }
+                                                        else if inspected_game_statuses.get(&game.game_id)
+                                                            == Some(&InspectedGameStatus::Empty) { "Start game" }
+                                                        else { "Resume" }}</button>
+                                            </div>
+                                        </article>
+                                    }
+                                })}</div>
+                                    <div class="lobby-inline-actions">
+                                        <span class="panel-note">{format!("Showing {} of {} games", visible_count, total)}</span>
+                                        {if visible_count < total { html! {
+                                            <button type="button" onclick={show_older}>
+                                                {format!("View older games ({})", total - visible_count)}
+                                            </button>
+                                        }} else { html! {} }}
+                                        {if *older_games_visible > 0 { html! {
+                                            <button type="button" onclick={show_less}>{"Show fewer games"}</button>
+                                        }} else { html! {} }}
+                                    </div>
+                                </> }
+                            }
+                        },
+                    }}
+                </section>
+            }
+        } else { html! {} };
+
+        let pending_board_message = {
+            let scope = active_game_scope.borrow();
+            match scope.accepted_game() {
+                None => "The board becomes playable after a verified CreateGame action appears in this contract.".to_owned(),
+                Some(accepted) => {
+                    let peer = match accepted.local_role {
+                        Player::White => &accepted.accepted_proposal.configuration.black,
+                        Player::Black => &accepted.accepted_proposal.configuration.white,
+                    };
+                    let evidence = (*authoritative_lobby_state).as_ref().and_then(|state| {
+                        state.challenges.offers.iter().find(|offer| {
+                            offer.offer.body.proposal == accepted.accepted_proposal
+                                && offer.verify().is_ok()
+                        })
+                    });
+                    let (local_joined, peer_joined) = evidence.map_or((false, false), |offer| {
+                        let joined = |role| offer.terminal_evidence.iter().any(|evidence| {
+                            matches!((role, evidence),
+                                (Player::White, backgammon_protocol::ChallengeTerminalEvidence::WhiteGenesisShare(_))
+                                | (Player::Black, backgammon_protocol::ChallengeTerminalEvidence::BlackGenesisShare(_)))
+                        });
+                        (joined(accepted.local_role), joined(accepted.local_role.opponent()))
+                    });
+                    if local_joined && peer_joined {
+                        "Both players have joined. Verifying the new board.".to_owned()
+                    } else if local_joined {
+                        format!("Waiting for {} to join this game. The board will open automatically when they join.", peer.display_name)
+                    } else {
+                        "Confirming your participation in this game. The board will open automatically after both players join.".to_owned()
+                    }
+                }
+            }
+        };
 
         html! {
             <main class="app-shell">
@@ -7881,14 +8350,14 @@ mod browser {
                     </div>
                 </header>
 
+                {games_panel}
+
                 <section
-                    class="lobby-strip"
+                    class={classes!("lobby-strip", (!*lobby_view).then_some("lobby-hidden"))}
                     aria-label="Multiplayer lobby"
                 >
-                    <section
-                        class="panel lobby-panel lobby-profile-panel"
-                        aria-labelledby="lobby-profile-heading"
-                    >
+                    <details class="panel lobby-panel lobby-profile-panel">
+                        <summary>{"Your profile"}</summary>
                         <div class="panel-heading-row">
                             <h2 id="lobby-profile-heading">
                                 { "Lobby profile" }
@@ -7944,7 +8413,7 @@ mod browser {
                                 },
                             )
                         }
-                    </section>
+                    </details>
 
                     <section
                         class="panel lobby-panel lobby-availability-panel"
@@ -7967,7 +8436,7 @@ mod browser {
 
                         <p class="panel-note">
                             {
-                                "This setting controls discovery by new opponents. It does not affect an established game or the local node connection."
+                                "Let other players find you. You can view and accept invitations even when you are not shown as available."
                             }
                         </p>
 
@@ -7983,6 +8452,19 @@ mod browser {
                         >
                             { lobby_availability_action }
                         </button>
+                        <button
+                            type="button"
+                            class="availability-control"
+                            aria-controls="incoming-challenges-panel"
+                            aria-expanded={(*invitations_view || !incoming_challenges.is_empty()
+                                || incoming_acceptance_error.is_some() || *incoming_acceptance_pending).to_string()}
+                            onclick={{
+                                let invitations_view = invitations_view.clone();
+                                Callback::from(move |_| invitations_view.set(true))
+                            }}
+                        >
+                            { format!("View new challenges ({})", incoming_challenges.len()) }
+                        </button>
                     </section>
 
                     <section
@@ -7991,7 +8473,7 @@ mod browser {
                     >
                         <div class="panel-heading-row">
                             <h2 id="available-players-heading">
-                                { "Available players" }
+                                { "Players" }
                             </h2>
 
                             <span class="history-count">
@@ -7999,9 +8481,10 @@ mod browser {
                             </span>
                         </div>
 
-                        <p class="panel-note" role="status">
-                            { lobby_network_detail }
-                        </p>
+                        <details class="lobby-network-details">
+                            <summary>{"Lobby connection"}</summary>
+                            <p class="panel-note">{ lobby_network_detail }</p>
+                        </details>
 
                         <p
                             class="challenge-publication-status"
@@ -8065,13 +8548,9 @@ mod browser {
                                                                 }
                                                             </strong>
 
-                                                            <span>
-                                                                {
-                                                                    format_player_id(
-                                                                        &player.player_id
-                                                                    )
-                                                                }
-                                                            </span>
+                                                            <details><summary>{"Player ID"}</summary>
+                                                                {format_player_id(&player.player_id)}
+                                                            </details>
 
                                                             <button
                                                                 type="button"
@@ -8101,12 +8580,15 @@ mod browser {
                     </section>
 
                     <section
+                        id="incoming-challenges-panel"
                         class="panel lobby-panel lobby-incoming-panel"
+                        hidden={!*invitations_view && incoming_challenges.is_empty()
+                            && incoming_acceptance_error.is_none() && !*incoming_acceptance_pending}
                         aria-labelledby="incoming-challenges-heading"
                     >
                         <div class="panel-heading-row">
                             <h2 id="incoming-challenges-heading">
-                                { "Incoming challenges" }
+                                { "Invitations" }
                             </h2>
 
                             <span class="history-count">
@@ -8209,6 +8691,8 @@ mod browser {
                                                                 </span>
                                                             </div>
 
+                                                            <details>
+                                                                <summary>{"Invitation details"}</summary>
                                                             <dl
                                                                 class="incoming-challenge-details"
                                                             >
@@ -8254,6 +8738,7 @@ mod browser {
                                                                     </dd>
                                                                 </div>
                                                             </dl>
+                                                            </details>
 
                                                             <button
                                                                 type="button"
@@ -8283,7 +8768,8 @@ mod browser {
                     </section>
                 </section>
 
-                <section class="game-layout">
+                {transition_panel}
+                <section class={classes!("game-layout", collapse_table.then_some("lobby-view"))}>
                     <aside class="left-rail">
                         <PlayerPanel
                             player={Player::Black}
@@ -8343,7 +8829,6 @@ mod browser {
                             can_roll={can_roll}
                             can_pass={can_pass}
                             can_resign={can_resign}
-                            can_leave={!left_table}
                             can_reconnect={connection_status.can_reconnect()}
                             status_note={control_note}
                             on_roll={on_roll}
@@ -8371,8 +8856,12 @@ mod browser {
                             } else {
                                 html! {
                                     <div class="panel" role="status">
-                                        <h2>{"Waiting for authoritative game creation"}</h2>
-                                        <p>{"The board becomes playable after a verified CreateGame action appears in this contract."}</p>
+                                        <h2>{if active_game_scope.borrow().accepted_game().is_some() {
+                                            "Preparing your new game"
+                                        } else {
+                                            "Waiting for authoritative game creation"
+                                        }}</h2>
+                                        <p>{pending_board_message}</p>
                                     </div>
                                 }
                             }
@@ -8380,8 +8869,15 @@ mod browser {
                     </section>
 
                     <aside class="right-rail">
-                        <MoveHistory history={visible_history} />
+                        {if collapse_table { html! {} } else {
+                            html! { <MoveHistory history={visible_history} /> }
+                        }}
 
+                    </aside>
+                </section>
+
+                <details class="connection-details">
+                    <summary>{"Connection details"}</summary>
                         <section class="panel status-panel" aria-labelledby="status-heading" tabindex="0">
                             <h2 id="status-heading">{ "Connection" }</h2>
 
@@ -8428,7 +8924,8 @@ mod browser {
                                                                 on_activate_accepted_game.clone()
                                                             }
                                                             disabled={
-                                                                selected_game_is_active
+                                                                selected_game_is_active || *activation_busy
+                                                                    || !activation_connection_ready
                                                             }
                                                         >
                                                             {
@@ -8555,7 +9052,15 @@ mod browser {
                                                                                     let on_select = {
                                                                                         let selected = selected_accepted_game_id.clone();
                                                                                         let activation_status = accepted_game_activation_status.clone();
+                                                                                        let intent = game_transition_intent.clone();
+                                                                                        let current_intent = current_transition_intent.clone();
+                                                                                        let gate = activation_gate.clone();
+                                                                                        let busy = activation_busy.clone();
                                                                                         Callback::from(move |_| {
+                                                                                            gate.borrow_mut().cancel();
+                                                                                            busy.set(false);
+                                                                                            current_intent.borrow_mut().take();
+                                                                                            intent.set(None);
                                                                                             selected.set(Some(game_id));
                                                                                             activation_status.set("Accepted game selected for inspection or activation".to_owned());
                                                                                         })
@@ -8708,8 +9213,7 @@ mod browser {
                                 </div>
                             </dl>
                         </section>
-                    </aside>
-                </section>
+                </details>
 
                 { terminal_overlay }
                 { confirmation_overlay }

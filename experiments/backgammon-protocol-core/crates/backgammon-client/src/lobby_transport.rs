@@ -14,9 +14,8 @@ use crate::lobby_codec::decode_verified_lobby_state;
 #[cfg(target_arch = "wasm32")]
 use crate::transport::SubscriptionStatus;
 
-/// Fresh genesis-share-capable lobby published for the September 2026
-/// two-node acceptance game.
-pub const LOBBY_CONTRACT_ID: &str = "2bEh8hDrjQvoGs3dK5WiYezd1BdYgZTbNmZskvFTPwHa";
+/// Empty lobby published on October 6, 2026 for the fresh-player test.
+pub const LOBBY_CONTRACT_ID: &str = "5zrqJg6wYXvgD7ifJW3B5JDkQ9MSb4zPi3cb38PamqQv";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LobbyContractStatus {
@@ -368,7 +367,7 @@ mod tests {
     fn published_lobby_contract_id_is_stable() {
         assert_eq!(
             LOBBY_CONTRACT_ID,
-            "2bEh8hDrjQvoGs3dK5WiYezd1BdYgZTbNmZskvFTPwHa"
+            "5zrqJg6wYXvgD7ifJW3B5JDkQ9MSb4zPi3cb38PamqQv"
         );
     }
 

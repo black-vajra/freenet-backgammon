@@ -137,9 +137,40 @@ pub struct ClassifiedResponse {
     pub authoritative_state: Option<Vec<u8>>,
 }
 
+/// Published apps use their serving node, including its port and TLS scheme.
+/// The local Trunk development page still connects to the local node on 7509.
+fn node_url_for_page(protocol: &str, host: &str, pathname: &str) -> Result<String, String> {
+    let scheme = match protocol {
+        "http:" => "ws",
+        "https:" => "wss",
+        _ => return Err("Open Backgammon through a Freenet HTTP or HTTPS page.".to_owned()),
+    };
+    if host.is_empty() {
+        return Err("Could not determine the Freenet node serving this page.".to_owned());
+    }
+    if pathname.starts_with("/v1/contract/web/") {
+        return Ok(format!("{scheme}://{host}/v1/contract/command?encodingProtocol=native"));
+    }
+    if protocol == "http:" && matches!(host, "127.0.0.1:8081" | "localhost:8081") {
+        return Ok("ws://127.0.0.1:7509/v1/contract/command?encodingProtocol=native".to_owned());
+    }
+    Err("Open Backgammon through its Freenet website address.".to_owned())
+}
+
 #[cfg(target_arch = "wasm32")]
-pub const DEFAULT_NODE_URL: &str =
-    "ws://127.0.0.1:7509/v1/contract/command?encodingProtocol=native";
+fn serving_node_url() -> Result<String, String> {
+    use wasm_bindgen::JsValue;
+    let window = web_sys::window().ok_or_else(|| "Browser window unavailable.".to_owned())?;
+    // Read the iframe's own URL, not its opaque security origin or parent.
+    let location = js_sys::Reflect::get(window.as_ref(), &JsValue::from_str("location"))
+        .map_err(|_| "Could not read this page's location.".to_owned())?;
+    let read = |name: &str| -> Result<String, String> {
+        js_sys::Reflect::get(&location, &JsValue::from_str(name))
+            .ok().and_then(|value| value.as_string())
+            .ok_or_else(|| format!("Could not read page location {name}."))
+    };
+    node_url_for_page(&read("protocol")?, &read("host")?, &read("pathname")?)
+}
 
 #[cfg(target_arch = "wasm32")]
 pub const TEST_CONTRACT_ID: &str = "2mb2afETZnqqGEeS9yENKGJ5fmom1n3eGw7b4qDq5eDR";
@@ -155,8 +186,9 @@ pub fn connect(
 
     status_handler(ConnectionStatus::Connecting);
 
-    let websocket = web_sys::WebSocket::new(DEFAULT_NODE_URL).map_err(|error| {
-        format!("Could not create the Freenet WebSocket for {DEFAULT_NODE_URL}: {error:?}")
+    let node_url = serving_node_url()?;
+    let websocket = web_sys::WebSocket::new(&node_url).map_err(|error| {
+        format!("Could not create the Freenet WebSocket: {error:?}")
     })?;
 
     let open_status = status_handler.clone();
@@ -443,5 +475,38 @@ mod tests {
         assert_eq!(FIRST_CREATE_DELTA_CBOR.len(), 732);
         assert_eq!(EXPECTED_ONE_ACTION_STATE_CBOR.len(), 732);
         assert_eq!(FIRST_CREATE_DELTA_CBOR, EXPECTED_ONE_ACTION_STATE_CBOR);
+    }
+}
+
+#[cfg(test)]
+mod serving_node_tests {
+    use super::node_url_for_page;
+
+    #[test]
+    fn published_pages_use_the_serving_node_and_port() {
+        for host in ["127.0.0.1:7509", "127.0.0.1:7510", "192.168.0.117:7509", "[::1]:7510"] {
+            assert_eq!(node_url_for_page("http:", host, "/v1/contract/web/test/").unwrap(),
+                format!("ws://{host}/v1/contract/command?encodingProtocol=native"));
+        }
+    }
+
+    #[test]
+    fn remote_https_uses_secure_websocket() {
+        assert_eq!(node_url_for_page("https:", "node.example:8443", "/v1/contract/web/test/").unwrap(),
+            "wss://node.example:8443/v1/contract/command?encodingProtocol=native");
+    }
+
+    #[test]
+    fn local_development_keeps_its_separate_node_port() {
+        assert_eq!(node_url_for_page("http:", "127.0.0.1:8081", "/").unwrap(),
+            "ws://127.0.0.1:7509/v1/contract/command?encodingProtocol=native");
+    }
+
+    #[test]
+    fn unsupported_pages_fail_without_selecting_another_node() {
+        for (protocol, host, path) in [("file:", "", "/"), ("https:", "", "/v1/contract/web/test/"),
+            ("https:", "other.example", "/")] {
+            assert!(node_url_for_page(protocol, host, path).is_err());
+        }
     }
 }

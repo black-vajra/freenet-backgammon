@@ -1252,3 +1252,43 @@ h2 {
         flex-direction: column;
     }
 }
+
+/* Lobby navigation keeps accepted-game history visible while closing the table. */
+.game-layout.lobby-view {
+    grid-template-columns: minmax(0, 1fr);
+}
+
+.game-layout.lobby-view > .left-rail,
+.game-layout.lobby-view > .board-stage {
+    display: none;
+}
+
+.game-transition-panel {
+    margin-block: 1rem;
+}
+
+.game-transition-panel button + button {
+    margin-inline-start: 0.5rem;
+}
+
+.game-layout.lobby-view > .right-rail {
+    grid-column: auto;
+    grid-template-columns: minmax(0, 1fr);
+}
+
+/* Player navigation is separate from the verified game and its diagnostics. */
+.game-layout.lobby-view, .lobby-strip.lobby-hidden { display: none; }
+.lobby-games { margin-block: 1rem; }
+.game-list-tabs, .game-card-actions { display: flex; gap: .6rem; flex-wrap: wrap; }
+.game-list-tabs button[aria-pressed="true"] { background: var(--accent, #b77d43); color: white; }
+.game-card-list { display: grid; gap: .75rem; margin-top: 1rem; }
+.game-card { display: flex; align-items: center; justify-content: space-between;
+    gap: 1rem; padding: 1rem; border: 1px solid rgba(160, 130, 100, .35); border-radius: .65rem; }
+.game-card h3 { margin: 0 0 .35rem; }
+.game-card p { margin: 0; }
+.connection-details { margin-block: 1rem; }
+.connection-details > summary, .lobby-profile-panel > summary { cursor: pointer; padding: .75rem; }
+.connection-details .status-panel { margin-top: .5rem; }
+@media (max-width: 640px) {
+    .game-card { align-items: flex-start; flex-direction: column; }
+}
