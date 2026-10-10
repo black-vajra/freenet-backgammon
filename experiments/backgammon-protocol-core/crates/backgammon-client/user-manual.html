@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Freenet Backgammon — User manual</title>
+<style>
+body{margin:0;padding:clamp(1rem,4vw,3rem);background:#170e09;font:1rem system-ui,sans-serif;color:#f8efdc;}
+.user-manual{max-width:90ch;margin:auto;}
+/* BEGIN BACKGAMMON USER MANUAL */
+.manual-widget { margin: 0 0 1.25rem; }
+.manual-toggle { padding: .55rem 1rem; }
+.user-manual[hidden] { display: none !important; }
+.user-manual { margin-top: .75rem; padding: clamp(1rem, 2vw, 1.5rem); color: #f8efdc; background: #291a12; border: 1px solid #87603d; border-radius: .8rem; }
+.user-manual .manual-heading-row, .user-manual .manual-footer { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: .75rem; }
+.user-manual .manual-heading-row h2 { font-family: Georgia, serif; font-size: clamp(1.2rem, 3vw, 1.65rem); line-height: 1.3; letter-spacing: normal; }
+.user-manual button { padding: .55rem .9rem; }
+.user-manual .manual-body { max-height: 65vh; overflow-y: auto; overscroll-behavior: contain; margin: 1rem 0; padding: .25rem .8rem .75rem .25rem; scrollbar-gutter: stable; line-height: 1.65; overflow-wrap: anywhere; }
+.user-manual .manual-body > * { max-width: 78ch; margin-left: auto; margin-right: auto; }
+.user-manual h3 { margin: 1.8rem 0 .65rem; font-size: 1.2rem; line-height: 1.35; color: #ebc88d; }
+.user-manual p { margin: .7rem 0; }
+.user-manual li { margin: .7rem 0; padding-left: .2rem; }
+.user-manual ol { padding-left: 1.6rem; }
+.user-manual dt { margin-top: 1rem; font-weight: 800; color: #ebc88d; }
+.user-manual dd { margin: .3rem 0 0; }
+.user-manual a { color: #f0ca85; text-decoration: underline; text-underline-offset: .2em; }
+.user-manual .manual-contents { display: flex; flex-wrap: wrap; gap: .5rem 1.2rem; padding: .8rem 0; border-bottom: 1px solid #87603d; }
+.user-manual .manual-callout { padding: .9rem 1rem; border-left: 4px solid #e1b56c; background: #3a281b; }
+.user-manual .manual-version { font-size: .85rem; color: #d7c4a4; }
+.user-manual code { font-size: .95em; }
+.user-manual section { scroll-margin-top: .5rem; }
+.user-manual :focus-visible, .manual-toggle:focus-visible { outline: 3px solid #f0ca85; outline-offset: 3px; }
+@media (max-width: 600px) {
+  .user-manual .manual-body { max-height: 70vh; padding-right: .35rem; }
+  .user-manual .manual-heading-row { align-items: flex-start; }
+}
+@media print {
+  .user-manual .manual-body { max-height: none; overflow: visible; }
+  .user-manual { color: #111; background: white; border: 0; }
+  .user-manual h3, .user-manual dt, .user-manual a, .user-manual .manual-version { color: #111; }
+  .user-manual .manual-callout { background: #eee; }
+  .user-manual button, .user-manual .manual-footer, .manual-toggle { display: none; }
+}
+/* END BACKGAMMON USER MANUAL */
+.user-manual .manual-body{max-height:none;overflow:visible;}
+</style></head><body>
+<main class="user-manual"><h1>Freenet Backgammon — User manual</h1>
+<p>Use your browser’s Print command to print or save this guide. Return to the game tab to keep playing.</p>
+<div class="manual-body">
+<p class="manual-intro">A real opponent, a shared table, and verifiable dice. This guide takes you from arranging a game to finishing it, and explains what to do when Freenet takes its time.</p>
+<nav aria-label="Manual contents" class="manual-contents">
+  <a href="#manual-start">Start a game</a>
+  <a href="#manual-lobby">Lobby guide</a>
+  <a href="#manual-archive">Archive unwanted games</a>
+  <a href="#manual-activity">Activity during play</a>
+  <a href="#manual-board">Board and controls</a>
+  <a href="#manual-rules">Rules</a>
+  <a href="#manual-delays">Stale game or missing roll</a>
+  <a href="#manual-finish">Finish and play again</a>
+  <a href="#manual-privacy">Identity and privacy</a>
+</nav>
+
+<section id="manual-start">
+  <h3>How to start a game</h3>
+  <p><strong>Arrange to meet another player first.</strong> This version is multiplayer network play; it does not supply a computer opponent. A name in the lobby does not guarantee that its owner is watching the page right now.</p>
+  <ol>
+    <li><strong>Coordinate outside the game.</strong> Send a direct message on River, or use another channel you both prefer. Agree when to play, exchange your public display names, and decide who will send the challenge. For example: “Ready for backgammon? I’m Dada in the lobby. Open the Backgammon site through your Freenet node, show yourself as available, and I’ll challenge you.” Chat is currently outside this application.</li>
+    <li><strong>Both open the same Backgammon publication through your own working Freenet nodes.</strong> Keep the page open throughout play, including your opponent’s turn: your client participates in the dice exchange. A link beginning with <code>127.0.0.1</code> refers to the machine opening it. Your opponent must use their own node’s address and port with the same website contract, rather than trying to connect to your localhost.</li>
+    <li><strong>Wait for your identity and lobby to load.</strong> Check the connection badge. Expand <strong>Your profile</strong>, enter a <strong>Public display name</strong>, click <strong>Save name</strong>, and wait for confirmation. If you are already available and the name field is disabled, hide your availability before editing it.</li>
+    <li><strong>Click Show me as available.</strong> Wait for publishing to finish. The player who receives the challenge needs to appear in the challenger’s <strong>Players</strong> list. Both showing availability makes finding one another easier. If you cannot see the expected name yet, allow time for the lobby update to arrive.</li>
+    <li><strong>One player clicks Challenge beside the agreed opponent.</strong> Send one offer and wait for its status to settle. Use the <strong>Play as</strong> selector beside that opponent’s Challenge button to choose White or Black for yourself. The invitation assigns your opponent the other color; White still takes the first turn. Confirm the colors and names displayed in the invitation; names alone are not unique identities.</li>
+    <li><strong>The other player finds the incoming offer in the challenger’s Players row (or Invitations if that player is not advertised as available) and clicks Accept — play White/Black</strong> on the correct invitation. Check the opponent, colors, and game information first. Acceptance can remain pending while the signed records travel through the network. An unanswered invitation can expire; if it does, coordinate before sending a replacement.</li>
+    <li><strong>Both join the same accepted game.</strong> The page normally starts opening it after acceptance. If it remains in <strong>Your games → In progress</strong>, use its <strong>Start game</strong> or <strong>Resume</strong> button. If the preparation panel offers <strong>Open game</strong>, use that to retry the existing game. Connection details may also offer <strong>Activate game</strong> or <strong>Resume game</strong>. Do not send a new challenge just because the accepted board has not appeared.</li>
+    <li><strong>Wait for the board to load on both sides.</strong> “Preparing your new game,” “Confirming your participation,” and “Waiting for … to join” mean the table is not ready yet. Both clients must join and verify the starting game. Tell each other when the actual board appears. If you have several records with the same opponent, compare the game ID in <strong>Connection details</strong> to make sure you opened the same one.</li>
+    <li><strong>White begins.</strong> This build starts with White to roll; there is no separate opening roll-off. White clicks <strong>Roll</strong> when enabled and waits for the verified dice. Black keeps the page open. If the dice hesitate, follow the recovery steps below.</li>
+  </ol>
+  <p class="manual-callout">An accepted invitation is not yet a fully loaded table. You are ready to play when both players have opened the same game, the board is visible, and the Turn panel indicates who should roll.</p>
+</section>
+
+<section id="manual-lobby">
+  <h3>What the lobby areas mean</h3>
+  <dl>
+    <dt>Your games</dt><dd>Your accepted games. <strong>In progress</strong> contains unfinished tables; <strong>Finished</strong> contains recorded results. <strong>Start game</strong> opens an unstarted table; <strong>Resume</strong> opens an existing one; <strong>View result</strong> opens a completed game. <strong>View older games</strong> and <strong>Show fewer games</strong> expand or shorten the list when offered. Be careful to choose the intended table if an opponent appears more than once.</dd>
+    <dt>Your profile</dt><dd>A collapsible area containing your public name and an abbreviated identity. <strong>Save name</strong> records your chosen name. A name is a label; the cryptographic identity distinguishes players. No email registration is needed.</dd>
+    <dt>Availability</dt><dd><strong>Show me as available</strong> advertises that you want an opponent. <strong>Hide me from available players</strong> withdraws that advertisement. Hiding does not resign a game. Availability is temporary and can lag across nodes; it is not proof that someone is online. You can still view and accept invitations while hidden.</dd>
+    <dt>Players</dt><dd>The currently loaded, verified availability list, with a <strong>Challenge</strong> button beside each opponent. The count is the number your client currently sees. An empty list can mean nobody is available, or that lobby records have not arrived. Expand <strong>Lobby connection</strong> to inspect its status. Publication messages here tell you whether your challenge is still pending or failed.</dd>
+    <dt>Invitations</dt><dd>Incoming challenges addressed to your identity appear once: in the challenger’s <strong>Players</strong> row if that player is advertised as available, otherwise in the separate <strong>Invitations</strong> panel. <strong>View invitation details</strong> expands the details in the player rows; each offer also has its own expandable details. Verify the offer details before accepting. The challenger has already fixed the colors: the invitation says who challenged you and which color you will play. Use <strong>Accept — play White/Black</strong> to join, or <strong>Decline</strong> to send a signed refusal. A decline remains pending until verified lobby evidence arrives; if it is delayed, use <strong>Retry decline</strong>. The same opponent’s Players row shows these fixed-color actions while their invitation is open. Other opponents keep their own <strong>Play as</strong> selector and <strong>Challenge</strong> button. After refusal is confirmed or the offer expires, the normal controls return for that opponent.</dd>
+    <dt>Game preparation</dt><dd>The panel that appears while a challenge is being accepted and the table is opening. It reports whose participation or connection is still needed. <strong>Open game</strong> retries joining the accepted table when offered. <strong>Return to lobby</strong> lets you navigate back.</dd>
+    <dt>Connection badge and Connection details</dt><dd>The badge describes your client’s connection to its local node, not guaranteed delivery to your opponent. The expandable details at the bottom show selected game, activation, participation exchange, player ID, delegate/recovery status, node WebSocket address, game and lobby retrieval/subscriptions, state checks, latest verified action, and ledger hash. You normally do not need to operate these diagnostic fields. The accepted-game list here also has <strong>Select / inspect</strong> and buttons to copy game and contract IDs.</dd>
+  </dl>
+  <p>Keep your computer’s date and time correct: availability and invitation expiry depend on the clock. If a control is disabled, read the nearby status text before trying again. This guide describes the existing single-game flow. Match formats, doubling-cube play, spectators, and in-game chat are not instructions for features available in this build.</p>
+</section>
+
+<section id="manual-archive">
+  <h3>Archive abandoned or unwanted games</h3>
+  <p>In <strong>Your games</strong>, click <strong>Move to archive</strong> beside an unwanted table. You can do this from In progress, Finished, or Hidden games. It removes the table from all three lists and places it in the separate, collapsed <strong>Archive (count)</strong> section below them.</p>
+  <p>Expand <strong>Archive</strong> to see its tables. Click <strong>Restore</strong> to return a table to the ordinary In progress or Finished list, according to its verified state. Restoring does not start a new game. Use Resume, Start game, or View result from that list as appropriate. Older archive entries can be expanded in groups; closing Archive collapses them again.</p>
+  <p><strong>Hide game</strong> still moves a table into Hidden games; Move to archive gets it out of Hidden too. Existing hidden entries are preserved. Neither action resigns, cancels, deletes the shared record, or changes your opponent’s list. Coordinate a break or abandonment with your opponent; an archived table is not automatically a completed game.</p>
+  <p>These preferences are saved privately for your identity on this Freenet node. Wait for saving to finish. Reloading should retain them when the same node and identity recover; another node does not automatically share the preferences. If private storage is unavailable, the controls stay disabled and an error or loading message explains why.</p>
+</section>
+
+<section id="manual-activity">
+  <h3>Lobby activity while you are playing</h3>
+  <p>The <strong>Lobby activity</strong> strip above the table shows players currently advertised as available and invitations addressed to you. These are your node’s verified lobby records; they can arrive late and do not prove that another player is watching their page.</p>
+  <p>Click <strong>View invitations</strong> to read offers without leaving your board. Check the challenger’s identity, fixed colors, and game ID before accepting; you can also decline from this view. While an unfinished game is open, accepting another invitation prepares the new table without switching you away from the current game. A notice and <strong>Open accepted game</strong> appear when the signed acceptance is confirmed. That button explicitly switches tables, so finish any partly selected turn before opening the other game. <strong>Hide invitations</strong> collapses the offers while the board stays visible.</p>
+  <p>A winner of either color receives the victory display. If your browser prefers reduced motion, the streamers are stationary. The losing player receives the ordinary result banner.</p>
+</section>
+
+<section id="manual-board">
+  <h3>The board and how to use it</h3>
+  <p>The table has 24 numbered triangular points, two sets of 15 checkers, a central <strong>bar</strong> for hit checkers, and two <strong>OFF</strong> trays at the right edge. Player panels identify the White and Black sides, whose turn is active, and how many checkers are on the bar or borne off. Use the labels and Turn panel to identify your side.</p>
+  <p><strong>White moves toward higher point numbers, from 1 toward 24.</strong> White’s home board is points 19–24. <strong>Black moves toward lower numbers, from 24 toward 1.</strong> Black’s home board is points 1–6. The standard setup is White: 2 on 1, 5 on 12, 3 on 17, 5 on 19; Black: 2 on 24, 5 on 13, 3 on 8, 5 on 6.</p>
+  <ol>
+    <li>Read <strong>Turn</strong>. When it is your turn and <strong>Roll</strong> is enabled, click it once. Wait for the <strong>Current verified roll</strong> in the Dice panel. Dashes or “Awaiting roll” are not usable dice.</li>
+    <li><strong>Click one of your selectable checkers.</strong> Legal destinations are highlighted. Click the highlighted destination point’s triangle to move there. This is a click-to-select, click-to-move interface; you do not need to drag a checker. To choose another source before moving, click another selectable checker.</li>
+    <li>Repeat using the remaining dice. The Dice panel lists the values still available; doubles provide four uses of the same value. The engine restricts choices to legal complete turns, including mandatory dice use.</li>
+    <li>If you have a checker on the bar, select that checker first and click a highlighted entry point. You cannot move other checkers until all your bar checkers have entered.</li>
+    <li>When bearing off is legal, select a checker and click your highlighted <strong>OFF</strong> tray: White at the lower right, Black at the upper right.</li>
+    <li>After you complete the required moves, the client submits the turn automatically. There is no separate “Submit moves” button. Wait for confirmation before continuing. A <strong>Local move preview — awaiting authoritative confirmation</strong> is provisional; a checker moving on your screen does not by itself prove that your opponent has received the turn.</li>
+  </ol>
+  <p><strong>Move history</strong> lists completed turns and dice. A notation such as “point 12 +3” means a move from point 12 using a three; the plus sign describes the die used, not necessarily increasing point numbers. Black moves toward decreasing numbers.</p>
+  <dl>
+    <dt>Roll</dt><dd>Requests the next fair roll when it is your turn and the verified game is ready. Both clients automatically contribute to the dice exchange; your opponent does not need to click Roll for your turn.</dd>
+    <dt>Pass turn</dt><dd>Enabled when the verified roll permits no legal move. Click it to record the forced pass. You cannot use it to skip a legal turn.</dd>
+    <dt>Resign</dt><dd>Concedes the active game. Review the confirmation before proceeding. This is not a repair tool for slow dice.</dd>
+    <dt>New game</dt><dd>Offers another network game. The choices can include a rematch with the same colors, switching colors, or choosing a new opponent. Starting another table does not make a delayed existing table current.</dd>
+    <dt>Reconnect</dt><dd>Restores the client’s local Freenet node connection when the control is enabled. It cannot promise that another node has received your latest action.</dd>
+    <dt>Return to lobby</dt><dd>Leaves the table view and returns to player/game selection. It does not itself resign or delete the game. Use the existing game’s Resume control to return.</dd>
+  </dl>
+  <p>Disabled controls usually mean it is your opponent’s turn, the game is still loading, an action is awaiting confirmation, or the game is finished. Read Turn and the control note. On a smaller window, panels may stack; scroll to find dice, controls, history, and details.</p>
+</section>
+
+<section id="manual-rules">
+  <h3>Rules the game enforces</h3>
+  <p>The goal is to bear off all 15 checkers before your opponent. Each die is a separate move. You may move different checkers or use both dice on one checker, but each intermediate landing must be legal. Doubles give four moves of that value.</p>
+  <p>A point occupied by two or more opposing checkers is blocked. Landing on one opposing checker hits it onto the bar. A player with checkers on the bar must enter them before making other moves. White enters on points 1–6, Black on points 24–19, according to the die.</p>
+  <p>You must use both dice if possible, and as many moves as possible with doubles. If only one of two different dice can be used, the higher die must be used when a legal higher-die move exists. Highlights can therefore exclude a move that looks individually possible but would prevent the required use of the dice.</p>
+  <p>You may bear off only when all your remaining checkers are in your home board and none is on the bar. Use an exact die to remove a checker at that distance from the exit. An oversized die may remove a checker only when no checker remains farther from the exit. You may also use a legal die to move within the home board.</p>
+  <p>A normal win is worth one point. A gammon is worth two when the loser has borne off none. A backgammon is worth three when the loser has borne off none and still has a checker on the bar or in the winner’s home board. This release plays individual games; the player panels’ score display should not be read as a running match total.</p>
+  <p>Dice use a commitment-and-reveal exchange: both players contribute secret random material, and both clients verify the resulting roll. Neither player can simply choose a die value. The exchange needs both clients and network delivery, so it can pause when either side is disconnected. A pause is not an automatic loss.</p>
+</section>
+
+<section id="manual-delays">
+  <h3>What to do if the game is stale or a roll does not appear</h3>
+  <p>Freenet distributes updates asynchronously. Your local node can be connected while a challenge, participation record, dice message, or completed turn is still travelling. Two players can temporarily see different stages of the same game. A missing roll does not necessarily mean the Roll button failed.</p>
+  <ol>
+    <li><strong>Check the obvious first.</strong> Is it your turn? Is the board fully loaded? Is there a pending confirmation, forced pass, or synchronization message? Read Turn, Dice, and the control note. If the other player must roll or pass, ask them to do that.</li>
+    <li><strong>Ask your opponent to keep the same game open.</strong> Use River DM or your agreed channel. Both clients are needed for the dice exchange, even when only one player is moving. Confirm the same game ID if there is any doubt. Give the current update a reasonable pause to arrive.</li>
+    <li><strong>If your local connection has failed, use Reconnect</strong> when enabled. Wait for retrieval and verification, then resume the existing table if necessary.</li>
+    <li><strong>Try a normal browser reload: F5 or Ctrl+R.</strong> In our play sessions, reloads have often helped hesitant rolls appear by reloading the client and requesting/rejoining the game. Reload once, wait for identity and game recovery, and use <strong>Your games → In progress → Resume</strong> if the board does not reopen. Ask your opponent to reload and resume too if their view remains behind. Avoid repeatedly reloading before recovery can finish.</li>
+    <li><strong>If you are still at game preparation, retry the accepted game.</strong> Use <strong>Open game</strong>, <strong>Start game</strong>, or <strong>Resume</strong> as offered. Do not create another offer to repair the existing accepted game.</li>
+    <li><strong>If neither side progresses, stop clicking and compare details.</strong> Open Connection details and compare game ID, Latest verified action, and Verified ledger hash. These are useful checkpoints for the same game; a mismatch can mean one node is behind. Matching values are not a guarantee of future delivery. Record the status/error text and which player is waiting for what.</li>
+  </ol>
+  <p class="manual-callout"><strong>A reload is a useful workaround, not a guaranteed network repair.</strong> It cannot force a remote node to deliver missing state. Accepted history is verified again during recovery, but a partly selected, unsubmitted turn can be lost; you may need to select those moves again. Recovery can also remain pending while node/delegate state loads.</p>
+  <p><strong>Keep the same node, identity, and normal browser profile for recovery.</strong> Do not clear site data, delete delegate/node storage, reset your identity, or switch to a new private window as a troubleshooting shortcut. A new identity is not the participant who signed the existing game. Do not resign just to unstick a roll or restart Freenet services during a game without coordinating.</p>
+  <p>If you need help, share the public game/contract IDs, connection and error text, approximate time, and a screenshot of the affected view. Never share private keys, raw delegate records, dice secrets, or backup contents. Persistent staleness may need node-level investigation rather than another browser reload.</p>
+</section>
+
+<section id="manual-finish">
+  <h3>Finishing, resuming, and playing again</h3>
+  <p>When the last checker is borne off, or an authenticated resignation completes, wait for the recorded result. The result screen offers another game or a return to the lobby. Your finished table is available under <strong>Your games → Finished → View result</strong>. If the other side is still waiting, keep the page open and coordinate recovery until they see the result too.</p>
+  <p><strong>Play again, same player</strong>, <strong>Rematch, same colors</strong>, and <strong>Switch colors</strong> create an offer for a new game when those choices appear. Agree who sends it. If your opponent has already offered a rematch, accept that offer rather than creating a second one. Each new game has its own record; it does not erase the previous result.</p>
+  <p>For a break, coordinate with your opponent and return to the lobby. Later, open the existing unfinished game with the same identity. Brief interruptions do not automatically award victory. Resume and multiple-game recovery are still being validated; do not assume every interruption or simultaneous-table workflow is reliable yet.</p>
+</section>
+
+<section id="manual-privacy">
+  <h3>Your identity and what becomes public</h3>
+  <p>Use a nickname, not personal information. Your advertised name, public player identity, challenges, participant names, and authenticated game history are shared through Freenet. Hiding availability does not remove records already distributed, and there is no promise of permanent deletion of a completed game.</p>
+  <p>Your signing identity and recovery material are stored locally through Freenet delegates. Preserve that node’s data and your recovery backups. The manual needs no remote fonts, tracking, or external services; River or another messaging channel is only for the coordination you choose.</p>
+  <p class="manual-version">Manual updated 10 October 2026 for the current network-play interface. Some lifecycle and propagation wrinkles remain under investigation.</p>
+</section>
+
+</div></main>
+</body></html>

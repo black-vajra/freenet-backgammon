@@ -1,0 +1,15 @@
+{
+  "experiments/backgammon-protocol-core/crates/backgammon-client/src/main.rs": "a40e2bf6817e1464cc32b6d3c5191e39de951a011b90ae9eeb4eb28d2669b0af",
+  "experiments/backgammon-protocol-core/crates/backgammon-client/src/game_history_preferences.rs": "df92ffc41d8d823a9039caf9caef21b985caeffd525bb14e462fab4cffed0648",
+  "experiments/backgammon-protocol-core/crates/backgammon-client/src/user-manual-content.html": "af07794018c146e0e8a5122824a819d4f7e130ca374c29aebb0343392e38a299",
+  "experiments/backgammon-protocol-core/crates/backgammon-client/user-manual.html": "bedb1e563fd5fa1a6f25aaea0ef5d591b7605d250075117c4ab6b0bb0ecf9d8a",
+  "experiments/backgammon-protocol-core/crates/backgammon-client/styles.css": "a004db0ffd990e8587c1a15ed63a2fba75761953f8d37e863e1f59f9b250dd45",
+  "experiments/backgammon-protocol-core/crates/backgammon-client/index.html": "85252dfe62663f598f9435455770e662a357fbdd4c87396285d15738fcbc40fe",
+  "experiments/backgammon-protocol-core/crates/backgammon-client/Cargo.toml": "0144006734d4ef3493dc9eeceab6b8908eee567a7b73bf0a4faceaa18704c65b",
+  "experiments/backgammon-protocol-core/crates/backgammon-client/src/result_presentation.rs": "dc2880e1717e817ef3f4ac12ae93ef77ec51097fb117e8a1dd98bc6ae1c1cf0d",
+  "experiments/backgammon-protocol-core/crates/backgammon-client/src/presence_renewal.rs": "8b4f15fd325ed0dddecc0a4150853b93216f99df40d323b4d8b7ac447bc633d8",
+  "experiments/backgammon-protocol-core/crates/backgammon-client/src/user_manual.rs": "9b362720a184957aefda23865fc60457bfcfc48b3215f5ad7f8fc3115b51e55e",
+  "experiments/backgammon-protocol-core/crates/backgammon-client/src/incoming_challenge_decline.rs": "2536c839a0aa60fa20283edf4cddf528c93296753cd19b1e277c42f19673a532",
+  "experiments/backgammon-protocol-core/scripts/build-website.sh": "ef616b3badf648300f55a65a441800b9efcb388e5150d9a8bf6759993181b3cb",
+  "experiments/backgammon-protocol-core/crates/backgammon-client/assets/backgammon-durable-state-delegate.wasm": "e7a0446efab84cb6fa1491484f0d176e9d54fcdb677a90a9747608e508d2fe71"
+}
