@@ -2,12 +2,12 @@ use backgammon_core::Player;
 use backgammon_protocol::{GameConfiguration, PlayerId};
 use ed25519_dalek::SigningKey;
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(test, target_arch = "wasm32"))]
 thread_local! {
     static SIGNING_KEY_CACHE: std::cell::RefCell<Option<SigningKey>> = const { std::cell::RefCell::new(None) };
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(test, target_arch = "wasm32"))]
 pub fn cache_identity(seed: [u8; 32]) -> PlayerId {
     let signing_key = signing_key_from_seed(seed);
     let player_id = player_id_for_signing_key(&signing_key);
@@ -15,16 +15,23 @@ pub fn cache_identity(seed: [u8; 32]) -> PlayerId {
     player_id
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(test, target_arch = "wasm32"))]
 pub fn clear_cached_identity() {
     SIGNING_KEY_CACHE.with(|cache| cache.borrow_mut().take());
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(any(test, target_arch = "wasm32"))]
 pub fn load_cached_identity() -> Result<SigningKey, String> {
     SIGNING_KEY_CACHE.with(|cache| {
         cache.borrow().clone().ok_or_else(|| "Verified Freenet signing identity is unavailable.".to_owned())
     })
+}
+
+/// Current public identity from the verified runtime cache. Unlike a captured
+/// render handle this accessor reflects identity recovery and clearing now.
+#[cfg(any(test, target_arch = "wasm32"))]
+pub fn cached_player_id() -> Option<PlayerId> {
+    SIGNING_KEY_CACHE.with(|cache| cache.borrow().as_ref().map(player_id_for_signing_key))
 }
 
 const STORAGE_KEY: &str = "freenet-backgammon.local-identity.v1";
@@ -275,5 +282,24 @@ mod tests {
         for encoded in invalid {
             assert!(decode_identity_seed(&encoded).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod live_identity_tests {
+    use super::*;
+
+    #[test]
+    fn long_lived_accessor_sees_recovered_changed_and_cleared_identity() {
+        clear_cached_identity();
+        let callback = || cached_player_id();
+        assert_eq!(callback(), None);
+        let first = cache_identity([41; 32]);
+        assert_eq!(callback(), Some(first));
+        let second = cache_identity([42; 32]);
+        assert_ne!(first, second);
+        assert_eq!(callback(), Some(second));
+        clear_cached_identity();
+        assert_eq!(callback(), None);
     }
 }

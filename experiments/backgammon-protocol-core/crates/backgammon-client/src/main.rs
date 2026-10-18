@@ -27,6 +27,7 @@ pub mod incoming_challenge_decline;
 pub mod ledger_codec;
 pub mod lobby;
 pub mod lobby_codec;
+pub mod verified_lobby_view;
 pub mod lobby_presence_planner;
 pub mod presence_renewal;
 pub mod lobby_profile_store;
@@ -74,6 +75,7 @@ mod browser {
     use js_sys::Date;
     use yew::prelude::*;
     use yew::TargetCast;
+    use crate::verified_lobby_view::VerifiedLobbyView;
 
     use crate::accepted_game_history::{
         classify_accepted_game, AcceptedGameSection, InspectedGameStatus,
@@ -137,7 +139,7 @@ mod browser {
         ClassifiedLobbyResponse, LobbyContractStatus,
     };
     use crate::local_identity_store::{
-        cache_identity, clear_cached_identity, load_cached_identity, player_id_for_signing_key,
+        cache_identity, cached_player_id, clear_cached_identity, load_cached_identity, player_id_for_signing_key,
         role_for_player_id, verify_identity_readback,
     };
     use crate::local_state_transport::{
@@ -610,7 +612,6 @@ mod browser {
     /// offer appears in a complete, independently verified lobby state.
     fn observe_authoritative_challenge_publication(
         state: &LobbyContractState,
-        local_player_id_handle: &UseStateHandle<Option<[u8; 32]>>,
         api_handle: &Rc<RefCell<Option<WebApi>>>,
         durable_handle: &Rc<RefCell<Option<LocalStateDelegateHandle>>>,
         reply_router: &Rc<RefCell<DurableReplyRouter>>,
@@ -619,7 +620,7 @@ mod browser {
         status_handle: &UseStateHandle<String>,
         error_handle: &UseStateHandle<Option<String>>,
     ) {
-        let Some(player_id) = **local_player_id_handle else { return; };
+        let Some(player_id) = cached_player_id() else { return; };
         let state = state.clone();
         let api = api_handle.clone();
         let delegate = durable_handle.clone();
@@ -685,7 +686,6 @@ mod browser {
     /// independently verified authoritative lobby state.
     fn observe_authoritative_incoming_challenge_acceptance(
         state: &LobbyContractState,
-        local_player_id_handle: &UseStateHandle<Option<[u8; 32]>>,
         api_handle: &Rc<RefCell<Option<WebApi>>>,
         durable_handle: &Rc<RefCell<Option<LocalStateDelegateHandle>>>,
         reply_router: &Rc<RefCell<DurableReplyRouter>>,
@@ -694,7 +694,7 @@ mod browser {
         status_handle: &UseStateHandle<String>,
         error_handle: &UseStateHandle<Option<String>>,
     ) {
-        let Some(player_id) = **local_player_id_handle else { return; };
+        let Some(player_id) = cached_player_id() else { return; };
         let state = state.clone();
         let api = api_handle.clone();
         let delegate = durable_handle.clone();
@@ -755,6 +755,7 @@ mod browser {
 
     fn handle_lobby_response(
         response: &HostResponse,
+        current_view: &Rc<RefCell<VerifiedLobbyView>>,
         contract_status_handle: &UseStateHandle<LobbyContractStatus>,
         subscription_status_handle: &UseStateHandle<SubscriptionStatus>,
         authoritative_state_handle: &UseStateHandle<Option<LobbyContractState>>,
@@ -763,7 +764,6 @@ mod browser {
         durable_handle: &Rc<RefCell<Option<LocalStateDelegateHandle>>>,
         reply_router: &Rc<RefCell<DurableReplyRouter>>,
         epoch_handle: &Rc<RefCell<u64>>,
-        local_player_id_handle: &UseStateHandle<Option<[u8; 32]>>,
         challenge_pending_handle: &UseStateHandle<bool>,
         challenge_status_handle: &UseStateHandle<String>,
         challenge_error_handle: &UseStateHandle<Option<String>>,
@@ -796,9 +796,16 @@ mod browser {
         }
 
         if let Some(state) = authoritative_state {
+            let state = match current_view.borrow_mut().observe(state) {
+                Ok(state) => state,
+                Err(error) => {
+                    contract_status_handle.set(LobbyContractStatus::Failed(format!(
+                        "Lobby view reconciliation failed: {error}")));
+                    return true;
+                }
+            };
             observe_authoritative_challenge_publication(
                 &state,
-                local_player_id_handle,
                 api_handle,
                 durable_handle,
                 reply_router,
@@ -810,7 +817,6 @@ mod browser {
 
             observe_authoritative_incoming_challenge_acceptance(
                 &state,
-                local_player_id_handle,
                 api_handle,
                 durable_handle,
                 reply_router,
@@ -862,8 +868,7 @@ mod browser {
         retrieved_read_handle: &Rc<
             RefCell<Option<(IncomingChallengeContractProbe, ContractKey, Vec<u8>)>>,
         >,
-        authoritative_state_handle: &UseStateHandle<Option<LobbyContractState>>,
-        local_player_id_handle: &UseStateHandle<Option<[u8; 32]>>,
+        current_view: &Rc<RefCell<VerifiedLobbyView>>,
         lobby_key_handle: &Rc<RefCell<Option<ContractKey>>>,
         api_handle: &Rc<RefCell<Option<WebApi>>>,
         durable_handle: &Rc<RefCell<Option<LocalStateDelegateHandle>>>,
@@ -921,8 +926,7 @@ mod browser {
         let router = reply_router.clone();
         let epoch = epoch_handle.clone();
         let epoch_snapshot = *epoch.borrow();
-        let authoritative_state_handle = authoritative_state_handle.clone();
-        let local_player_id_handle = local_player_id_handle.clone();
+        let current_view = current_view.clone();
         let lobby_key_handle = lobby_key_handle.clone();
         let pending_handle = pending_handle.clone();
         let status_handle = status_handle.clone();
@@ -959,45 +963,14 @@ mod browser {
         let mut finalization_started = false;
 
         let prepared = (|| {
-            let active_player_id = (*local_player_id_handle).ok_or_else(|| {
-                "Local identity disappeared before acceptance finalization.".to_owned()
-            })?;
-
+            // Re-read both identity and lobby evidence after the durable await.
+            // The callback may have been registered before this offer existed.
+            let signing_key = load_cached_identity()?;
+            let active_player_id = player_id_for_signing_key(&signing_key);
             if active_player_id != probe.local_player_id {
                 return Err("Active PlayerId differs from the challenged recipient.".to_owned());
             }
-
-            let authoritative_state = (*authoritative_state_handle).as_ref().ok_or_else(|| {
-                "Authoritative lobby state disappeared before \
-                         acceptance finalization."
-                    .to_owned()
-            })?;
-
-            let mut exact_matches = authoritative_state
-                .challenges
-                .offers
-                .iter()
-                .filter(|entry| entry.offer == probe.signed_offer);
-
-            let current_challenge = exact_matches.next().ok_or_else(|| {
-                "The probed signed challenge is no longer present in \
-                     authoritative lobby state."
-                    .to_owned()
-            })?;
-
-            if exact_matches.next().is_some() {
-                return Err("Authoritative lobby state contains ambiguous duplicate \
-                     records for the probed challenge."
-                    .to_owned());
-            }
-
-            let signing_key = load_cached_identity()?;
-
-            if player_id_for_signing_key(&signing_key) != active_player_id {
-                return Err("Persistent signing identity does not match the active \
-                     PlayerId."
-                    .to_owned());
-            }
+            let current_challenge = current_view.borrow().exact_offer(&probe.signed_offer)?;
 
             let now_unix_seconds = local_observation_unix_seconds()?;
 
@@ -1020,7 +993,7 @@ mod browser {
 
             let plan = finalize_incoming_challenge_acceptance(
                 &probe,
-                current_challenge,
+                &current_challenge,
                 &contract_key,
                 &state,
                 &signing_key,
@@ -1157,7 +1130,6 @@ mod browser {
     fn handle_challenge_contract_publication_response(
         response: &HostResponse,
         submitted_handle: &Rc<RefCell<Option<SubmittedGameContractPublication>>>,
-        local_player_id_handle: &UseStateHandle<Option<[u8; 32]>>,
         lobby_key_handle: &Rc<RefCell<Option<ContractKey>>>,
         api_handle: &Rc<RefCell<Option<WebApi>>>,
         durable_handle: &Rc<RefCell<Option<LocalStateDelegateHandle>>>,
@@ -1201,7 +1173,6 @@ mod browser {
         let router = reply_router.clone();
         let epoch = epoch_handle.clone();
         let epoch_snapshot = *epoch.borrow();
-        let local_id = local_player_id_handle.clone();
         let lobby_key = lobby_key_handle.clone();
         let pending = pending_handle.clone();
         let status = status_handle.clone();
@@ -1211,8 +1182,8 @@ mod browser {
 
         wasm_bindgen_futures::spawn_local(async move {
             let prepared = async {
-                let player_id = (*local_id).ok_or_else(||
-                    "Local identity is unavailable during contract confirmation".to_owned())?;
+                let player_id = cached_player_id().ok_or_else(||
+                    "Verified runtime identity is unavailable during contract confirmation".to_owned())?;
                 let handle = delegate.borrow().clone().ok_or_else(||
                     "Durable state delegate is unavailable after contract confirmation".to_owned())?;
                 let get = DurableRequest {
@@ -1227,7 +1198,7 @@ mod browser {
                     DurableResult::Error(error) => return Err(error),
                     _ => return Err("Confirmed contract has no exact durable challenge".to_owned()),
                 };
-                if *epoch.borrow() != epoch_snapshot || *local_id != Some(player_id) {
+                if *epoch.borrow() != epoch_snapshot || cached_player_id() != Some(player_id) {
                     return Err("Identity or connection changed during challenge confirmation".to_owned());
                 }
                 let mut stored = StoredOutboundChallengePublication::decode(&bytes)?;
@@ -1272,7 +1243,7 @@ mod browser {
                     DurableResult::Error(error) => return Err(error),
                     _ => return Err("Confirmed challenge failed exact durable readback".to_owned()),
                 }
-                if *epoch.borrow() != epoch_snapshot || *local_id != Some(player_id) {
+                if *epoch.borrow() != epoch_snapshot || cached_player_id() != Some(player_id) {
                     return Err("Identity or connection changed before challenge advertisement".to_owned());
                 }
                 let lobby_key = lobby_key.borrow().clone().ok_or_else(||
@@ -1993,6 +1964,9 @@ mod browser {
         let lobby_contract_status = use_state(|| LobbyContractStatus::WaitingForConnection);
         let lobby_subscription_status = use_state(|| SubscriptionStatus::Pending);
         let authoritative_lobby_state = use_state(|| None::<LobbyContractState>);
+        // Stable runtime data for long-lived callbacks; render state is only
+        // presentation. Updated synchronously before any render is scheduled.
+        let verified_lobby_view = use_mut_ref(VerifiedLobbyView::default);
 
         /*
          * Genesis-share publication is reconciled from durable signed evidence
@@ -3240,6 +3214,7 @@ mod browser {
             let lobby_contract_status = lobby_contract_status.clone();
             let lobby_subscription_status = lobby_subscription_status.clone();
             let authoritative_lobby_state = authoritative_lobby_state.clone();
+            let verified_lobby_view = verified_lobby_view.clone();
             let challenge_publication_pending = challenge_publication_pending.clone();
             let challenge_publication_status = challenge_publication_status.clone();
             let challenge_publication_error = challenge_publication_error.clone();
@@ -3371,6 +3346,7 @@ mod browser {
                 let scope_for_request = active_game_scope.clone();
                 let scope_snapshot_for_request = scope_for_request.borrow().snapshot();
                 let lobby_state_for_response = authoritative_lobby_state.clone();
+                let current_lobby_view_for_response = verified_lobby_view.clone();
                 let lobby_key_for_response = latest_lobby_contract_key.clone();
                 let challenge_pending_for_response = challenge_publication_pending.clone();
                 let challenge_status_for_response = challenge_publication_status.clone();
@@ -3509,6 +3485,7 @@ mod browser {
                         );
                         if handle_lobby_response(
                             &response,
+                            &current_lobby_view_for_response,
                             &lobby_contract_for_response,
                             &lobby_subscription_for_response,
                             &lobby_state_for_response,
@@ -3517,7 +3494,6 @@ mod browser {
                             &durable_delegate_for_response,
                             &durable_replies_for_response,
                             &epoch_for_response,
-                            &player_id_for_response,
                             &challenge_pending_for_response,
                             &challenge_status_for_response,
                             &challenge_error_for_response,
@@ -3532,8 +3508,7 @@ mod browser {
                             &response,
                             &incoming_probe_for_response,
                             &incoming_read_for_response,
-                            &lobby_state_for_response,
-                            &player_id_for_response,
+                            &current_lobby_view_for_response,
                             &lobby_key_for_response,
                             &api_for_response,
                             &durable_delegate_for_response,
@@ -3549,7 +3524,6 @@ mod browser {
                         if handle_challenge_contract_publication_response(
                             &response,
                             &submitted_game_for_response,
-                            &player_id_for_response,
                             &lobby_key_for_response,
                             &api_for_response,
                             &durable_delegate_for_response,
