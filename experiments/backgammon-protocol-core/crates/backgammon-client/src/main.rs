@@ -7974,7 +7974,7 @@ mod browser {
                 <header class="app-header">
                     <div>
                         <p class="mode-label">{ "FREENET NETWORK PLAY" }</p>
-                        <h1>{ "Freenet Backgammon" }</h1>
+                        <h1>{ "Freenet Backgammon Network Play" }</h1>
                     </div>
 
                     <div
