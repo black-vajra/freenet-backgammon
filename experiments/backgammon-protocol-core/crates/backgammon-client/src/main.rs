@@ -46,6 +46,7 @@ pub mod durable_recovery_gate;
 pub mod profile_state_transport;
 pub mod projection;
 pub mod request_roll_planner;
+pub mod resignation;
 pub mod reveal_planner;
 pub mod secret_store;
 pub mod transport;
@@ -64,7 +65,7 @@ mod browser {
     use backgammon_core::{GameState, MoveSource, MoveTarget, Player, TurnPhase, TurnSequence};
     use backgammon_lobby_core::LobbyContractState;
     use backgammon_protocol::{
-        replay_game, verify_challenge_offer_at, Action, DiceSecret, GameActionPayload,
+        replay_game, verify_challenge_offer_at, Action, DiceSecret, GameActionPayload, ReplayStatus,
         ProfileStateAction, ProfileStateRequest, ProfileStateResult, SignedChallengeOffer,
         PresenceRevisionAction, PresenceRevisionRequest, PresenceRevisionResult,
         PRESENCE_REVISION_PROTOCOL_VERSION, PROFILE_STATE_PROTOCOL_VERSION,
@@ -159,6 +160,7 @@ mod browser {
     use crate::request_roll_planner::{
         plan_request_roll, RequestRollPlan, RequestRollPlannerInput,
     };
+    use crate::resignation::{prepare_resignation, recover_resignation, ResignationRecovery};
     use crate::reveal_planner::{plan_reveal, RevealPlan, RevealPlannerInput};
     use crate::transport::{
         classify_response, connect, request_contract, request_contract_snapshot,
@@ -1339,6 +1341,8 @@ mod browser {
         Genesis,
         PlayTurn,
         RequestRoll,
+        Resign,
+        ResignationSuperseded,
     }
 
     enum BrowserNetworkActionPlan {
@@ -1591,12 +1595,40 @@ mod browser {
         let previous = load_durable_pending_action(
             api, router, handle, contract_id,
         ).await?;
+        let replay = decode_verified_replay(authoritative_state)?;
         let Some((pending, exact_bytes)) = previous else {
+            if replay.status != ReplayStatus::InProgress {
+                return Ok(BrowserNetworkActionPlan::NoAction);
+            }
             return plan_durable_dice_action(api, router, handle,
                 contract_id, authoritative_state, local_player, None).await;
         };
         let record = pending.verify()?;
         let disposition = match &record.payload {
+            GameActionPayload::Resign { .. } => {
+                let signing_key = load_cached_identity()?;
+                match recover_resignation(contract_id, authoritative_state, local_player, &signing_key, &pending)? {
+                    ResignationRecovery::Accepted => BrowserNetworkActionPlan::SecretlessAccepted {
+                        kind: SecretlessNetworkActionKind::Resign,
+                    },
+                    ResignationRecovery::Retry => BrowserNetworkActionPlan::SecretlessSubmit {
+                        pending: pending.clone(),
+                        recovered_pending: true,
+                        kind: SecretlessNetworkActionKind::Resign,
+                    },
+                    ResignationRecovery::Superseded => BrowserNetworkActionPlan::SecretlessAccepted {
+                        kind: SecretlessNetworkActionKind::ResignationSuperseded,
+                    },
+                }
+            }
+            // The opponent's verified resignation ends the game even when a
+            // local dice or turn action was still waiting to be confirmed.
+            _ if matches!(replay.status, ReplayStatus::Resigned { .. })
+                && pending.game_id == replay.game_id => {
+                BrowserNetworkActionPlan::SecretlessAccepted {
+                    kind: SecretlessNetworkActionKind::Resign,
+                }
+            }
             GameActionPayload::RequestRoll { player, .. } if *player == local_player => {
                 let signing_key = load_cached_identity()?;
                 match plan_request_roll(RequestRollPlannerInput {
@@ -1644,7 +1676,7 @@ mod browser {
             GameActionPayload::CommitDice { .. } | GameActionPayload::RevealDice { .. } =>
                 return plan_durable_dice_action(api, router, handle, contract_id,
                     authoritative_state, local_player, Some((pending, exact_bytes))).await,
-            _ => return Err("Stored pending action is not a local roll request or turn".to_owned()),
+            _ => return Err("Stored pending action is not a supported local game action".to_owned()),
         };
         if matches!(disposition, BrowserNetworkActionPlan::SecretlessAccepted { .. }) {
             delete_durable_pending_action(api, router, handle, contract_id, exact_bytes).await?;
@@ -1695,7 +1727,7 @@ mod browser {
 
         fn message(self) -> &'static str {
             match self {
-                Self::Resign => "The active player will resign and the opponent will win.",
+                Self::Resign => "You will resign and your opponent will win.",
             }
         }
 
@@ -1708,7 +1740,7 @@ mod browser {
 
     fn authoritative_game_projection(
         state_bytes: &[u8],
-    ) -> Result<Option<(GameState, Vec<LocalTurnRecord>)>, String> {
+    ) -> Result<Option<(GameState, Vec<LocalTurnRecord>, ReplayStatus)>, String> {
         let ledger = decode_verified_ledger(state_bytes)?;
 
         /*
@@ -1731,7 +1763,7 @@ mod browser {
             })
             .collect();
 
-        Ok(Some((replay.state, history)))
+        Ok(Some((replay.state, history, replay.status)))
     }
 
     fn observe_accepted_game_probe(
@@ -1746,12 +1778,10 @@ mod browser {
             }) => {
                 let status = match authoritative_game_projection(state.as_ref()) {
                     Ok(None) => InspectedGameStatus::Empty,
-                    Ok(Some((state, _))) => match state.status {
-                        backgammon_core::GameStatus::InProgress => InspectedGameStatus::InProgress,
-                        backgammon_core::GameStatus::Completed { .. } => {
-                            InspectedGameStatus::Completed
-                        }
-                    },
+                    Ok(Some((_, _, ReplayStatus::Completed { .. } | ReplayStatus::Resigned { .. }))) => {
+                        InspectedGameStatus::Completed
+                    }
+                    Ok(Some(_)) => InspectedGameStatus::InProgress,
                     Err(error) => InspectedGameStatus::Failed(error),
                 };
                 (key.id().encode(), status)
@@ -1777,6 +1807,7 @@ mod browser {
         scope: ActiveGameScopeSnapshot,
         state: GameState,
         history: Vec<LocalTurnRecord>,
+        status: ReplayStatus,
         local_role: Option<Player>,
         white_player_id: [u8; 32],
         black_player_id: [u8; 32],
@@ -3203,6 +3234,7 @@ mod browser {
             let local_network_action_submitted = local_network_action_submitted.clone();
             let local_dice_secret = local_dice_secret.clone();
             let dice_secret_status = dice_secret_status.clone();
+            let resignation_error = interface_error.clone();
             let latest_contract_key = latest_contract_key.clone();
             let latest_authoritative_state = latest_authoritative_state.clone();
             let latest_lobby_contract_key = latest_lobby_contract_key.clone();
@@ -3330,6 +3362,7 @@ mod browser {
                 let network_action_for_response = local_network_action_submitted.clone();
                 let secret_for_response = local_dice_secret.clone();
                 let secret_status_for_response = dice_secret_status.clone();
+                let resignation_error_for_response = resignation_error.clone();
                 let pending_refresh_for_response = pending_view_refresh.clone();
                 let pending_counter_for_response = pending_view_refresh_counter.clone();
                 let key_for_response = latest_contract_key.clone();
@@ -4184,6 +4217,7 @@ mod browser {
                                 let scope_snapshot_for_response = scope_snapshot_for_response.clone();
                                 let secret_for_response = secret_for_response.clone();
                                 let secret_status_for_response = secret_status_for_response.clone();
+                                let resignation_error_for_response = resignation_error_for_response.clone();
                                 let pending_refresh_for_response = pending_refresh_for_response.clone();
                                 let pending_counter_for_response = pending_counter_for_response.clone();
                                 let state_for_response = state_for_response.clone();
@@ -4271,7 +4305,7 @@ mod browser {
                                 authoritative_role_for_response.set(resolved_role);
 
                                 if state_changed {
-                                    if let Some((authoritative_state, authoritative_history)) =
+                                    if let Some((authoritative_state, authoritative_history, status)) =
                                         authoritative_state
                                     {
                                         // Keep participant IDs with the verified result, rather
@@ -4287,6 +4321,7 @@ mod browser {
                                             scope: scope_snapshot_for_response.clone(),
                                             state: authoritative_state.clone(),
                                             history: authoritative_history.clone(),
+                                            status,
                                             local_role: authoritative_player,
                                             white_player_id: configuration.white.id,
                                             black_player_id: configuration.black.id,
@@ -4458,7 +4493,15 @@ mod browser {
                                         });
                                     }
 
-                                    BrowserNetworkActionPlan::SecretlessAccepted { kind: _ } => {
+                                    BrowserNetworkActionPlan::SecretlessAccepted { kind } => {
+                                        if kind == SecretlessNetworkActionKind::ResignationSuperseded
+                                            && decode_verified_replay(&state_bytes)
+                                                .is_ok_and(|replay| replay.status == ReplayStatus::InProgress)
+                                        {
+                                            resignation_error_for_response.set(Some(
+                                                "The game advanced before the resignation was confirmed. Select Resign again to concede.".to_owned(),
+                                            ));
+                                        }
                                         let next_refresh = {
                                             let mut counter = pending_counter_for_response.borrow_mut();
                                             *counter = counter.wrapping_add(1);
@@ -5043,17 +5086,19 @@ mod browser {
             }
             remaining
         });
-        let outcome = match current_verified_view {
-            Some(view) if !controller_matches_verified_view => match view.state.status {
-                backgammon_core::GameStatus::InProgress => None,
-                backgammon_core::GameStatus::Completed { winner, points } => {
-                    Some(LocalGameOutcome::Completed { winner, points })
-                }
-            },
-            _ => controller.outcome(),
-        };
+        let outcome = current_verified_view.and_then(|view| match view.status {
+            ReplayStatus::Completed { winner, points } => {
+                Some(LocalGameOutcome::Completed { winner, points })
+            }
+            ReplayStatus::Resigned { resigned, winner } => {
+                Some(LocalGameOutcome::Resigned { resigned, winner })
+            }
+            ReplayStatus::InProgress | ReplayStatus::Abandoned { .. } => None,
+        });
         let left_table = controller.has_left_table();
-        let session_active = controller_matches_verified_view && controller.is_active();
+        let session_active = controller_matches_verified_view
+            && controller.is_active()
+            && current_verified_view.is_some_and(|view| view.status == ReplayStatus::InProgress);
 
         let pending_role_check = (*durable_pending_action_view).clone();
 
@@ -5099,11 +5144,14 @@ mod browser {
         let authoritative_must_pass = session_active && controller.must_pass();
         let can_pass = controls_authoritative_turn && authoritative_must_pass;
 
-        /*
-         * Resignation is not networked yet. Disable the local-only mutation so
-         * it cannot falsely present a terminal network result.
-         */
-        let can_resign = false;
+        let can_resign = session_active
+            && authoritative_player_role.is_some()
+            && no_pending_action
+            && !*synchronizing_game_state
+            && *connection_status == ConnectionStatus::Connected
+            && durable_delegate.borrow().is_some()
+            && local_network_action_submitted.borrow().is_none()
+            && latest_contract_key.borrow().is_some();
 
         let active_name = player_name(board.active_player);
 
@@ -5699,38 +5747,50 @@ mod browser {
         };
 
         let on_confirm_action = {
-            let controller = controller.clone();
             let interface_error = interface_error.clone();
             let pending_confirmation = pending_confirmation.clone();
+            let latest_contract_key = latest_contract_key.clone();
+            let latest_authoritative_state = latest_authoritative_state.clone();
+            let local_network_action_submitted = local_network_action_submitted.clone();
+            let submit_pending_secretless_action = submit_pending_secretless_action.clone();
+            let scope = active_game_scope.clone();
+            let snapshot = active_game_scope_snapshot.clone();
 
             Callback::from(move |_| {
-                let Some(action) = *pending_confirmation else {
+                if pending_confirmation.is_none() || !can_resign
+                    || local_network_action_submitted.borrow().is_some()
+                {
                     return;
-                };
+                }
+                pending_confirmation.set(None);
 
-                let mut next = (*controller).clone();
+                let prepared = (|| {
+                    let contract_id = contract_id_for_scope_snapshot(&scope, &snapshot)?;
+                    let player = authoritative_player_role
+                        .ok_or_else(|| "This identity cannot resign this game.".to_owned())?;
+                    let key = latest_contract_key.borrow().clone()
+                        .ok_or_else(|| "No verified game contract is available.".to_owned())?;
+                    let state = latest_authoritative_state.borrow();
+                    let state = state.as_deref()
+                        .ok_or_else(|| "No verified game state is available.".to_owned())?;
+                    let pending = prepare_resignation(
+                        contract_id,
+                        state,
+                        player,
+                        secure_random_32("network resignation action ID")?,
+                        &load_cached_identity()?,
+                    )?;
+                    Ok::<_, String>((key, pending))
+                })();
 
-                let result = match action {
-                    PendingConfirmation::Resign => next.resign(),
-                };
-
-                match result {
-                    Ok(()) => {
-                        interface_error.set(None);
-                        pending_confirmation.set(None);
-                        controller.set(next);
-                    }
-                    Err(error) => {
-                        interface_error.set(Some(format!(
-                            "The requested action could not be completed: {error:?}"
-                        )));
-                        pending_confirmation.set(None);
-                    }
+                match prepared {
+                    Ok(submission) => submit_pending_secretless_action.emit(submission),
+                    Err(error) => interface_error.set(Some(error)),
                 }
             })
         };
 
-        let confirmation_overlay = pending_confirmation.as_ref().map_or_else(
+        let confirmation_overlay = pending_confirmation.as_ref().filter(|_| outcome.is_none()).map_or_else(
             || html! {},
             |action| {
                 html! {
@@ -5767,6 +5827,7 @@ mod browser {
                                 <button
                                     type="button"
                                     class="confirmation-danger"
+                                    disabled={!can_resign}
                                     onclick={on_confirm_action.clone()}
                                 >
                                     { action.confirm_label() }
@@ -5843,7 +5904,7 @@ mod browser {
                     let celebrate = current_verified_view.is_some_and(|view| {
                         crate::result_presentation::local_identity_won(
                             *local_player_id, view.white_player_id, view.black_player_id,
-                            view.state.status,
+                            &view.status,
                         )
                     });
                     if !celebrate {
@@ -8454,7 +8515,9 @@ mod browser {
                             <strong>{ turn_text }</strong>
 
                             <p class="panel-note">
-                                { if controller_matches_verified_view {
+                                { if let Some(LocalGameOutcome::Resigned { resigned, winner }) = outcome {
+                                    format!("{} resigned. {} wins.", player_name(resigned), player_name(winner))
+                                } else if controller_matches_verified_view {
                                     controller.status_message().to_owned()
                                 } else {
                                     "Synchronizing latest verified game state".to_owned()
@@ -8473,11 +8536,17 @@ mod browser {
                             }
                         </section>
 
-                        <DiceDisplay
-                            dice={board.dice}
-                            remaining={remaining_dice}
-                            preview={preview_in_progress}
-                        />
+                        { if outcome.is_none() {
+                            html! {
+                                <DiceDisplay
+                                    dice={board.dice}
+                                    remaining={remaining_dice}
+                                    preview={preview_in_progress}
+                                />
+                            }
+                        } else {
+                            html! {}
+                        } }
 
                         <GameControls
                             can_roll={can_roll}
